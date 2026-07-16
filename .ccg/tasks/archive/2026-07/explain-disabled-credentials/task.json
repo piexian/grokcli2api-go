@@ -1,0 +1,13 @@
+{
+  "id": "explain-disabled-credentials",
+  "title": "清理 jp 的 refresh_invalid 永久失效凭证",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "operations",
+  "currentPhase": "completed",
+  "nextAction": "归档清理记录",
+  "createdAt": "2026-07-16T22:30:00Z",
+  "branch": "main",
+  "completedAt": "2026-07-16T23:21:36Z"
+}
