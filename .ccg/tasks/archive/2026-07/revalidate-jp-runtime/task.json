@@ -1,0 +1,13 @@
+{
+  "id": "revalidate-jp-runtime",
+  "title": "复验 jp 部署运行状态与日志",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "low",
+  "domain": "operations",
+  "currentPhase": "completed",
+  "nextAction": "归档运行复验记录",
+  "createdAt": "2026-07-16T22:22:56Z",
+  "branch": "main",
+  "completedAt": "2026-07-16T22:29:01Z"
+}
