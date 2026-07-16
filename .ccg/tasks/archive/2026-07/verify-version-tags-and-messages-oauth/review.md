@@ -30,4 +30,13 @@ Production free-OAuth A/B probe on 2026-07-16, with credentials kept entirely on
 - Same OAuth and `grok-4.5`, `/v1/responses`: 200; response model `grok-4.5-build-free`.
 - Same OAuth and `grok-4.5`, `/v1/messages`: 403 `personal-team-blocked:spending-limit`.
 
-Therefore the route exists, but native Messages is not available to the current free OAuth entitlement. The adapter's downstream Messages-to-upstream Responses conversion is the correct behavior for this reverse-engineered target. Paid or specially entitled OAuth remains unverified and must not be inferred from sampler source alone.
+Therefore the route exists, but native Messages is not available to the current free OAuth entitlement. The adapter's downstream Messages-to-upstream Responses conversion is correct for free accounts.
+
+Follow-up SuperGrok tier 4 OAuth probe, also on 2026-07-16:
+
+- Proxy `/v1/models`: 200; two models, both advertised as `responses`.
+- Same OAuth and `grok-4.5`, proxy `/v1/responses`: 200; response model `grok-4.5-build`.
+- Proxy `/v1/messages`: 200 for both non-streaming and streaming; standard Anthropic message blocks and SSE event sequence were returned.
+- Credential-declared `api.x.ai/v1/messages`: 200.
+
+Paid/SuperGrok Messages support is therefore confirmed. The model catalog's `apiBackend` is a default client-routing hint, not a complete endpoint-capability list. A mixed OAuth pool needs per-account capability selection rather than one global upstream backend.

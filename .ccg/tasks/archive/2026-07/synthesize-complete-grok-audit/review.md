@@ -18,7 +18,7 @@
 1. Proxy 指纹确实缺 `x-authenticateresponse` 和 `x-grok-client-mode`，但官方是按可信 URL 派生注入；不能在所有可配置上游上无条件发送。
 2. Chat 主体可用，但不是“无关键字段缺口”：`user`、流式 `stream_options.include_usage`、新版 `search_parameters` 均有明确 wire 漂移。
 3. Responses 兼容层较完整，但必须区分 native Grok 透传和 OpenAI/Codex 兼容分支；`stream_tool_calls`、raw `x_search` 不是全局缺失。
-4. Anthropic `/v1/messages` 入口能用，但当前转为上游 `/v1/responses`。官方 sampler 虽实现 Messages 协议，免费 OAuth Build API 的线上目录只广告 Responses，同 OAuth A/B 实测也只有 Responses 可用；因此不能把 native Messages 视为当前目标的架构债。
+4. Anthropic `/v1/messages` 入口能用，但当前统一转为上游 `/v1/responses`。线上 A/B 证明 backend 能力随 OAuth entitlement 变化：免费 OAuth 只有 Responses，SuperGrok tier 4 OAuth 的原生 Messages 非流式和流式均可用。不能全局启用或全局否定 native Messages，应按账户能力选择。
 5. Retry、响应模型元数据和 SSE usage 仍有真实缺口。
 6. Codex duplicate `call_id` 的 400 确实由适配层在出网前生成；但现有证据只能证明最终入站 payload 已重复，不能证明 Codex 是重复项的制造者。
 7. doom-loop、compaction、TUI、MCP host、sandbox、agent WebSocket 等仍应排除在 API 适配范围之外。
@@ -92,12 +92,17 @@ UA 漂移成立：
 | --- | --- | --- | --- |
 | `POST /v1/chat/completions` | 支持 | 支持 | 核心可用 |
 | `POST /v1/responses` | 支持 | 支持 | 核心可用 |
-| `POST /v1/messages` | sampler 有协议实现；线上能力由模型目录和 entitlement 决定 | 下游 Messages 转上游 Responses | 对当前免费 OAuth 目标是正确兼容路径 |
+| `POST /v1/messages` | sampler 有协议实现；免费 OAuth 拒绝，SuperGrok tier 4 OAuth 实测可用 | 下游 Messages 转上游 Responses | 需要按账户 capability 选择 |
 | `GET /v1/models` | 支持 | 支持并池化 | 可用 |
 
-源码证明 session token 可以作为 Bearer 构造 `{base_url}/messages` 请求，也证明远端模型目录能够声明 `apiBackend=messages`；这仍不等于生产 Build API 已对当前 OAuth entitlement 开放 Messages。
+源码证明 session token 可以作为 Bearer 构造 `{base_url}/messages` 请求，也证明远端模型目录能够声明 `apiBackend=messages`；线上是否可用仍由 OAuth entitlement 决定。
 
-2026-07-16 在 `jp` 使用同一个有效免费 OAuth、固定 `grok-4.5` 做了 A/B：`/v1/models` 返回 200 且仅广告一个 `responses` backend；`/v1/responses` 返回 200 并路由到 `grok-4.5-build-free`；紧接着 `/v1/messages` 返回 403 `personal-team-blocked:spending-limit`。这排除了 token 过期和账户完全无免费额度，说明 Messages 至少不属于当前免费 OAuth entitlement。付费/特定 entitlement 是否开放仍需单独实测。
+2026-07-16 在 `jp` 固定 `grok-4.5` 做了两组同-token A/B：
+
+- 免费 OAuth：`/v1/models` 仅广告 `responses`；`/v1/responses` 返回 200 并路由到 `grok-4.5-build-free`；`/v1/messages` 返回 403 `personal-team-blocked:spending-limit`。
+- SuperGrok tier 4 OAuth：proxy `/v1/models` 仍只广告两个 `responses` 模型，但 `/v1/responses` 返回 200 并路由到 `grok-4.5-build`，proxy `/v1/messages` 非流式和流式均返回 200；`api.x.ai/v1/messages` 也返回 200。
+
+因此模型目录的 `apiBackend` 是官方客户端默认选路，不是 endpoint capability 清单。免费账户继续走 Responses；SuperGrok/付费账户可以走原生 Messages，但应按账户探测或 entitlement 缓存，不能用全局 backend 开关覆盖混合账户池。
 
 ## 5. Chat body 审计
 
@@ -169,7 +174,7 @@ UA 漂移成立：
 - `metadata.user_id` 到 `safety_identifier`：已映射。
 - 上游 `/v1/messages`：当前不使用。
 
-这些转换差异仍然存在，但不能据此增加 native Messages backend。对本项目逆向的免费 OAuth Build API，继续上游 Responses 才与线上模型目录和 A/B 结果一致。只有未来模型目录实际返回 `apiBackend=messages`，或付费 OAuth probe 成功后，才应启用 capability-gated Messages backend；实现工作量仍需按完整 backend 评估。
+这些转换差异仍然存在。对免费 OAuth，继续上游 Responses 与线上 A/B 一致；对 SuperGrok tier 4 OAuth，原生 Messages 已被非流式、流式实测确认。合理实现是 `auto|responses|messages` 策略加 per-account capability cache：只在明确支持的账户上走 native，entitlement 拒绝时回退 Responses；网络超时或不确定 5xx 不应自动跨 backend 重试，以免重复执行。实现工作量仍需按完整 backend 评估。
 
 ## 8. Retry、响应头与 SSE
 
@@ -274,7 +279,7 @@ UA 漂移成立：
 2. 对齐流式 Chat usage options。
 3. 统一 UA 平台/架构格式。
 4. 选择性向 compatibility 分支开放 `stream_tool_calls`、raw `x_search`。
-5. 保留 Messages capability probe；免费 OAuth 不启用 native backend，付费/目录广告成功后再评估。
+5. 评估 per-account Messages capability：免费 OAuth 固定 Responses，已验证的 SuperGrok OAuth 可走 native；不要仅依赖模型目录的 `apiBackend`。
 6. 处理 SSE context-details usage 和响应模型元数据。
 
 ### P3/不补
@@ -296,5 +301,5 @@ UA 漂移成立：
 | duplicate call_id 是上游 Grok 报的吗？ | 否，是适配层出网前本地 400。 |
 | 能否断言是 Codex 造出的重复？ | 不能；只能确认最终 ingress payload 已重复。 |
 | 是否应该无条件 soft-dedupe？ | 不应该；只折叠 canonical-equivalent 重复，冲突内容必须继续报错。 |
-| Anthropic 为什么仍转 Responses？ | 当前免费 OAuth 模型目录只广告 Responses，且同 token A/B 实测 Messages 被 entitlement 拒绝；这不是当前目标的架构债。 |
+| Anthropic 是否应直连 Messages？ | 不能全局决定：免费 OAuth 必须走 Responses，SuperGrok tier 4 OAuth 已实测可走原生 Messages；混合池需要 per-account capability。 |
 | 哪些能力明确不补？ | agent/TUI/MCP/sandbox/doom-loop/compaction 等产品层能力。 |

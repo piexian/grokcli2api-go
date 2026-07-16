@@ -1,6 +1,6 @@
 # Review
 
-> Post-audit correction (2026-07-16): the public `xai-org/grok-build` repository has no Git tags or Releases; use the official npm/channel-pointer release sources instead. The sampler's `ApiBackend::Messages` implementation does not prove production Build API entitlement. A same-token free-OAuth A/B probe returned Responses 200 (`grok-4.5-build-free`) but Messages 403 (`personal-team-blocked:spending-limit`), while `/v1/models` advertised only `responses`. For this project's free OAuth target, Messages-to-Responses conversion is not an architecture debt. See `.ccg/tasks/archive/2026-07/verify-version-tags-and-messages-oauth/review.md` and the corrected combined audit.
+> Post-audit correction (2026-07-16): the public `xai-org/grok-build` repository has no Git tags or Releases; use the official npm/channel-pointer release sources instead. The sampler's `ApiBackend::Messages` implementation alone does not prove production entitlement. Same-token probes showed free OAuth: Responses 200 (`grok-4.5-build-free`) and Messages 403; SuperGrok tier 4 OAuth: Responses 200 (`grok-4.5-build`) and Messages 200 for both non-streaming and streaming. `/v1/models` advertised only `responses` in both cases, so it is not a complete capability list. See `.ccg/tasks/archive/2026-07/verify-version-tags-and-messages-oauth/review.md` and the corrected combined audit.
 
 ## Baseline
 

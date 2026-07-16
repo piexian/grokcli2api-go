@@ -1,0 +1,13 @@
+{
+  "id": "probe-supergrok-oauth-messages",
+  "title": "验证 SuperGrok OAuth 的 Build API Messages 权限",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "medium",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-16T09:25:29Z",
+  "branch": "main",
+  "completedAt": "2026-07-16T09:31:35Z"
+}
