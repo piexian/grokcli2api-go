@@ -1,0 +1,13 @@
+{
+  "id": "synthesize-complete-grok-audit",
+  "title": "汇总字段级缺口与 Codex call_id 完整审计",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "low",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-16T08:47:18Z",
+  "completedAt": "2026-07-16T08:50:38Z",
+  "branch": "main"
+}
