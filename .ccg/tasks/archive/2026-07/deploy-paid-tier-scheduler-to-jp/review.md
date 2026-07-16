@@ -25,7 +25,7 @@ Date: 2026-07-16
 - Startup and periodic logs contained no model-refresh or billing-refresh failures.
 - `GROK_BILLING_REFRESH_INTERVAL` is unset remotely, so the new five-minute default is active; the deployment remained clean past the first periodic billing interval.
 - The scheduler state contained no `billing_exhausted` cooldown after deployment.
-- Direct external access to port 8088 timed out, while host-local access succeeded; this is consistent with an external firewall/security-group boundary and did not affect the container smoke test.
+- Direct external access to port 8088 is blocked by the network boundary, as intended. The canonical public endpoint `https://build.eloina.cn` returned 200 over verified TLS and HTTP/2; unauthenticated `/v1/models` returned 401, while authenticated model listing and a live Responses request both succeeded.
 
 ## Tier inventory
 

@@ -1,0 +1,13 @@
+{
+  "id": "verify-jp-public-https",
+  "title": "验证 jp 公网 HTTPS 入口 build.eloina.cn",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "low",
+  "domain": "operations",
+  "currentPhase": "completed",
+  "nextAction": "归档 HTTPS 验证记录",
+  "createdAt": "2026-07-16T11:56:00Z",
+  "branch": "main",
+  "completedAt": "2026-07-16T12:15:51Z"
+}
