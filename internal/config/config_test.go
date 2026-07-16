@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadValidatesStreamCompression(t *testing.T) {
@@ -21,5 +22,16 @@ func TestLoadAdminKey(t *testing.T) {
 	}
 	if cfg.AdminKey != "admin-secret" {
 		t.Fatalf("AdminKey = %q", cfg.AdminKey)
+	}
+}
+
+func TestLoadBillingRefreshInterval(t *testing.T) {
+	t.Setenv("GROK_BILLING_REFRESH_INTERVAL", "7m")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BillingRefreshInterval != 7*time.Minute {
+		t.Fatalf("BillingRefreshInterval = %s", cfg.BillingRefreshInterval)
 	}
 }

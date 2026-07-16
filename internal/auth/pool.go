@@ -51,14 +51,30 @@ type PoolConfig struct {
 // CredentialInfo is a redacted view of a credential account. It deliberately
 // excludes subjects, file paths, client IDs, and token values.
 type CredentialInfo struct {
-	ID              string     `json:"id"`
-	Status          string     `json:"status"`
-	Usable          bool       `json:"usable"`
-	Disabled        bool       `json:"disabled"`
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
-	CooldownUntil   *time.Time `json:"cooldown_until,omitempty"`
-	Models          []string   `json:"models"`
-	HasRefreshToken bool       `json:"has_refresh_token"`
+	ID                      string       `json:"id"`
+	Status                  string       `json:"status"`
+	Usable                  bool         `json:"usable"`
+	Disabled                bool         `json:"disabled"`
+	ExpiresAt               *time.Time   `json:"expires_at,omitempty"`
+	CooldownUntil           *time.Time   `json:"cooldown_until,omitempty"`
+	Models                  []string     `json:"models"`
+	HasRefreshToken         bool         `json:"has_refresh_token"`
+	SubscriptionTier        string       `json:"subscription_tier,omitempty"`
+	SubscriptionTierDisplay string       `json:"subscription_tier_display,omitempty"`
+	Billing                 *BillingInfo `json:"billing,omitempty"`
+}
+
+// BillingInfo is a redacted, in-memory snapshot of the authoritative credits
+// endpoint. Monetary values are remaining cents and never include payment data.
+type BillingInfo struct {
+	UsagePercent           *float64   `json:"usage_percent,omitempty"`
+	PeriodType             string     `json:"period_type,omitempty"`
+	PeriodEnd              *time.Time `json:"period_end,omitempty"`
+	OnDemandRemainingCents *int64     `json:"on_demand_remaining_cents,omitempty"`
+	PrepaidBalanceCents    *int64     `json:"prepaid_balance_cents,omitempty"`
+	UnifiedBilling         *bool      `json:"unified_billing,omitempty"`
+	Exhausted              bool       `json:"exhausted"`
+	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
 type UnavailableError struct {
@@ -91,10 +107,12 @@ type account struct {
 	modelCooldowns map[string]cooldownState
 	disabled       bool
 	disableReason  string
+	billing        *BillingInfo
 	refreshOnce    sync.Once
 	refreshLock    chan struct{}
 	generation     atomic.Uint64
 	inflight       atomic.Int64
+	paidTier       atomic.Bool
 }
 
 func (a *account) currentGeneration() uint64 {
@@ -131,6 +149,8 @@ func (a *account) requestUsable(now time.Time) bool {
 	defer a.mu.RUnlock()
 	return !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil && a.credential.usable(now)
 }
+
+func (a *account) prefersPaidTier() bool { return a.paidTier.Load() }
 
 func (a *account) supportsModel(model string) bool {
 	if model == "" {
@@ -343,48 +363,63 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 				return nil, p.unavailable(model)
 			}
 		}
-		start := int(p.cursor.Add(1)-1) % len(active)
+		cursor := p.cursor.Add(1) - 1
 		saturated := false
 		const schedulingChoices = 4
-		for batch := 0; batch < len(active); batch += schedulingChoices {
-			var selected *account
-			selectedInflight := int64(^uint64(0) >> 1)
-			selectedUsable := false
-			for offset := 0; offset < schedulingChoices && batch+offset < len(active); offset++ {
-				a := active[(start+batch+offset)%len(active)]
-				_, excluded := exclude[a.id]
-				_, failedRefresh := refreshFailed[a.id]
-				if excluded || failedRefresh || !a.available(time.Now()) || !a.supportsModel(model) {
-					continue
-				}
-				inflight := a.inflight.Load()
-				if p.cfg.AccountMaxInflight > 0 && inflight >= int64(p.cfg.AccountMaxInflight) {
-					saturated = true
-					continue
-				}
-				usable := a.requestUsable(time.Now())
-				if selected == nil || usable && !selectedUsable || usable == selectedUsable && inflight < selectedInflight {
-					selected, selectedInflight, selectedUsable = a, inflight, usable
-				}
+		paidEnd := sort.Search(len(active), func(i int) bool { return !active[i].prefersPaidTier() })
+		for _, candidates := range [2][]*account{active[:paidEnd], active[paidEnd:]} {
+			if len(candidates) == 0 {
+				continue
 			}
-			if selected != nil {
-				if !selected.tryAcquire(p.cfg.AccountMaxInflight) {
-					saturated = true
-					continue
-				}
-				if err := p.ensureUsable(ctx, selected); err != nil {
-					selected.inflight.Add(-1)
-					p.notifyCapacity()
-					if refreshFailed == nil {
-						refreshFailed = make(map[string]struct{})
+			start := int(cursor % uint64(len(candidates)))
+			for {
+				retryCandidates := false
+				for batch := 0; batch < len(candidates); batch += schedulingChoices {
+					var selected *account
+					selectedInflight := int64(^uint64(0) >> 1)
+					selectedUsable := false
+					for offset := 0; offset < schedulingChoices && batch+offset < len(candidates); offset++ {
+						a := candidates[(start+batch+offset)%len(candidates)]
+						_, excluded := exclude[a.id]
+						_, failedRefresh := refreshFailed[a.id]
+						if excluded || failedRefresh || !a.available(time.Now()) || !a.supportsModel(model) {
+							continue
+						}
+						inflight := a.inflight.Load()
+						if p.cfg.AccountMaxInflight > 0 && inflight >= int64(p.cfg.AccountMaxInflight) {
+							saturated = true
+							continue
+						}
+						usable := a.requestUsable(time.Now())
+						if selected == nil || usable && !selectedUsable || usable == selectedUsable && inflight < selectedInflight {
+							selected, selectedInflight, selectedUsable = a, inflight, usable
+						}
 					}
-					refreshFailed[selected.id] = struct{}{}
-					continue
+					if selected != nil {
+						if !selected.tryAcquire(p.cfg.AccountMaxInflight) {
+							saturated = true
+							retryCandidates = true
+							break
+						}
+						if err := p.ensureUsable(ctx, selected); err != nil {
+							selected.inflight.Add(-1)
+							p.notifyCapacity()
+							if refreshFailed == nil {
+								refreshFailed = make(map[string]struct{})
+							}
+							refreshFailed[selected.id] = struct{}{}
+							retryCandidates = true
+							break
+						}
+						if affinity.Key != "" {
+							p.affinity.Set(cacheKey, selected.id)
+						}
+						return p.newLease(selected), nil
+					}
 				}
-				if affinity.Key != "" {
-					p.affinity.Set(cacheKey, selected.id)
+				if !retryCandidates {
+					break
 				}
-				return p.newLease(selected), nil
 			}
 		}
 		if saturated {
@@ -584,6 +619,9 @@ func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
 	}
 	info.Models = append(info.Models, a.credential.Models...)
 	info.HasRefreshToken = a.credential.RefreshToken != ""
+	info.SubscriptionTier = a.credential.Tier.Key
+	info.SubscriptionTierDisplay = a.credential.Tier.Display
+	info.Billing = cloneBillingInfo(a.billing)
 	if !a.credential.ExpiresAt.IsZero() {
 		expires := a.credential.ExpiresAt.UTC()
 		info.ExpiresAt = &expires
@@ -784,6 +822,45 @@ func (p *Pool) AccountsNeedingModelRefresh(interval time.Duration) []string {
 	return ids
 }
 
+// AccountsNeedingBillingRefresh returns accounts whose official tier exposes
+// the usage surface and whose in-memory credits snapshot is absent or stale.
+// Cooldowns do not suppress metadata refresh, allowing a topped-up account to
+// recover before its old deadline.
+func (p *Pool) AccountsNeedingBillingRefresh(interval time.Duration) []string {
+	now := time.Now()
+	p.mu.RLock()
+	ids := make([]string, 0, len(p.accounts))
+	for id, a := range p.accounts {
+		a.mu.RLock()
+		billingEligible := !a.disabled && a.credential != nil && a.credential.Tier.Billing
+		due := billingEligible && (a.billing == nil || interval <= 0 || now.Sub(a.billing.UpdatedAt) >= interval)
+		a.mu.RUnlock()
+		if due {
+			ids = append(ids, id)
+		}
+	}
+	p.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
+}
+
+// UpdateBilling replaces one account's redacted in-memory credits snapshot.
+func (p *Pool) UpdateBilling(accountID string, info BillingInfo) error {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	if info.UpdatedAt.IsZero() {
+		info.UpdatedAt = time.Now().UTC()
+	}
+	a.mu.Lock()
+	a.billing = cloneBillingInfo(&info)
+	a.mu.Unlock()
+	return nil
+}
+
 func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Time) error {
 	p.mu.RLock()
 	a := p.accounts[accountID]
@@ -855,15 +932,30 @@ func (p *Pool) RefreshIfUnchanged(ctx context.Context, accountID string, observe
 }
 
 func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
+	p.markCooldown(accountID, reason, duration, true)
+}
+
+// MarkCooldownIfNoOtherReason installs a subsystem cooldown only when the
+// account has no active cooldown from another source. This prevents metadata
+// probes from replacing stronger upstream rate-limit or quota decisions.
+func (p *Pool) MarkCooldownIfNoOtherReason(accountID, reason string, duration time.Duration) bool {
+	return p.markCooldown(accountID, reason, duration, false)
+}
+
+func (p *Pool) markCooldown(accountID, reason string, duration time.Duration, replaceOther bool) bool {
 	p.mu.RLock()
 	a := p.accounts[accountID]
 	p.mu.RUnlock()
 	if a == nil {
-		return
+		return false
 	}
 	now := time.Now()
 	until := now.Add(duration)
 	a.mu.Lock()
+	if !replaceOther && now.Before(a.cooldownUntil) && a.cooldownCause != "" && a.cooldownCause != reason {
+		a.mu.Unlock()
+		return false
+	}
 	remaining := time.Until(a.cooldownUntil)
 	extensionThreshold := remaining / 10
 	if extensionThreshold < 5*time.Second {
@@ -878,7 +970,7 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 	}
 	a.mu.Unlock()
 	if !changed {
-		return
+		return false
 	}
 	p.mu.Lock()
 	state := p.states[accountID]
@@ -889,6 +981,43 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 	p.rebuildWhenCooldownExpires(until)
 	_ = p.persistState()
 	slog.Warn("credential account cooling", "account", accountID, "reason", reason, "until", until.UTC().Format(time.RFC3339))
+	return true
+}
+
+// ClearCooldownReason clears only a cooldown created by the named subsystem.
+// It cannot erase rate-limit, auth, model, or upstream quota cooldowns.
+func (p *Pool) ClearCooldownReason(accountID, reason string) bool {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	if a.cooldownCause != reason {
+		a.mu.Unlock()
+		return false
+	}
+	a.cooldownUntil = time.Time{}
+	a.cooldownCause = ""
+	a.mu.Unlock()
+
+	p.mu.Lock()
+	state := p.states[accountID]
+	if state.Reason == reason {
+		state.CooldownUntil = time.Time{}
+		state.Reason = ""
+		if !state.Disabled && len(state.ModelCooldowns) == 0 {
+			delete(p.states, accountID)
+		} else {
+			p.states[accountID] = state
+		}
+	}
+	p.mu.Unlock()
+	p.requestRebuild()
+	p.notifyCapacity()
+	_ = p.persistState()
+	return true
 }
 
 func (p *Pool) MarkModelCooldown(accountID, model, reason string, duration time.Duration) {
@@ -1318,6 +1447,7 @@ func (p *Pool) scanUnlocked() error {
 				existing.disableReason = ""
 				existing.cooldownUntil = time.Time{}
 				existing.cooldownCause = ""
+				existing.billing = nil
 				state := p.states[id]
 				state.Disabled = false
 				state.CredentialFingerprint = ""
@@ -1390,6 +1520,34 @@ func (p *Pool) scanUnlocked() error {
 	return nil
 }
 
+func cloneBillingInfo(source *BillingInfo) *BillingInfo {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	if source.UsagePercent != nil {
+		value := *source.UsagePercent
+		cloned.UsagePercent = &value
+	}
+	if source.PeriodEnd != nil {
+		value := *source.PeriodEnd
+		cloned.PeriodEnd = &value
+	}
+	if source.OnDemandRemainingCents != nil {
+		value := *source.OnDemandRemainingCents
+		cloned.OnDemandRemainingCents = &value
+	}
+	if source.PrepaidBalanceCents != nil {
+		value := *source.PrepaidBalanceCents
+		cloned.PrepaidBalanceCents = &value
+	}
+	if source.UnifiedBilling != nil {
+		value := *source.UnifiedBilling
+		cloned.UnifiedBilling = &value
+	}
+	return &cloned
+}
+
 func (p *Pool) rebuildActive() {
 	now := time.Now()
 	p.mu.RLock()
@@ -1400,6 +1558,7 @@ func (p *Pool) rebuildActive() {
 		available := !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil
 		var models []string
 		if available {
+			a.paidTier.Store(a.credential.Tier.Paid)
 			for _, model := range a.credential.Models {
 				cooldown, cooling := a.modelCooldowns[model]
 				if !cooling || !now.Before(cooldown.Until) {
@@ -1417,10 +1576,22 @@ func (p *Pool) rebuildActive() {
 		}
 	}
 	p.mu.RUnlock()
-	sort.Slice(active, func(i, j int) bool { return active[i].id < active[j].id })
+	sort.Slice(active, func(i, j int) bool {
+		paidI, paidJ := active[i].prefersPaidTier(), active[j].prefersPaidTier()
+		if paidI != paidJ {
+			return paidI
+		}
+		return active[i].id < active[j].id
+	})
 	for model := range byModel {
 		accounts := byModel[model]
-		sort.Slice(accounts, func(i, j int) bool { return accounts[i].id < accounts[j].id })
+		sort.Slice(accounts, func(i, j int) bool {
+			paidI, paidJ := accounts[i].prefersPaidTier(), accounts[j].prefersPaidTier()
+			if paidI != paidJ {
+				return paidI
+			}
+			return accounts[i].id < accounts[j].id
+		})
 	}
 	p.active.Store(active)
 	p.activeByModel.Store(byModel)

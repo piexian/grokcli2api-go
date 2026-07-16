@@ -1,6 +1,6 @@
 {
   "id": "probe-supergrok-oauth-messages",
-  "title": "验证 SuperGrok OAuth 的 Build API Messages 权限",
+  "title": "验证 X Premium+ OAuth 的 Build API Messages 权限",
   "status": "completed",
   "complexity": "S",
   "risk": "medium",

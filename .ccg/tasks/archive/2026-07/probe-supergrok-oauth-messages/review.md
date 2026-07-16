@@ -1,4 +1,4 @@
-# SuperGrok OAuth Messages probe
+# X Premium+ OAuth Messages probe
 
 Date: 2026-07-16
 
@@ -10,7 +10,8 @@ Security handling:
 
 Credential metadata relevant to capability selection:
 
-- OAuth tier: 4
+- OAuth tier: 4, which the official CLI maps to `x_premium_plus` / `X Premium+` (not SuperGrok).
+- Live `/v1/settings` and `/v1/user?include=subscription` independently confirmed `X Premium+` / `XPremiumPlus`.
 - Scopes included `grok-cli:access` and `api:access`.
 - Test model was fixed to `grok-4.5`.
 
@@ -25,4 +26,4 @@ Results:
 
 Conclusion:
 
-SuperGrok tier 4 OAuth supports native Anthropic Messages on both the Build proxy and the public API. This differs from the tested free OAuth, where Responses succeeded but Messages returned `personal-team-blocked:spending-limit`. Because `/v1/models` advertised only `responses` for both account classes, backend capability must be selected per account; catalog `apiBackend` alone is insufficient.
+The tested X Premium+ OAuth supports native Anthropic Messages on both the Build proxy and the public API. This differs from the tested free OAuth, where Responses succeeded but Messages returned `personal-team-blocked:spending-limit`. Because `/v1/models` advertised only `responses` for both account classes, backend capability must be selected per account; catalog `apiBackend` alone is insufficient. This probe does not establish native Messages support for SuperGrok, SuperGrok Lite, SuperGrok Heavy, X Basic, or X Premium.

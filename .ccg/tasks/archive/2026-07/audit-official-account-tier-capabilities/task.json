@@ -1,0 +1,13 @@
+{
+  "id": "audit-official-account-tier-capabilities",
+  "title": "适配官方账号层级并评估付费账号原生端点",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "medium",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档任务并提交实现",
+  "createdAt": "2026-07-16T09:33:12Z",
+  "branch": "main",
+  "completedAt": "2026-07-16T10:24:54Z"
+}

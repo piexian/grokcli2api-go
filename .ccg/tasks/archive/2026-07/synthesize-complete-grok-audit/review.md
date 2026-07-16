@@ -18,7 +18,7 @@
 1. Proxy 指纹确实缺 `x-authenticateresponse` 和 `x-grok-client-mode`，但官方是按可信 URL 派生注入；不能在所有可配置上游上无条件发送。
 2. Chat 主体可用，但不是“无关键字段缺口”：`user`、流式 `stream_options.include_usage`、新版 `search_parameters` 均有明确 wire 漂移。
 3. Responses 兼容层较完整，但必须区分 native Grok 透传和 OpenAI/Codex 兼容分支；`stream_tool_calls`、raw `x_search` 不是全局缺失。
-4. Anthropic `/v1/messages` 入口能用，但当前统一转为上游 `/v1/responses`。线上 A/B 证明 backend 能力随 OAuth entitlement 变化：免费 OAuth 只有 Responses，SuperGrok tier 4 OAuth 的原生 Messages 非流式和流式均可用。不能全局启用或全局否定 native Messages，应按账户能力选择。
+4. Anthropic `/v1/messages` 入口能用，但当前统一转为上游 `/v1/responses`。线上 A/B 证明 backend 能力随 OAuth entitlement 变化：免费 OAuth 只有 Responses，X Premium+（JWT tier 4）的原生 Messages 非流式和流式均可用。不能全局启用或全局否定 native Messages，应按账户能力选择；其他付费层级仍需分别验证。
 5. Retry、响应模型元数据和 SSE usage 仍有真实缺口。
 6. Codex duplicate `call_id` 的 400 确实由适配层在出网前生成；但现有证据只能证明最终入站 payload 已重复，不能证明 Codex 是重复项的制造者。
 7. doom-loop、compaction、TUI、MCP host、sandbox、agent WebSocket 等仍应排除在 API 适配范围之外。
@@ -92,7 +92,7 @@ UA 漂移成立：
 | --- | --- | --- | --- |
 | `POST /v1/chat/completions` | 支持 | 支持 | 核心可用 |
 | `POST /v1/responses` | 支持 | 支持 | 核心可用 |
-| `POST /v1/messages` | sampler 有协议实现；免费 OAuth 拒绝，SuperGrok tier 4 OAuth 实测可用 | 下游 Messages 转上游 Responses | 需要按账户 capability 选择 |
+| `POST /v1/messages` | sampler 有协议实现；免费 OAuth 拒绝，X Premium+ OAuth 实测可用 | 下游 Messages 转上游 Responses | 需要按账户 capability 选择 |
 | `GET /v1/models` | 支持 | 支持并池化 | 可用 |
 
 源码证明 session token 可以作为 Bearer 构造 `{base_url}/messages` 请求，也证明远端模型目录能够声明 `apiBackend=messages`；线上是否可用仍由 OAuth entitlement 决定。
@@ -100,9 +100,9 @@ UA 漂移成立：
 2026-07-16 在 `jp` 固定 `grok-4.5` 做了两组同-token A/B：
 
 - 免费 OAuth：`/v1/models` 仅广告 `responses`；`/v1/responses` 返回 200 并路由到 `grok-4.5-build-free`；`/v1/messages` 返回 403 `personal-team-blocked:spending-limit`。
-- SuperGrok tier 4 OAuth：proxy `/v1/models` 仍只广告两个 `responses` 模型，但 `/v1/responses` 返回 200 并路由到 `grok-4.5-build`，proxy `/v1/messages` 非流式和流式均返回 200；`api.x.ai/v1/messages` 也返回 200。
+- X Premium+ OAuth（JWT tier 4，且 `/settings`/`/user` 双重确认）：proxy `/v1/models` 仍只广告两个 `responses` 模型，但 `/v1/responses` 返回 200 并路由到 `grok-4.5-build`，proxy `/v1/messages` 非流式和流式均返回 200；`api.x.ai/v1/messages` 也返回 200。
 
-因此模型目录的 `apiBackend` 是官方客户端默认选路，不是 endpoint capability 清单。免费账户继续走 Responses；SuperGrok/付费账户可以走原生 Messages，但应按账户探测或 entitlement 缓存，不能用全局 backend 开关覆盖混合账户池。
+因此模型目录的 `apiBackend` 是官方客户端默认选路，不是 endpoint capability 清单。免费账户继续走 Responses；已验证的 X Premium+ 账户可以走原生 Messages，但其他付费层级不能据此推断。应按账户探测或 entitlement 缓存，不能用全局 backend 开关覆盖混合账户池。
 
 ## 5. Chat body 审计
 
@@ -174,7 +174,7 @@ UA 漂移成立：
 - `metadata.user_id` 到 `safety_identifier`：已映射。
 - 上游 `/v1/messages`：当前不使用。
 
-这些转换差异仍然存在。对免费 OAuth，继续上游 Responses 与线上 A/B 一致；对 SuperGrok tier 4 OAuth，原生 Messages 已被非流式、流式实测确认。合理实现是 `auto|responses|messages` 策略加 per-account capability cache：只在明确支持的账户上走 native，entitlement 拒绝时回退 Responses；网络超时或不确定 5xx 不应自动跨 backend 重试，以免重复执行。实现工作量仍需按完整 backend 评估。
+这些转换差异仍然存在。对免费 OAuth，继续上游 Responses 与线上 A/B 一致；对 X Premium+ OAuth，原生 Messages 已被非流式、流式实测确认。合理实现是 `auto|responses|messages` 策略加 per-account capability cache：只在明确支持的账户上走 native，entitlement 拒绝时回退 Responses；网络超时或不确定 5xx 不应自动跨 backend 重试，以免重复执行。实现工作量仍需按完整 backend 评估。
 
 ## 8. Retry、响应头与 SSE
 
@@ -279,7 +279,7 @@ UA 漂移成立：
 2. 对齐流式 Chat usage options。
 3. 统一 UA 平台/架构格式。
 4. 选择性向 compatibility 分支开放 `stream_tool_calls`、raw `x_search`。
-5. 评估 per-account Messages capability：免费 OAuth 固定 Responses，已验证的 SuperGrok OAuth 可走 native；不要仅依赖模型目录的 `apiBackend`。
+5. 评估 per-account Messages capability：免费 OAuth 固定 Responses，已验证的 X Premium+ OAuth 可走 native；其余层级需独立验证，不要仅依赖模型目录的 `apiBackend`。
 6. 处理 SSE context-details usage 和响应模型元数据。
 
 ### P3/不补
@@ -301,5 +301,5 @@ UA 漂移成立：
 | duplicate call_id 是上游 Grok 报的吗？ | 否，是适配层出网前本地 400。 |
 | 能否断言是 Codex 造出的重复？ | 不能；只能确认最终 ingress payload 已重复。 |
 | 是否应该无条件 soft-dedupe？ | 不应该；只折叠 canonical-equivalent 重复，冲突内容必须继续报错。 |
-| Anthropic 是否应直连 Messages？ | 不能全局决定：免费 OAuth 必须走 Responses，SuperGrok tier 4 OAuth 已实测可走原生 Messages；混合池需要 per-account capability。 |
+| Anthropic 是否应直连 Messages？ | 不能全局决定：免费 OAuth 必须走 Responses，X Premium+ OAuth 已实测可走原生 Messages；其他层级未知，混合池需要 per-account capability。 |
 | 哪些能力明确不补？ | agent/TUI/MCP/sandbox/doom-loop/compaction 等产品层能力。 |
