@@ -1,0 +1,13 @@
+{
+  "id": "verify-grok-wire-parity-gap-list",
+  "title": "核验官方 grok-build 字段缺口与 Codex 重复 call_id 结论",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "low",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-16T08:14:23Z",
+  "completedAt": "2026-07-16T08:43:06Z",
+  "branch": "main"
+}
