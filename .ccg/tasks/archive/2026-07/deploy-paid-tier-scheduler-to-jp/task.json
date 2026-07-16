@@ -1,0 +1,13 @@
+{
+  "id": "deploy-paid-tier-scheduler-to-jp",
+  "title": "部署官方层级调度与 billing 冷却到 jp",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "operations",
+  "currentPhase": "completed",
+  "nextAction": "归档部署记录",
+  "createdAt": "2026-07-16T11:38:02Z",
+  "branch": "main",
+  "completedAt": "2026-07-16T11:55:18Z"
+}
