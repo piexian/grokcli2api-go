@@ -7,7 +7,8 @@
 - 官方源码仓库：`/root/work/grok-build`
 - 官方源码基线提交：`c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
 - Codex 对照：`openai/codex` tag `rust-v0.144.4`
-- 官方 xAI changelog 在该快照的最新版本：`0.2.101`
+- 官方发布版本源在审计时均返回 `0.2.101`：npm `latest/alpha`、`https://x.ai/cli/stable` 和公开 GCS stable pointer。
+- 官方公开 `xai-org/grok-build` 仓库在审计时没有 Git tag 或 GitHub Release。
 - 验证：当前适配执行 `go test ./...` 全部通过。
 
 ## 2. 总结论
@@ -17,7 +18,7 @@
 1. Proxy 指纹确实缺 `x-authenticateresponse` 和 `x-grok-client-mode`，但官方是按可信 URL 派生注入；不能在所有可配置上游上无条件发送。
 2. Chat 主体可用，但不是“无关键字段缺口”：`user`、流式 `stream_options.include_usage`、新版 `search_parameters` 均有明确 wire 漂移。
 3. Responses 兼容层较完整，但必须区分 native Grok 透传和 OpenAI/Codex 兼容分支；`stream_tool_calls`、raw `x_search` 不是全局缺失。
-4. Anthropic `/v1/messages` 能用，但当前实际转为上游 `/v1/responses`，其语义损失比原报告写得更大。
+4. Anthropic `/v1/messages` 入口能用，但当前转为上游 `/v1/responses`。官方 sampler 虽实现 Messages 协议，免费 OAuth Build API 的线上目录只广告 Responses，同 OAuth A/B 实测也只有 Responses 可用；因此不能把 native Messages 视为当前目标的架构债。
 5. Retry、响应模型元数据和 SSE usage 仍有真实缺口。
 6. Codex duplicate `call_id` 的 400 确实由适配层在出网前生成；但现有证据只能证明最终入站 payload 已重复，不能证明 Codex 是重复项的制造者。
 7. doom-loop、compaction、TUI、MCP host、sandbox、agent WebSocket 等仍应排除在 API 适配范围之外。
@@ -72,7 +73,9 @@
 - README 与 Responses 兼容基线写 `0.2.99`。
 - 官方源码快照的 changelog 最新为 `0.2.101`。
 
-因此不能简单把默认值改成 `0.2.99`。应先选定一个实际验证可通的发布基线，再集中定义 runtime、fixture、README 和过滤规则。源码本身不能证明旧版本一定触发 426，所以版本不一致是 P1；只有线上确认版本门禁后才升级为 P0。
+因此不能简单把默认值改成 `0.2.99`，也不能从公开仓库 Git tag 自动读取：该仓库当前没有 tag 或 Release。官方自己的 updater 对 npm 安装读取 `@xai-official/grok` dist-tag，对内部安装读取公开 channel pointer；`GROK_VERSION` 则在构建时注入。
+
+若要自动更新 header，正确数据源应为 `https://x.ai/cli/stable`，fallback 为 `https://storage.googleapis.com/grok-build-public-artifacts/cli/stable`，而不是解析 Git 仓库。建议显式 `GROK_CLIENT_VERSION` 始终优先；仅在可信 cli-chat-proxy 上启用异步发现，严格校验 semver、缓存 last-known-good，并保留编译时 fallback。不要让请求等待远端版本查询。源码本身不能证明旧版本一定触发 426，所以版本不一致仍是 P1；只有线上确认版本门禁后才升级为 P0。
 
 ### 3.5 User-Agent 与可选头
 
@@ -89,10 +92,12 @@ UA 漂移成立：
 | --- | --- | --- | --- |
 | `POST /v1/chat/completions` | 支持 | 支持 | 核心可用 |
 | `POST /v1/responses` | 支持 | 支持 | 核心可用 |
-| `POST /v1/messages` | 原生 backend | 下游 Messages 转上游 Responses | 架构/语义缺口 |
+| `POST /v1/messages` | sampler 有协议实现；线上能力由模型目录和 entitlement 决定 | 下游 Messages 转上游 Responses | 对当前免费 OAuth 目标是正确兼容路径 |
 | `GET /v1/models` | 支持 | 支持并池化 | 可用 |
 
-Anthropic 原生 Messages backend 是功能债，不是当前服务的存活债。增加 `GROK_ANTHROPIC_BACKEND=responses|messages` 的 feature flag 是合理方向，但不仅是改 path，还需要鉴权选择、流式事件策略、错误映射和行为测试。
+源码证明 session token 可以作为 Bearer 构造 `{base_url}/messages` 请求，也证明远端模型目录能够声明 `apiBackend=messages`；这仍不等于生产 Build API 已对当前 OAuth entitlement 开放 Messages。
+
+2026-07-16 在 `jp` 使用同一个有效免费 OAuth、固定 `grok-4.5` 做了 A/B：`/v1/models` 返回 200 且仅广告一个 `responses` backend；`/v1/responses` 返回 200 并路由到 `grok-4.5-build-free`；紧接着 `/v1/messages` 返回 403 `personal-team-blocked:spending-limit`。这排除了 token 过期和账户完全无免费额度，说明 Messages 至少不属于当前免费 OAuth entitlement。付费/特定 entitlement 是否开放仍需单独实测。
 
 ## 5. Chat body 审计
 
@@ -164,7 +169,7 @@ Anthropic 原生 Messages backend 是功能债，不是当前服务的存活债�
 - `metadata.user_id` 到 `safety_identifier`：已映射。
 - 上游 `/v1/messages`：当前不使用。
 
-这使原生 Messages feature flag 保持为 P2，但实现工作量应按一个完整 backend 评估，而不是简单透传开关。
+这些转换差异仍然存在，但不能据此增加 native Messages backend。对本项目逆向的免费 OAuth Build API，继续上游 Responses 才与线上模型目录和 A/B 结果一致。只有未来模型目录实际返回 `apiBackend=messages`，或付费 OAuth probe 成功后，才应启用 capability-gated Messages backend；实现工作量仍需按完整 backend 评估。
 
 ## 8. Retry、响应头与 SSE
 
@@ -258,7 +263,7 @@ Anthropic 原生 Messages backend 是功能债，不是当前服务的存活债�
 
 1. 增加并校验 `x-grok-client-mode`，适配器默认 `headless`。
 2. 双发 `x-userid` 与 `x-grok-user-id`。
-3. 选定并统一一个实测发布版本基线，不直接追随过时的 `0.2.99`。
+3. 统一版本基线；若做自动发现，读取官方 stable channel pointer，采用显式配置优先、异步刷新、semver 校验、last-known-good cache 和固定 fallback。
 4. 修正 Chat `user` wire 行为。
 5. 支持当前官方 `search_parameters.mode/sources[]` 形态。
 6. 若真实流量证实 identical duplicate call 来自正常 Codex 链路，实施保守 canonical dedupe；冲突重复继续拒绝。
@@ -269,7 +274,7 @@ Anthropic 原生 Messages backend 是功能债，不是当前服务的存活债�
 2. 对齐流式 Chat usage options。
 3. 统一 UA 平台/架构格式。
 4. 选择性向 compatibility 分支开放 `stream_tool_calls`、raw `x_search`。
-5. 评估原生 Anthropic Messages backend。
+5. 保留 Messages capability probe；免费 OAuth 不启用 native backend，付费/目录广告成功后再评估。
 6. 处理 SSE context-details usage 和响应模型元数据。
 
 ### P3/不补
@@ -291,5 +296,5 @@ Anthropic 原生 Messages backend 是功能债，不是当前服务的存活债�
 | duplicate call_id 是上游 Grok 报的吗？ | 否，是适配层出网前本地 400。 |
 | 能否断言是 Codex 造出的重复？ | 不能；只能确认最终 ingress payload 已重复。 |
 | 是否应该无条件 soft-dedupe？ | 不应该；只折叠 canonical-equivalent 重复，冲突内容必须继续报错。 |
-| 最大架构债是什么？ | Anthropic 下游 Messages 仍通过上游 Responses 实现。 |
+| Anthropic 为什么仍转 Responses？ | 当前免费 OAuth 模型目录只广告 Responses，且同 token A/B 实测 Messages 被 entitlement 拒绝；这不是当前目标的架构债。 |
 | 哪些能力明确不补？ | agent/TUI/MCP/sandbox/doom-loop/compaction 等产品层能力。 |

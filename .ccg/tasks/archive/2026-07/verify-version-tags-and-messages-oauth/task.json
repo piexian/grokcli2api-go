@@ -1,0 +1,13 @@
+{
+  "id": "verify-version-tags-and-messages-oauth",
+  "title": "核验官方 tag 自动版本与 Build API Messages OAuth 支持",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-16T08:54:36Z",
+  "completedAt": "2026-07-16T09:14:59Z",
+  "branch": "main"
+}

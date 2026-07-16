@@ -1,5 +1,7 @@
 # Review
 
+> Post-audit correction (2026-07-16): the public `xai-org/grok-build` repository has no Git tags or Releases; use the official npm/channel-pointer release sources instead. The sampler's `ApiBackend::Messages` implementation does not prove production Build API entitlement. A same-token free-OAuth A/B probe returned Responses 200 (`grok-4.5-build-free`) but Messages 403 (`personal-team-blocked:spending-limit`), while `/v1/models` advertised only `responses`. For this project's free OAuth target, Messages-to-Responses conversion is not an architecture debt. See `.ccg/tasks/archive/2026-07/verify-version-tags-and-messages-oauth/review.md` and the corrected combined audit.
+
 ## Baseline
 
 - Current adapter: `/root/work/grokcli2api-go` at `fc2f2cdca682aaf1f864317bc9aa0c83c2e8e891`
@@ -9,7 +11,7 @@
 
 ## Verdict
 
-The supplied gap list is directionally correct for proxy headers, the missing upstream Messages backend, retry metadata, and agent/product boundaries. It is not accurate enough to implement unchanged. It misses three concrete Chat wire divergences, treats native Responses passthrough gaps as global gaps, understates Anthropic compatibility losses, and recommends an already stale client version.
+The supplied gap list is directionally correct for proxy headers, Anthropic conversion losses, retry metadata, and agent/product boundaries. It is not accurate enough to implement unchanged. It misses three concrete Chat wire divergences, treats native Responses passthrough gaps as global gaps, overstates production Messages availability, understates Anthropic compatibility losses, and recommends an already stale client version.
 
 An exact “80-85% covered” figure is not supported by a stable denominator: the report mixes wire fields, optional metadata, backend architecture, and deliberately excluded agent features.
 
@@ -67,7 +69,7 @@ Official sampler defaults omitted `store` to false and always adds `reasoning.en
 
 ### 9. Anthropic compatibility loss is understated
 
-The architecture finding is correct: downstream `/v1/messages` always becomes upstream `/v1/responses`: `internal/server/server.go:366-405,601-603`; official has a native `Messages` backend: `xai-grok-sampling-types/src/types.rs:1010-1021`.
+The adapter behavior is confirmed: downstream `/v1/messages` always becomes upstream `/v1/responses`: `internal/server/server.go:366-405,601-603`. Official source has a `Messages` protocol implementation (`xai-grok-sampling-types/src/types.rs:1010-1021`), but that alone does not establish production Build API OAuth entitlement. The later free-OAuth A/B probe shows Responses is the only advertised and usable backend for this target.
 
 Corrections:
 
@@ -76,7 +78,7 @@ Corrections:
 - Adapter maps only `output_config.format`; `output_config.effort` is ignored: `internal/anthropic/converter.go:132-136`.
 - Local `stop_sequences` execution is implemented and is a semantic approximation, as the report says: `internal/anthropic/converter.go:166-172` plus response/stream filters.
 
-An opt-in native Messages backend remains a reasonable feature, but it needs request auth selection, streaming translation/passthrough policy, error mapping, and tests.
+A native Messages backend should remain disabled for the current free-OAuth target. It becomes reasonable only behind a capability check after `/v1/models` advertises `apiBackend=messages` or a paid/entitled OAuth probe succeeds; it would then still need request auth selection, streaming policy, error mapping, and tests.
 
 ## Confirmed findings
 
@@ -99,7 +101,7 @@ An opt-in native Messages backend remains a reasonable feature, but it needs req
 
 1. P0: trusted-URL-scoped `x-authenticateresponse` injection, with regression tests.
 2. P1: add validated `x-grok-client-mode` (adapter default `headless`); dual-send `x-grok-user-id`; choose one verified client version baseline; fix Chat `user` and current `search_parameters` shape.
-3. P2: honor `x-should-retry:false` and reconcile retry statuses; inject Chat streaming usage options; normalize UA; optionally expose `stream_tool_calls`/`x_search` to compatibility clients; evaluate native Messages backend.
+3. P2: honor `x-should-retry:false` and reconcile retry statuses; inject Chat streaming usage options; normalize UA; optionally expose `stream_tool_calls`/`x_search` to compatibility clients; retain a Messages capability probe without enabling it for free OAuth.
 4. P3: Responses context-details presentation, response model metadata, and documentation cleanup unless operational needs raise their priority.
 5. Out of scope: agent-only doom-loop/compaction/TUI/MCP/sandbox/WS product features.
 
