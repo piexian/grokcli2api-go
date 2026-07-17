@@ -3,7 +3,9 @@ package grok
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -109,6 +111,121 @@ func TestFreeModelQuotaDetection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseBillingInfoDetectsOnlyExplicitExhaustion(t *testing.T) {
+	now := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+	periodEnd := "2026-07-21T08:02:22.599357+00:00"
+	tests := []struct {
+		name      string
+		config    map[string]any
+		exhausted bool
+	}{
+		{name: "usage available", config: map[string]any{"creditUsagePercent": 5.0, "currentPeriod": map[string]any{"end": periodEnd}}},
+		{name: "included exhausted", config: map[string]any{"creditUsagePercent": 100.0}, exhausted: true},
+		{name: "on demand remains", config: map[string]any{"creditUsagePercent": 100.0, "onDemandCap": map[string]any{"val": 5000}, "onDemandUsed": map[string]any{"val": 300}}},
+		{name: "prepaid remains", config: map[string]any{"creditUsagePercent": 100.0, "prepaidBalance": map[string]any{"val": 100}}},
+		{name: "negative prepaid is invalid", config: map[string]any{"creditUsagePercent": 100.0, "prepaidBalance": map[string]any{"val": -100}}, exhausted: true},
+		{name: "legacy exhausted", config: map[string]any{"monthlyLimit": map[string]any{"val": 2000}, "used": map[string]any{"val": 2000}, "billingPeriodEnd": periodEnd}, exhausted: true},
+		{name: "unknown usage", config: map[string]any{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(map[string]any{"config": test.config})
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := parseBillingInfo(payload, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Exhausted != test.exhausted {
+				t.Fatalf("billing = %#v, exhausted want %t", info, test.exhausted)
+			}
+			if test.name == "usage available" || test.name == "legacy exhausted" {
+				wantEnd, err := time.Parse(time.RFC3339Nano, periodEnd)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.PeriodEnd == nil || !info.PeriodEnd.Equal(wantEnd) {
+					t.Fatalf("period end = %v, want %v", info.PeriodEnd, wantEnd)
+				}
+			}
+		})
+	}
+}
+
+func TestRefreshBillingCoolsAndRestoresPaidAccount(t *testing.T) {
+	var exhausted atomic.Bool
+	exhausted.Store(true)
+	periodEnd := time.Now().Add(2 * time.Hour).UTC()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/billing" || r.URL.Query().Get("format") != "credits" {
+			t.Errorf("path = %s?%s", r.URL.Path, r.URL.RawQuery)
+			http.NotFound(w, r)
+			return
+		}
+		usage := 10.0
+		if exhausted.Load() {
+			usage = 100.0
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"config": map[string]any{
+			"creditUsagePercent": usage,
+			"currentPeriod":      map[string]any{"end": periodEnd.Format(time.RFC3339Nano)},
+			"onDemandCap":        map[string]any{"val": 0},
+			"onDemandUsed":       map[string]any{"val": 0},
+			"prepaidBalance":     map[string]any{"val": 0},
+		}})
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	cfg := config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, BillingRefreshInterval: 5 * time.Minute,
+		RetryMaxAttempts: 1, QuotaCooldown: 24 * time.Hour, AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	client, err := NewClient(cfg, pool, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.RefreshBilling(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	info := pool.Credentials()[0]
+	if info.Billing == nil || !info.Billing.Exhausted || info.CooldownUntil == nil {
+		t.Fatalf("exhausted credential = %#v", info)
+	}
+	if delta := info.CooldownUntil.Sub(periodEnd); delta < -time.Second || delta > time.Second {
+		t.Fatalf("cooldown until = %s, period end = %s", info.CooldownUntil, periodEnd)
+	}
+	if _, err := pool.Acquire(context.Background(), auth.Affinity{}, "grok-4.5", nil); err == nil {
+		t.Fatal("billing-exhausted account remained schedulable")
+	}
+
+	exhausted.Store(false)
+	if err := client.RefreshBilling(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	info = pool.Credentials()[0]
+	if info.Billing == nil || info.Billing.Exhausted || info.CooldownUntil != nil {
+		t.Fatalf("restored credential = %#v", info)
+	}
+	lease, err := pool.Acquire(context.Background(), auth.Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
 }
 
 func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogs(t *testing.T) {
@@ -252,6 +369,25 @@ func writeModelTestCredential(t *testing.T, dir, name, subject, token string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, name), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeBillingTestCredential(t *testing.T, dir, name, subject string, tier int64) {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"tier":` + fmt.Sprint(tier) + `}`))
+	raw := map[string]any{
+		"access_token":  header + "." + payload + ".signature",
+		"refresh_token": "refresh", "client_id": "client", "sub": subject,
+		"expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"models":  []string{"grok-4.5"}, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

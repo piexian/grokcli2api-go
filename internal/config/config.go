@@ -23,6 +23,7 @@ type Config struct {
 	AuthRefreshConcurrency int
 	AccountMaxInflight     int
 	ModelsRefreshInterval  time.Duration
+	BillingRefreshInterval time.Duration
 	RetryMaxAttempts       int
 	RetryBaseDelay         time.Duration
 	RateLimitCooldown      time.Duration
@@ -74,6 +75,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	billingRefreshInterval, err := envDuration("GROK_BILLING_REFRESH_INTERVAL", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	retryBaseDelay, err := envDuration("GROK_RETRY_BASE_DELAY", 200*time.Millisecond)
 	if err != nil {
 		return Config{}, err
@@ -105,6 +110,7 @@ func Load() (Config, error) {
 		AuthRefreshConcurrency: refreshConcurrency,
 		AccountMaxInflight:     accountMaxInflight,
 		ModelsRefreshInterval:  modelsRefreshInterval,
+		BillingRefreshInterval: billingRefreshInterval,
 		RetryMaxAttempts:       retryAttempts,
 		RetryBaseDelay:         retryBaseDelay,
 		RateLimitCooldown:      rateLimitCooldown,

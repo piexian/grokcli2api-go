@@ -46,6 +46,13 @@ type RefreshError struct {
 	Code      string
 }
 
+type subscriptionTier struct {
+	Key     string
+	Display string
+	Paid    bool
+	Billing bool
+}
+
 func (e *RefreshError) Error() string {
 	if e.Code != "" {
 		return "OAuth refresh failed: " + e.Code
@@ -66,6 +73,7 @@ type credential struct {
 	ExpiresIn       time.Duration
 	Models          []string
 	ModelsUpdatedAt time.Time
+	Tier            subscriptionTier
 }
 
 func loadCredential(path, surface string) (*credential, error) {
@@ -125,6 +133,7 @@ func parseCredential(b []byte, path, surface string) (*credential, error) {
 		ClientID: clientID, Subject: subject, Surface: defaultSurface(surface),
 		ExpiresAt: expiresAt, ExpiresIn: expiresIn,
 		Models: stringSlice(node["models"]), ModelsUpdatedAt: firstTime(node, "models_updated_at"),
+		Tier: subscriptionTierFromClaims(accessClaims),
 	}, nil
 }
 
@@ -217,6 +226,7 @@ func (c *credential) refresh(ctx context.Context, client *http.Client) (*credent
 	node := credentialNode(next.Raw)
 	node["access_token"] = access
 	next.AccessToken = access
+	next.Tier = subscriptionTierFromClaims(jwtClaims(access))
 	if refresh := firstString(payload, "refresh_token"); refresh != "" {
 		node["refresh_token"] = refresh
 		next.RefreshToken = refresh
@@ -339,6 +349,59 @@ func jwtClaims(token string) map[string]any {
 		return nil
 	}
 	return claims
+}
+
+// subscriptionTierFromClaims mirrors the official Grok CLI mapping for the
+// prod_auth.SubscriptionTier numeric JWT claim. Unknown positive values remain
+// visible and are treated as paid, matching the CLI's fail-open future-tier policy.
+func subscriptionTierFromClaims(claims map[string]any) subscriptionTier {
+	value, ok := claims["tier"]
+	if !ok {
+		return subscriptionTier{}
+	}
+	n, ok := integerValue(value)
+	if !ok || n < 0 {
+		return subscriptionTier{}
+	}
+	switch n {
+	case 0:
+		return subscriptionTier{Key: "free", Display: "Free"}
+	case 1:
+		return subscriptionTier{Key: "supergrok", Display: "SuperGrok", Paid: true, Billing: true}
+	case 2:
+		return subscriptionTier{Key: "x_basic", Display: "X Basic", Paid: true}
+	case 3:
+		return subscriptionTier{Key: "x_premium", Display: "X Premium", Paid: true, Billing: true}
+	case 4:
+		return subscriptionTier{Key: "x_premium_plus", Display: "X Premium+", Paid: true, Billing: true}
+	case 5:
+		return subscriptionTier{Key: "supergrok_heavy", Display: "SuperGrok Heavy", Paid: true, Billing: true}
+	case 6:
+		return subscriptionTier{Key: "supergrok_lite", Display: "SuperGrok Lite", Paid: true, Billing: true}
+	default:
+		label := strconv.FormatInt(n, 10)
+		return subscriptionTier{Key: label, Display: label, Paid: n > 0, Billing: n > 0}
+	}
+}
+
+func integerValue(value any) (int64, bool) {
+	switch v := value.(type) {
+	case float64:
+		n := int64(v)
+		return n, v == float64(n)
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
+	case string:
+		n, err := strconv.ParseInt(v, 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func unixClaimTime(claims map[string]any, key string) time.Time {

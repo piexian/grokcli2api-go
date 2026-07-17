@@ -33,7 +33,7 @@
 | API 兼容 | OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Grok CLI 原生 Responses 透传 |
 | 响应模式 | 流式 SSE 与非流式响应，兼容常见 SDK 和 HTTP 客户端 |
 | 凭证管理 | 多账号 OAuth 凭证池、自动刷新、目录热加载、刷新结果原子写回 |
-| 智能调度 | 账号轮询、会话亲和、按模型能力调度、失败重试与额度冷却 |
+| 智能调度 | 官方订阅层级识别、付费账号优先、会话亲和、按模型能力调度、失败重试与额度冷却 |
 | 并发治理 | 账号级并发上限与容量背压，降低高并发场景下的 429 重试风暴 |
 | 模型发现 | 按账号获取上游模型目录，缓存、聚合并输出去重后的模型列表 |
 | 访问保护 | 可配置一个或多个本地 API Key，兼容 Bearer、`x-api-key` 与 `api-key` 请求头 |
@@ -55,7 +55,7 @@ flowchart LR
     E3 --> F
 ```
 
-针对不同订阅类型优化，每个请求只会调度到声明支持目标模型的有效账号。
+服务按官方 OAuth tier 识别订阅层级。没有既有亲和的新请求优先使用声明支持目标模型的付费账号；付费账号不可用后再回退 free 或层级未知的账号。
 
 ## API 兼容性
 
@@ -310,6 +310,22 @@ X-Grok-Session-ID: conversation-123
 
 本地 API Key 与客户端 IP 不会被用作账号亲和标识。亲和关系仅保存在内存中，并受 TTL 与容量上限控制。
 
+没有既有亲和的新请求会先在可用付费账号间按负载轮转；当付费账号不支持目标模型、被禁用、进入冷却或达到并发上限时，调度器才会使用 free 或层级未知的账号。已有亲和仍优先保证多轮与 `previous_response_id` 连续性。
+
+管理员凭证接口按官方 CLI 的 JWT `tier` 映射返回 `subscription_tier` 与 `subscription_tier_display`：
+
+| JWT `tier` | `subscription_tier` | 显示名称 |
+| ---: | --- | --- |
+| 0 | `free` | Free |
+| 1 | `supergrok` | SuperGrok |
+| 2 | `x_basic` | X Basic |
+| 3 | `x_premium` | X Premium |
+| 4 | `x_premium_plus` | X Premium+ |
+| 5 | `supergrok_heavy` | SuperGrok Heavy |
+| 6 | `supergrok_lite` | SuperGrok Lite |
+
+层级从当前 access token 动态派生，OAuth 刷新后同步更新，不额外写入凭证文件。没有 tier claim 时省略这两个字段；未知的正数层级保留数字显示并按官方 CLI 的未来层级 fail-open 策略进入付费优先组。
+
 ## 配置说明
 
 程序会从当前工作目录的 `.env` 文件中加载尚未设置的环境变量。完整模板与高级客户端标识选项见 [`.env.example`](.env.example)。
@@ -348,7 +364,7 @@ curl http://localhost:8088/v1/admin/credentials \
   -F "file=@auth.json;type=application/json"
 ```
 
-服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型，临时探测失败不会删除已经保存的凭证。
+服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型，临时探测失败不会删除已经保存的凭证。状态响应还会返回从 JWT 派生的官方订阅层级 key 与显示名称。
 
 列出脱敏后的凭证状态：
 
@@ -375,6 +391,7 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | OAuth 刷新的最大并发数 |
 | `GROK_ACCOUNT_MAX_INFLIGHT` | `16` | 每账号最大上游在途请求数，超出后等待可用容量 |
 | `GROK_MODELS_REFRESH_INTERVAL` | `6h` | 每个账号模型目录的刷新周期 |
+| `GROK_BILLING_REFRESH_INTERVAL` | `5m` | 官方支持 usage 的高层级账号 credits 刷新周期 |
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | 单个请求最多尝试的不同账号数 |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络错误与上游 5xx 错误的基础退避时间 |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 上游 429 未提供 `Retry-After` 时的冷却时间 |
@@ -382,7 +399,9 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | `GROK_AFFINITY_TTL` | `1h` | 内存会话亲和关系的有效期 |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | 会话亲和缓存的容量上限 |
 
-免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。
+免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。官方开放 usage 的高层级账号还会读取 `billing?format=credits`（Free 与 X Basic 不主动轮询）：只有 included usage 达到 100%，且没有剩余 on-demand 或 prepaid 额度时，才主动冷却到服务端返回的周期结束时间。余额恢复只会清理由此探测设置的 `billing_exhausted` 冷却，不会覆盖 429、鉴权、模型级或其他上游冷却。用量快照仅保存在内存并通过管理员凭证状态的 `billing` 字段展示，不写回 OAuth 文件。
+
+调度优先级只区分已知付费层级与 free/未知层级，不假定数字越大套餐越高。
 
 ### 上游与网络
 
@@ -433,7 +452,7 @@ go run ./cmd/grok2api -version
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/admin/credentials` | 列出脱敏的凭证状态和模型目录 |
+| `GET` | `/v1/admin/credentials` | 列出脱敏的凭证状态、官方订阅层级和模型目录 |
 | `POST` | `/v1/admin/credentials` | 上传或覆盖 JSON 凭证，支持 JSON 请求体和 multipart `file` 字段 |
 | `DELETE` | `/v1/admin/credentials/{id}` | 删除凭证并立即从调度池移除 |
 

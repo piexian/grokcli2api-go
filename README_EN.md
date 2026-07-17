@@ -33,7 +33,7 @@ The project uses only the Go standard library at runtime and provides a multi-ac
 | API compatibility | OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and native Grok CLI Responses passthrough |
 | Response modes | Streaming SSE and non-streaming responses for common SDKs and HTTP clients |
 | Credential management | Multi-account OAuth pool, automatic refresh, directory hot reload, and atomic persistence |
-| Smart scheduling | Account rotation, session affinity, capability-aware routing, retries, and quota cooldowns |
+| Smart scheduling | Official subscription-tier detection, paid-account preference, session affinity, capability-aware routing, retries, and quota cooldowns |
 | Concurrency control | Per-account concurrency limits and capacity backpressure to reduce 429 retry storms |
 | Model discovery | Per-account upstream catalogs with caching, aggregation, and deduplication |
 | Access protection | One or more local API keys through Bearer, `x-api-key`, or `api-key` headers |
@@ -55,7 +55,7 @@ flowchart LR
     E3 --> F
 ```
 
-The service is optimized for different subscription tiers, and each request is routed only to a valid account that advertises support for the requested model.
+The service derives the official subscription tier from OAuth tokens. New requests without an existing affinity prefer paid accounts that advertise the requested model, then fall back to free or unknown-tier accounts when paid accounts are unavailable.
 
 ## API Compatibility
 
@@ -310,6 +310,22 @@ The service also recognizes the following fields as affinity identifiers, in ord
 
 Local API keys and client IP addresses are never used for account affinity. Affinity mappings are stored only in memory and are bounded by a TTL and maximum capacity.
 
+New requests without an existing affinity rotate across available paid accounts first. The scheduler uses free or unknown-tier accounts only when paid accounts do not advertise the model, are disabled, are cooling down, or have reached their concurrency limit. Existing affinity still wins to preserve multi-turn and `previous_response_id` continuity.
+
+The administrator credential API returns `subscription_tier` and `subscription_tier_display` using the official CLI mapping for the JWT `tier` claim:
+
+| JWT `tier` | `subscription_tier` | Display name |
+| ---: | --- | --- |
+| 0 | `free` | Free |
+| 1 | `supergrok` | SuperGrok |
+| 2 | `x_basic` | X Basic |
+| 3 | `x_premium` | X Premium |
+| 4 | `x_premium_plus` | X Premium+ |
+| 5 | `supergrok_heavy` | SuperGrok Heavy |
+| 6 | `supergrok_lite` | SuperGrok Lite |
+
+The tier is derived from the current access token and updates after OAuth refresh without adding derived fields to the credential file. Both fields are omitted when the token has no tier claim. Unknown positive numeric tiers retain their numeric label and join the paid-preference group, matching the official CLI's fail-open policy for future tiers.
+
 ## Configuration
 
 The service loads environment variables that are not already set from a `.env` file in the current working directory. See [`.env.example`](.env.example) for the complete template and advanced client-identity options.
@@ -348,7 +364,7 @@ curl http://localhost:8088/v1/admin/credentials \
   -F "file=@auth.json;type=application/json"
 ```
 
-The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload; a temporary discovery failure does not remove the saved credential.
+The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload; a temporary discovery failure does not remove the saved credential. Status responses also include the official subscription-tier key and display name derived from the JWT.
 
 List redacted credential status:
 
@@ -375,6 +391,7 @@ Administrator responses include `Cache-Control: no-store`. Uploads are limited t
 | `GROK_AUTH_REFRESH_CONCURRENCY` | `4` | Maximum concurrent OAuth refreshes |
 | `GROK_ACCOUNT_MAX_INFLIGHT` | `16` | Maximum upstream requests in flight per account; excess requests wait for capacity |
 | `GROK_MODELS_REFRESH_INTERVAL` | `6h` | Per-account model-catalog refresh interval |
+| `GROK_BILLING_REFRESH_INTERVAL` | `5m` | Credits refresh interval for higher tiers with official usage support |
 | `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum number of distinct accounts tried per request |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and upstream 5xx failures |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | Cooldown when an upstream 429 omits `Retry-After` |
@@ -382,7 +399,9 @@ Administrator responses include `Cache-Control: no-store`. Uploads are limited t
 | `GROK_AFFINITY_TTL` | `1h` | Lifetime of in-memory session-affinity mappings |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | Maximum number of affinity-cache entries |
 
-Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account.
+Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account. Higher tiers on which the official client exposes usage also poll `billing?format=credits`; Free and X Basic are not proactively polled. Proactive cooldown occurs only when included usage reaches 100% and neither on-demand nor prepaid credit remains; the cooldown lasts until the server-provided period end. A recovered balance clears only the `billing_exhausted` cooldown created by this probe, never a 429, authentication, model-level, or other upstream cooldown. The redacted snapshot is kept in memory and exposed through the administrator credential status `billing` field; it is not written to OAuth files.
+
+Scheduling distinguishes known paid tiers from free or unknown tiers; it does not assume that larger numeric tier claims represent higher plans.
 
 ### Upstream and Network
 
@@ -433,7 +452,7 @@ These endpoints are registered only when `GROK_ADMIN_KEY` is set, and normal API
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/v1/admin/credentials` | List redacted credential status and model catalogs |
+| `GET` | `/v1/admin/credentials` | List redacted credential status, official subscription tiers, and model catalogs |
 | `POST` | `/v1/admin/credentials` | Upload or replace a JSON credential using a JSON body or multipart `file` field |
 | `DELETE` | `/v1/admin/credentials/{id}` | Delete a credential and immediately remove it from scheduling |
 

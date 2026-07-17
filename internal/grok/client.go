@@ -40,6 +40,10 @@ const freeModelQuotaMessage = "used all the included free usage for model"
 
 const freeModelQuotaReason = "model_free_quota_exhausted"
 
+const billingExhaustedReason = "billing_exhausted"
+
+const defaultBillingRefreshInterval = 5 * time.Minute
+
 type APIError struct {
 	Status          int
 	Body            string
@@ -72,6 +76,7 @@ type Client struct {
 	pool       *auth.Pool
 	http       *http.Client
 	modelsMu   sync.Mutex
+	billingMu  sync.Mutex
 	modelStart sync.Once
 	modelClose chan struct{}
 	modelWG    sync.WaitGroup
@@ -228,6 +233,9 @@ func (c *Client) InitializeModels(ctx context.Context) error {
 	if len(c.pool.Models()) == 0 {
 		return errors.New("no models discovered from credential accounts")
 	}
+	if err := c.RefreshBilling(ctx, false); err != nil {
+		slog.Warn("initial account billing refresh failed", "error", err)
+	}
 	c.StartModelRefresh()
 	return nil
 }
@@ -313,6 +321,113 @@ func (c *Client) RefreshModels(ctx context.Context, force bool) error {
 	return nil
 }
 
+// RefreshBilling fetches authoritative credits metadata for tiers on which the
+// official client exposes its usage surface.
+// It is independent from model discovery so cooled accounts can recover after
+// a reset or top-up without waiting for the model-catalog interval.
+func (c *Client) RefreshBilling(ctx context.Context, force bool) error {
+	c.billingMu.Lock()
+	defer c.billingMu.Unlock()
+	interval := c.cfg.BillingRefreshInterval
+	if interval <= 0 {
+		interval = defaultBillingRefreshInterval
+	}
+	if force {
+		interval = 0
+	}
+	ids := c.pool.AccountsNeedingBillingRefresh(interval)
+	if len(ids) == 0 {
+		return nil
+	}
+	workers := c.cfg.AuthRefreshConcurrency
+	if workers < 1 {
+		workers = 4
+	}
+	if workers > len(ids) {
+		workers = len(ids)
+	}
+	jobs := make(chan string)
+	results := make(chan error, len(ids))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				results <- c.fetchAccountBilling(ctx, id, false)
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, id := range ids {
+			select {
+			case jobs <- id:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(results)
+	succeeded := 0
+	for err := range results {
+		if err == nil {
+			succeeded++
+		}
+	}
+	if succeeded != len(ids) {
+		return fmt.Errorf("billing discovery failed for %d of %d usage-eligible credential accounts", len(ids)-succeeded, len(ids))
+	}
+	return nil
+}
+
+func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refreshed bool) error {
+	lease, err := c.pool.AcquireAccountForMetadata(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	resp, _, err := c.do(ctx, lease, http.MethodGet, "billing?format=credits", nil, NewID(), "", false, false)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	payload, err := readResponseBody(resp, 1<<20)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		apiErr := parseAPIError(resp, payload)
+		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
+			return c.fetchAccountBilling(ctx, accountID, true)
+		}
+		return apiErr
+	}
+	info, err := parseBillingInfo(payload, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := c.pool.UpdateBilling(accountID, info); err != nil {
+		return err
+	}
+	if !info.Exhausted {
+		c.pool.ClearCooldownReason(accountID, billingExhaustedReason)
+		return nil
+	}
+	duration := c.cfg.QuotaCooldown
+	if duration <= 0 {
+		duration = 24 * time.Hour
+	}
+	if info.PeriodEnd != nil {
+		if untilReset := time.Until(*info.PeriodEnd); untilReset > 0 {
+			duration = untilReset
+		}
+	}
+	c.pool.MarkCooldownIfNoOtherReason(accountID, billingExhaustedReason, duration)
+	return nil
+}
+
 func (c *Client) fetchAccountModels(ctx context.Context, accountID string, refreshed bool) ([]string, error) {
 	lease, err := c.pool.AcquireAccountForMetadata(ctx, accountID)
 	if err != nil {
@@ -380,11 +495,122 @@ func parseModelIDs(payload []byte) ([]string, error) {
 	return models, nil
 }
 
+type billingCreditsResponse struct {
+	Config *billingCreditsConfig `json:"config"`
+}
+
+type billingCreditsConfig struct {
+	CreditUsagePercent   *float64            `json:"creditUsagePercent"`
+	CurrentPeriod        *billingUsagePeriod `json:"currentPeriod"`
+	MonthlyLimit         *billingCent        `json:"monthlyLimit"`
+	Used                 *billingCent        `json:"used"`
+	OnDemandCap          *billingCent        `json:"onDemandCap"`
+	OnDemandUsed         *billingCent        `json:"onDemandUsed"`
+	PrepaidBalance       *billingCent        `json:"prepaidBalance"`
+	IsUnifiedBillingUser *bool               `json:"isUnifiedBillingUser"`
+	BillingPeriodEnd     string              `json:"billingPeriodEnd"`
+}
+
+type billingUsagePeriod struct {
+	Type string `json:"type"`
+	End  string `json:"end"`
+}
+
+type billingCent struct {
+	Val int64 `json:"val"`
+}
+
+func parseBillingInfo(payload []byte, now time.Time) (auth.BillingInfo, error) {
+	var response billingCreditsResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return auth.BillingInfo{}, err
+	}
+	info := auth.BillingInfo{UpdatedAt: now.UTC()}
+	if response.Config == nil {
+		return info, nil
+	}
+	cfg := response.Config
+	if cfg.CreditUsagePercent != nil {
+		usage := *cfg.CreditUsagePercent
+		if usage < 0 {
+			usage = 0
+		} else if usage > 100 {
+			usage = 100
+		}
+		info.UsagePercent = &usage
+	} else if cfg.MonthlyLimit != nil && nonNegativeCents(cfg.MonthlyLimit.Val) > 0 {
+		limit := nonNegativeCents(cfg.MonthlyLimit.Val)
+		used := int64(0)
+		if cfg.Used != nil {
+			used = nonNegativeCents(cfg.Used.Val)
+		}
+		usage := float64(used) / float64(limit) * 100
+		if usage > 100 {
+			usage = 100
+		}
+		info.UsagePercent = &usage
+	}
+	periodEnd := cfg.BillingPeriodEnd
+	if cfg.CurrentPeriod != nil {
+		info.PeriodType = cfg.CurrentPeriod.Type
+		if cfg.CurrentPeriod.End != "" {
+			periodEnd = cfg.CurrentPeriod.End
+		}
+	}
+	if end, err := time.Parse(time.RFC3339Nano, periodEnd); err == nil {
+		end = end.UTC()
+		info.PeriodEnd = &end
+	}
+	if cfg.OnDemandCap != nil {
+		capCents := nonNegativeCents(cfg.OnDemandCap.Val)
+		usedCents := int64(0)
+		if cfg.OnDemandUsed != nil {
+			usedCents = nonNegativeCents(cfg.OnDemandUsed.Val)
+		} else if cfg.Used != nil && cfg.MonthlyLimit != nil {
+			usedCents = nonNegativeCents(cfg.Used.Val) - nonNegativeCents(cfg.MonthlyLimit.Val)
+			if usedCents < 0 {
+				usedCents = 0
+			}
+		}
+		remaining := capCents - usedCents
+		if remaining < 0 {
+			remaining = 0
+		}
+		info.OnDemandRemainingCents = &remaining
+	}
+	if cfg.PrepaidBalance != nil {
+		balance := nonNegativeCents(cfg.PrepaidBalance.Val)
+		info.PrepaidBalanceCents = &balance
+	}
+	if cfg.IsUnifiedBillingUser != nil {
+		unified := *cfg.IsUnifiedBillingUser
+		info.UnifiedBilling = &unified
+	}
+	hasOnDemand := info.OnDemandRemainingCents != nil && *info.OnDemandRemainingCents > 0
+	hasPrepaid := info.PrepaidBalanceCents != nil && *info.PrepaidBalanceCents > 0
+	info.Exhausted = info.UsagePercent != nil && *info.UsagePercent >= 100 && !hasOnDemand && !hasPrepaid
+	return info, nil
+}
+
+func nonNegativeCents(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 func (c *Client) modelRefreshLoop() {
 	defer c.modelWG.Done()
 	checkInterval := c.cfg.AuthsReloadInterval
 	if checkInterval <= 0 {
 		checkInterval = 30 * time.Second
+	}
+	billingInterval := c.cfg.BillingRefreshInterval
+	if billingInterval <= 0 {
+		billingInterval = defaultBillingRefreshInterval
+	}
+	if billingInterval < checkInterval {
+		checkInterval = billingInterval
 	}
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
@@ -394,6 +620,11 @@ func (c *Client) modelRefreshLoop() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if err := c.RefreshModels(ctx, false); err != nil {
 				slog.Warn("account model refresh failed", "error", err)
+			}
+			cancel()
+			ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := c.RefreshBilling(ctx, false); err != nil {
+				slog.Warn("account billing refresh failed", "error", err)
 			}
 			cancel()
 		case <-c.modelClose:

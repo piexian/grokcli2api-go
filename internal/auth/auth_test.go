@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,36 @@ import (
 	"time"
 )
 
+func TestOfficialSubscriptionTierMapping(t *testing.T) {
+	tests := []struct {
+		tier    int64
+		key     string
+		display string
+		paid    bool
+		billing bool
+	}{
+		{tier: 0, key: "free", display: "Free"},
+		{tier: 1, key: "supergrok", display: "SuperGrok", paid: true, billing: true},
+		{tier: 2, key: "x_basic", display: "X Basic", paid: true},
+		{tier: 3, key: "x_premium", display: "X Premium", paid: true, billing: true},
+		{tier: 4, key: "x_premium_plus", display: "X Premium+", paid: true, billing: true},
+		{tier: 5, key: "supergrok_heavy", display: "SuperGrok Heavy", paid: true, billing: true},
+		{tier: 6, key: "supergrok_lite", display: "SuperGrok Lite", paid: true, billing: true},
+		{tier: 99, key: "99", display: "99", paid: true, billing: true},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprint(test.tier), func(t *testing.T) {
+			tier := subscriptionTierFromClaims(jwtClaims(testJWTWithTier(test.tier)))
+			if tier.Key != test.key || tier.Display != test.display || tier.Paid != test.paid || tier.Billing != test.billing {
+				t.Fatalf("tier %d = %#v", test.tier, tier)
+			}
+		})
+	}
+	if tier := subscriptionTierFromClaims(nil); tier != (subscriptionTier{}) {
+		t.Fatalf("missing tier claim = %#v", tier)
+	}
+}
+
 func TestLoadFlatOAuthCredential(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
@@ -30,6 +61,33 @@ func TestLoadFlatOAuthCredential(t *testing.T) {
 	}
 	if cred.session().Token != "token-a" || cred.session().UserID != "subject-a" {
 		t.Fatalf("unexpected session: %#v", cred.session())
+	}
+}
+
+func TestCredentialInfoUsesOfficialSubscriptionTierDisplay(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"access_token": testJWTWithTier(4),
+		"sub":          "subject-a",
+		"models":       []string{"grok-4.5"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := parseCredential(raw, "", "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &account{id: accountID(cred.Subject), credential: cred}
+	info := credentialInfo(a.id, a, time.Now())
+	if info.SubscriptionTier != "x_premium_plus" || info.SubscriptionTierDisplay != "X Premium+" {
+		t.Fatalf("credential tier = %#v", info)
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"subscription_tier":"x_premium_plus"`) || !strings.Contains(string(encoded), `"subscription_tier_display":"X Premium+"`) {
+		t.Fatalf("credential JSON = %s", encoded)
 	}
 }
 
@@ -66,6 +124,37 @@ func TestRefreshRotatesAndPersistsCredential(t *testing.T) {
 	}
 	if reloaded.AccessToken != "token-new" || !reloaded.ExpiresAt.After(time.Now()) {
 		t.Fatalf("refresh was not persisted: %#v", reloaded)
+	}
+}
+
+func TestRefreshUpdatesOfficialSubscriptionTier(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": testJWTWithTier(5),
+			"expires_in":   3600,
+		})
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	path := writeTestCredentialModels(t, dir, "a.json", "subject-a", testJWTWithTier(0), time.Now().Add(-time.Minute), server.URL, []string{"grok-4.5"})
+	cred, err := loadCredential(path, "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := cred.refresh(context.Background(), server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Tier.Key != "supergrok_heavy" || next.Tier.Display != "SuperGrok Heavy" || !next.Tier.Paid || !next.Tier.Billing {
+		t.Fatalf("refreshed tier = %#v", next.Tier)
+	}
+	reloaded, err := loadCredential(path, "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Tier != next.Tier {
+		t.Fatalf("reloaded tier = %#v, want %#v", reloaded.Tier, next.Tier)
 	}
 }
 
@@ -392,6 +481,72 @@ func TestPoolPrefersLeastInflightAccount(t *testing.T) {
 	}
 }
 
+func TestPoolPrefersPaidAccountsThenFallsBackToFree(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModelsWithTier(t, dir, "free.json", "free-subject", 0, []string{"grok-4.5"})
+	writeTestCredentialModelsWithTier(t, dir, "paid-a.json", "paid-a-subject", 4, []string{"grok-4.5"})
+	writeTestCredentialModelsWithTier(t, dir, "paid-b.json", "paid-b-subject", 1, []string{"grok-4.5"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+
+	freeID := accountID("free-subject")
+	paidIDs := []string{accountID("paid-a-subject"), accountID("paid-b-subject")}
+	pool.cfg.AccountMaxInflight = 1
+	firstPaid, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPaid, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		firstPaid.Release()
+		t.Fatal(err)
+	}
+	spill, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		firstPaid.Release()
+		secondPaid.Release()
+		t.Fatal(err)
+	}
+	if spill.AccountID() != freeID {
+		spill.Release()
+		firstPaid.Release()
+		secondPaid.Release()
+		t.Fatal("scheduler did not fall back to free after all paid accounts reached capacity")
+	}
+	spill.Release()
+	firstPaid.Release()
+	secondPaid.Release()
+
+	seenPaid := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.AccountID() == freeID {
+			lease.Release()
+			t.Fatal("free account selected while a paid account was available")
+		}
+		seenPaid[lease.AccountID()] = true
+		lease.Release()
+	}
+	if len(seenPaid) != len(paidIDs) {
+		t.Fatalf("paid account rotation used %d accounts, want %d", len(seenPaid), len(paidIDs))
+	}
+
+	for _, id := range paidIDs {
+		pool.MarkCooldown(id, "quota_exhausted", time.Hour)
+	}
+	lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.AccountID() != freeID {
+		t.Fatalf("fallback account = %s, want free account %s", lease.AccountID(), freeID)
+	}
+}
+
 func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
@@ -426,6 +581,40 @@ func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) 
 	}
 	if got := len(pool.schedulingSnapshot("grok-4")); got != 2 {
 		t.Fatalf("active model snapshot contains %d accounts after cooldown expiry, want 2", got)
+	}
+}
+
+func TestBillingRecoveryDoesNotClearOtherCooldownReasons(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModelsWithTier(t, dir, "paid.json", "paid-subject", 4, []string{"grok-4.5"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("paid-subject")
+	pool.MarkCooldown(id, "rate_limited", time.Hour)
+	if pool.MarkCooldownIfNoOtherReason(id, "billing_exhausted", 2*time.Hour) {
+		t.Fatal("billing cooldown replaced an active rate-limit cooldown")
+	}
+	if pool.ClearCooldownReason(id, "billing_exhausted") {
+		t.Fatal("billing recovery cleared an unrelated cooldown")
+	}
+	var unavailable *UnavailableError
+	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
+		t.Fatalf("rate-limit cooldown was cleared: %v", err)
+	}
+}
+
+func TestBillingRefreshEligibilityFollowsOfficialUsageGate(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModelsWithTier(t, dir, "free.json", "free-subject", 0, []string{"grok-4.5"})
+	writeTestCredentialModelsWithTier(t, dir, "basic.json", "basic-subject", 2, []string{"grok-4.5"})
+	writeTestCredentialModelsWithTier(t, dir, "premium.json", "premium-subject", 4, []string{"grok-4.5"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+
+	got := pool.AccountsNeedingBillingRefresh(time.Hour)
+	want := []string{accountID("premium-subject")}
+	if !slices.Equal(got, want) {
+		t.Fatalf("billing refresh accounts = %v, want %v", got, want)
 	}
 }
 
@@ -928,4 +1117,15 @@ func writeTestCredentialModels(t *testing.T, dir, name, subject, token string, e
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeTestCredentialModelsWithTier(t *testing.T, dir, name, subject string, tier int64, models []string) string {
+	t.Helper()
+	return writeTestCredentialModels(t, dir, name, subject, testJWTWithTier(tier), time.Now().Add(time.Hour), "", models)
+}
+
+func testJWTWithTier(tier int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"tier":%d}`, tier)))
+	return header + "." + payload + ".signature"
 }
