@@ -1,0 +1,13 @@
+{
+  "id": "revalidate-jp-runtime-after-cleanup",
+  "title": "再次复验 jp 新版本清理后的运行状态",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "low",
+  "domain": "operations",
+  "currentPhase": "completed",
+  "nextAction": "归档复验记录",
+  "createdAt": "2026-07-17T17:27:18Z",
+  "branch": "main",
+  "completedAt": "2026-07-17T17:35:52Z"
+}
