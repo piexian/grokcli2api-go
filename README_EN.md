@@ -364,7 +364,7 @@ curl http://localhost:8088/v1/admin/credentials \
   -F "file=@auth.json;type=application/json"
 ```
 
-The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload; a temporary discovery failure does not remove the saved credential. Status responses also include the official subscription-tier key and display name derived from the JWT.
+The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload, and tiers with official usage support also receive an immediate credits probe; a temporary discovery failure does not remove the saved credential. Status responses also include the official subscription-tier key and display name derived from the JWT.
 
 List redacted credential status:
 
@@ -399,7 +399,7 @@ Administrator responses include `Cache-Control: no-store`. Uploads are limited t
 | `GROK_AFFINITY_TTL` | `1h` | Lifetime of in-memory session-affinity mappings |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | Maximum number of affinity-cache entries |
 
-Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account. Higher tiers on which the official client exposes usage also poll `billing?format=credits`; Free and X Basic are not proactively polled. Proactive cooldown occurs only when included usage reaches 100% and neither on-demand nor prepaid credit remains; the cooldown lasts until the server-provided period end. A recovered balance clears only the `billing_exhausted` cooldown created by this probe, never a 429, authentication, model-level, or other upstream cooldown. The redacted snapshot is kept in memory and exposed through the administrator credential status `billing` field; it is not written to OAuth files.
+Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account. Account-level cooldowns are tracked independently by reason, so billing exhaustion, 429s, and other upstream cooldowns can overlap without clearing one reason prematurely releasing the account. Higher tiers on which the official client exposes usage poll `billing?format=credits`; Free and X Basic are not proactively polled. Administrator uploads, directory hot reloads, and OAuth tier transitions into that set trigger an immediate probe, followed by the configured periodic refresh. Proactive cooldown occurs only when included usage reaches 100% and neither on-demand nor prepaid credit remains; the cooldown lasts until the server-provided period end. An explicitly recovered balance clears `billing_exhausted` and the upstream spending-limit `quota_exhausted` reason, but never a 429, authentication, or model-level cooldown. The redacted snapshot is kept in memory and exposed through the administrator credential status `billing` field; it is not written to OAuth files.
 
 Scheduling distinguishes known paid tiers from free or unknown tiers; it does not assume that larger numeric tier claims represent higher plans.
 

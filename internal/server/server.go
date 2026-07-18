@@ -176,12 +176,23 @@ func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
 	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	probeErr := s.client.RefreshAccountModels(probeCtx, info.ID)
 	cancel()
+	billingCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	billingErr := s.client.RefreshAccountBilling(billingCtx, info.ID)
+	cancel()
 	if current, ok := s.pool.Credential(info.ID); ok {
 		response["credential"] = current
 	}
+	warnings := make([]string, 0, 2)
 	if probeErr != nil {
 		discovery = "failed"
-		response["warning"] = "model discovery failed; credential remains saved"
+		warnings = append(warnings, "model discovery failed; credential remains saved")
+	}
+	if billingErr != nil {
+		warnings = append(warnings, "billing discovery failed; credential remains saved")
+		slog.Warn("credential billing discovery failed", "account", info.ID, "error", billingErr)
+	}
+	if len(warnings) > 0 {
+		response["warning"] = strings.Join(warnings, "; ")
 	}
 	response["model_discovery"] = discovery
 	status = http.StatusOK

@@ -364,7 +364,7 @@ curl http://localhost:8088/v1/admin/credentials \
   -F "file=@auth.json;type=application/json"
 ```
 
-服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型，临时探测失败不会删除已经保存的凭证。状态响应还会返回从 JWT 派生的官方订阅层级 key 与显示名称。
+服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型；对支持 usage 的层级还会立即读取 credits，临时探测失败不会删除已经保存的凭证。状态响应还会返回从 JWT 派生的官方订阅层级 key 与显示名称。
 
 列出脱敏后的凭证状态：
 
@@ -399,7 +399,7 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | `GROK_AFFINITY_TTL` | `1h` | 内存会话亲和关系的有效期 |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | 会话亲和缓存的容量上限 |
 
-免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。官方开放 usage 的高层级账号还会读取 `billing?format=credits`（Free 与 X Basic 不主动轮询）：只有 included usage 达到 100%，且没有剩余 on-demand 或 prepaid 额度时，才主动冷却到服务端返回的周期结束时间。余额恢复只会清理由此探测设置的 `billing_exhausted` 冷却，不会覆盖 429、鉴权、模型级或其他上游冷却。用量快照仅保存在内存并通过管理员凭证状态的 `billing` 字段展示，不写回 OAuth 文件。
+免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。账号级冷却按原因独立追踪，因此计费耗尽、429 与其他上游冷却可以同时生效，清理其中一个原因不会提前放行仍受其他原因限制的账号。官方开放 usage 的高层级账号会读取 `billing?format=credits`（Free 与 X Basic 不主动轮询）：管理员上传、目录热加载或 OAuth tier 进入该范围时会立即触发探测，之后按配置周期刷新。只有 included usage 达到 100%，且没有剩余 on-demand 或 prepaid 额度时，才主动冷却到服务端返回的周期结束时间；明确恢复的余额会清理 `billing_exhausted` 和上游 spending-limit 对应的 `quota_exhausted`，但不会清理 429、鉴权或模型级冷却。用量快照仅保存在内存并通过管理员凭证状态的 `billing` 字段展示，不写回 OAuth 文件。
 
 调度优先级只区分已知付费层级与 free/未知层级，不假定数字越大套餐越高。
 

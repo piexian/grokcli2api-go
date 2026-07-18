@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -155,6 +156,30 @@ func TestParseBillingInfoDetectsOnlyExplicitExhaustion(t *testing.T) {
 	}
 }
 
+func TestBillingHasAvailableCapacityRequiresExplicitBalance(t *testing.T) {
+	availableUsage := 99.0
+	exhaustedUsage := 100.0
+	credit := int64(1)
+	tests := []struct {
+		name string
+		info auth.BillingInfo
+		want bool
+	}{
+		{name: "unknown"},
+		{name: "included available", info: auth.BillingInfo{UsagePercent: &availableUsage}, want: true},
+		{name: "included exhausted", info: auth.BillingInfo{UsagePercent: &exhaustedUsage}},
+		{name: "on demand available", info: auth.BillingInfo{UsagePercent: &exhaustedUsage, OnDemandRemainingCents: &credit}, want: true},
+		{name: "prepaid available", info: auth.BillingInfo{PrepaidBalanceCents: &credit}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := billingHasAvailableCapacity(test.info); got != test.want {
+				t.Fatalf("billingHasAvailableCapacity(%#v) = %t, want %t", test.info, got, test.want)
+			}
+		})
+	}
+}
+
 func TestRefreshBillingCoolsAndRestoresPaidAccount(t *testing.T) {
 	var exhausted atomic.Bool
 	exhausted.Store(true)
@@ -212,6 +237,7 @@ func TestRefreshBillingCoolsAndRestoresPaidAccount(t *testing.T) {
 	if _, err := pool.Acquire(context.Background(), auth.Affinity{}, "grok-4.5", nil); err == nil {
 		t.Fatal("billing-exhausted account remained schedulable")
 	}
+	pool.MarkCooldown(info.ID, quotaExhaustedReason, 24*time.Hour)
 
 	exhausted.Store(false)
 	if err := client.RefreshBilling(context.Background(), true); err != nil {
@@ -226,6 +252,180 @@ func TestRefreshBillingCoolsAndRestoresPaidAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease.Release()
+}
+
+func TestHotLoadedPaidAccountTriggersBillingRefresh(t *testing.T) {
+	var calls atomic.Int32
+	billingStarted := make(chan struct{}, 1)
+	releaseBilling := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseBilling) }) }
+	defer release()
+	periodEnd := time.Now().Add(time.Hour).UTC()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/billing" || r.URL.Query().Get("format") != "credits" {
+			http.NotFound(w, r)
+			return
+		}
+		calls.Add(1)
+		billingStarted <- struct{}{}
+		<-releaseBilling
+		_ = json.NewEncoder(w).Encode(map[string]any{"config": map[string]any{
+			"creditUsagePercent": 100.0,
+			"currentPeriod":      map[string]any{"end": periodEnd.Format(time.RFC3339Nano)},
+			"onDemandCap":        map[string]any{"val": 0},
+			"prepaidBalance":     map[string]any{"val": 0},
+		}})
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: 10 * time.Millisecond, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 128, AllowEmpty: true,
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	client, err := NewClient(config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, BillingRefreshInterval: time.Hour,
+		RetryMaxAttempts: 1, QuotaCooldown: 24 * time.Hour, AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, pool, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	client.StartModelRefresh()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	select {
+	case <-billingStarted:
+	case <-time.After(time.Second):
+		t.Fatal("hot-loaded billing refresh did not start")
+	}
+	credentials := pool.Credentials()
+	if len(credentials) != 1 || credentials[0].Status != "pending_billing" || credentials[0].Usable {
+		t.Fatalf("hot-loaded account was not gated before billing completed: %#v", credentials)
+	}
+	if _, err := pool.Acquire(context.Background(), auth.Affinity{}, "grok-4.5", nil); err == nil {
+		t.Fatal("hot-loaded account was schedulable before billing completed")
+	}
+	release()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		credentials := pool.Credentials()
+		if len(credentials) == 1 && credentials[0].Billing != nil && credentials[0].Billing.Exhausted && credentials[0].CooldownUntil != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	credentials = pool.Credentials()
+	if calls.Load() == 0 || len(credentials) != 1 || credentials[0].Billing == nil || !credentials[0].Billing.Exhausted || credentials[0].CooldownUntil == nil {
+		t.Fatalf("hot-loaded billing refresh did not complete: calls=%d credentials=%#v", calls.Load(), credentials)
+	}
+	if _, err := pool.Acquire(context.Background(), auth.Affinity{}, "grok-4.5", nil); err == nil {
+		t.Fatal("hot-loaded exhausted account became schedulable")
+	}
+}
+
+func TestBillingProbeFailureReleasesPendingAccount(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/billing" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, `{"error":"temporary"}`, http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	client, err := NewClient(config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthRefreshConcurrency: 1,
+		RetryMaxAttempts: 1, QuotaCooldown: 24 * time.Hour, AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, pool, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if info := pool.Credentials()[0]; info.Status != "pending_billing" || info.Usable {
+		t.Fatalf("credential was not gated before first probe: %#v", info)
+	}
+	if err := client.RefreshBilling(context.Background(), true); err == nil {
+		t.Fatal("temporary billing failure was not reported")
+	}
+	info := pool.Credentials()[0]
+	if info.Status != "ready" || !info.Usable {
+		t.Fatalf("temporary billing failure left credential gated: %#v", info)
+	}
+	lease, err := pool.Acquire(context.Background(), auth.Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+}
+
+func TestBillingAuthRefreshStopsWhenTierLosesEligibility(t *testing.T) {
+	var billingCalls atomic.Int32
+	var tokenCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/billing":
+			billingCalls.Add(1)
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		case "/token":
+			tokenCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": grokTestJWTWithTier(0), "expires_in": 3600})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	raw := map[string]any{
+		"access_token": grokTestJWTWithTier(4), "refresh_token": "refresh", "client_id": "client",
+		"sub": "paid-subject", "expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"token_endpoint": upstream.URL + "/token", "models": []string{"grok-4.5"},
+		"models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "paid.json"), encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	client, err := NewClient(config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthRefreshConcurrency: 1,
+		RetryMaxAttempts: 1, QuotaCooldown: 24 * time.Hour, AffinityTTL: time.Hour, AffinityMaxEntries: 128,
+	}, pool, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.RefreshBilling(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	info := pool.Credentials()[0]
+	if billingCalls.Load() != 1 || tokenCalls.Load() != 1 || info.SubscriptionTier != "free" || info.Billing != nil || info.Status != "ready" {
+		t.Fatalf("billing retry crossed tier transition: billing=%d token=%d info=%#v", billingCalls.Load(), tokenCalls.Load(), info)
+	}
 }
 
 func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogs(t *testing.T) {
@@ -375,10 +575,8 @@ func writeModelTestCredential(t *testing.T, dir, name, subject, token string) {
 
 func writeBillingTestCredential(t *testing.T, dir, name, subject string, tier int64) {
 	t.Helper()
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"tier":` + fmt.Sprint(tier) + `}`))
 	raw := map[string]any{
-		"access_token":  header + "." + payload + ".signature",
+		"access_token":  grokTestJWTWithTier(tier),
 		"refresh_token": "refresh", "client_id": "client", "sub": subject,
 		"expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
 		"models":  []string{"grok-4.5"}, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
@@ -390,6 +588,12 @@ func writeBillingTestCredential(t *testing.T, dir, name, subject string, tier in
 	if err := os.WriteFile(filepath.Join(dir, name), encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func grokTestJWTWithTier(tier int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"tier":%d}`, tier)))
+	return header + "." + payload + ".signature"
 }
 
 func TestEventStreamPreservesSSEFieldsAndMultilineData(t *testing.T) {

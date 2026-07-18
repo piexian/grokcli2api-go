@@ -175,7 +175,7 @@ func TestConcurrentRefreshIsSingleFlight(t *testing.T) {
 	}
 	a := &account{id: accountID(cred.Subject), credential: cred, agentID: "agent", sessionID: "session"}
 	p := &Pool{
-		cfg: PoolConfig{RefreshConcurrency: 4}, http: server.Client(), accounts: map[string]*account{a.id: a},
+		cfg: PoolConfig{Dir: dir, RefreshConcurrency: 4}, http: server.Client(), accounts: map[string]*account{a.id: a},
 		files: map[string]fileEntry{path: {cred: cred}}, states: map[string]accountState{},
 		affinity: newAffinityCache(time.Hour, 100), refreshSem: make(chan struct{}, 4), closed: make(chan struct{}),
 	}
@@ -214,7 +214,7 @@ func TestConcurrentForcedRefreshUsesCredentialGeneration(t *testing.T) {
 	a := &account{id: accountID(cred.Subject), credential: cred, agentID: "agent", sessionID: "session"}
 	a.generation.Store(1)
 	p := &Pool{
-		cfg: PoolConfig{RefreshConcurrency: 4}, http: server.Client(), accounts: map[string]*account{a.id: a},
+		cfg: PoolConfig{Dir: dir, RefreshConcurrency: 4}, http: server.Client(), accounts: map[string]*account{a.id: a},
 		files: map[string]fileEntry{path: {cred: cred}}, states: map[string]accountState{},
 		affinity: newAffinityCache(time.Hour, 100), refreshSem: make(chan struct{}, 4), closed: make(chan struct{}),
 	}
@@ -584,23 +584,56 @@ func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) 
 	}
 }
 
-func TestBillingRecoveryDoesNotClearOtherCooldownReasons(t *testing.T) {
+func TestAccountCooldownReasonsAreIndependent(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCredentialModelsWithTier(t, dir, "paid.json", "paid-subject", 4, []string{"grok-4.5"})
 	pool := newTestPool(t, dir)
 	defer pool.Close()
 	id := accountID("paid-subject")
-	pool.MarkCooldown(id, "rate_limited", time.Hour)
-	if pool.MarkCooldownIfNoOtherReason(id, "billing_exhausted", 2*time.Hour) {
-		t.Fatal("billing cooldown replaced an active rate-limit cooldown")
-	}
-	if pool.ClearCooldownReason(id, "billing_exhausted") {
-		t.Fatal("billing recovery cleared an unrelated cooldown")
-	}
+	pool.MarkCooldown(id, "rate_limited", 25*time.Millisecond)
+	pool.MarkCooldown(id, billingExhaustedReason, time.Hour)
+	time.Sleep(40 * time.Millisecond)
+	pool.RebuildSchedulingSnapshot()
 	var unavailable *UnavailableError
 	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
-		t.Fatalf("rate-limit cooldown was cleared: %v", err)
+		t.Fatalf("billing cooldown did not survive rate-limit expiry: %v", err)
 	}
+	if !pool.ClearCooldownReason(id, billingExhaustedReason) {
+		t.Fatal("billing cooldown was not cleared")
+	}
+	lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatalf("expired rate-limit cooldown remained after billing recovery: %v", err)
+	}
+	lease.Release()
+}
+
+func TestAccountCooldownReasonsPersistIndependently(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModelsWithTier(t, dir, "paid.json", "paid-subject", 4, []string{"grok-4.5"})
+	id := accountID("paid-subject")
+	pool := newTestPool(t, dir)
+	pool.MarkCooldown(id, "rate_limited", time.Hour)
+	pool.MarkCooldown(id, billingExhaustedReason, 2*time.Hour)
+	pool.Close()
+
+	reloaded := newTestPool(t, dir)
+	defer reloaded.Close()
+	if !reloaded.ClearCooldownReason(id, billingExhaustedReason) {
+		t.Fatal("persisted billing cooldown was not restored")
+	}
+	var unavailable *UnavailableError
+	if _, err := reloaded.Acquire(context.Background(), Affinity{}, "grok-4.5", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
+		t.Fatalf("clearing billing cooldown also cleared rate limit: %v", err)
+	}
+	if !reloaded.ClearCooldownReason(id, "rate_limited") {
+		t.Fatal("persisted rate-limit cooldown was not restored")
+	}
+	lease, err := reloaded.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
 }
 
 func TestBillingRefreshEligibilityFollowsOfficialUsageGate(t *testing.T) {
@@ -616,6 +649,83 @@ func TestBillingRefreshEligibilityFollowsOfficialUsageGate(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("billing refresh accounts = %v, want %v", got, want)
 	}
+}
+
+func TestRefreshClearsBillingStateWhenTierLosesEligibility(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": testJWTWithTier(0),
+			"expires_in":   3600,
+		})
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	writeTestCredentialModels(t, dir, "paid.json", "paid-subject", testJWTWithTier(4), time.Now().Add(time.Hour), server.URL, []string{"grok-4.5"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("paid-subject")
+	usage := 100.0
+	if err := pool.UpdateBilling(id, BillingInfo{UsagePercent: &usage, Exhausted: true, UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	pool.MarkCooldown(id, billingExhaustedReason, time.Hour)
+	if err := pool.Refresh(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	info, ok := pool.Credential(id)
+	if !ok {
+		t.Fatal("credential disappeared after refresh")
+	}
+	if info.SubscriptionTier != "free" || info.Billing != nil || info.CooldownUntil != nil {
+		t.Fatalf("refreshed credential retained stale billing state: %#v", info)
+	}
+	lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4.5", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+}
+
+func TestRefreshReprobesBillingWhenEligibleTierChanges(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": testJWTWithTier(5),
+			"expires_in":   3600,
+		})
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	writeTestCredentialModels(t, dir, "paid.json", "paid-subject", testJWTWithTier(4), time.Now().Add(time.Hour), server.URL, []string{"grok-4.5"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("paid-subject")
+	usage := 25.0
+	if err := pool.UpdateBilling(id, BillingInfo{UsagePercent: &usage, UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	pool.EnableBillingPreflight()
+	select {
+	case <-pool.BillingRefreshSignal():
+	default:
+	}
+	if err := pool.Refresh(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	info, ok := pool.Credential(id)
+	if !ok {
+		t.Fatal("credential disappeared after refresh")
+	}
+	if info.SubscriptionTier != "supergrok_heavy" || info.Billing != nil || info.Status != "pending_billing" || info.Usable {
+		t.Fatalf("tier change did not invalidate billing state: %#v", info)
+	}
+	select {
+	case <-pool.BillingRefreshSignal():
+	case <-time.After(time.Second):
+		t.Fatal("tier change did not request a billing refresh")
+	}
+	pool.CompleteBillingRefresh(id)
 }
 
 func TestModelCooldownIsScopedAndPersists(t *testing.T) {
@@ -801,6 +911,31 @@ func TestCooldownPersistsAndAffinityMigrates(t *testing.T) {
 	if lease, err := reloaded.AcquireAccount(context.Background(), cooledID); err == nil {
 		lease.Release()
 		t.Fatal("persisted cooldown was not restored")
+	}
+}
+
+func TestLegacyAccountCooldownStateLoads(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	id := accountID("subject-a")
+	legacy := persistedState{Version: 1, Accounts: map[string]accountState{
+		id: {CooldownUntil: time.Now().Add(time.Hour), Reason: "quota_exhausted"},
+	}}
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, stateFileName), encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	var unavailable *UnavailableError
+	if _, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil); !errors.As(err, &unavailable) || !unavailable.Cooling {
+		t.Fatalf("legacy cooldown was not restored: %v", err)
+	}
+	if !pool.ClearCooldownReason(id, "quota_exhausted") {
+		t.Fatal("legacy cooldown was not converted to a reason-specific cooldown")
 	}
 }
 

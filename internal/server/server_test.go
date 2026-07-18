@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1366,6 +1367,51 @@ func TestAdminCredentialLifecycle(t *testing.T) {
 	}
 }
 
+func TestAdminPaidCredentialRefreshesBillingBeforeResponse(t *testing.T) {
+	periodEnd := time.Now().Add(time.Hour).UTC()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			writeJSON(w, http.StatusOK, map[string]any{"data": []any{map[string]any{"id": "grok-4"}}})
+		case "/v1/billing":
+			if r.URL.Query().Get("format") != "credits" {
+				t.Errorf("billing query = %q", r.URL.RawQuery)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"config": map[string]any{
+				"creditUsagePercent": 100.0,
+				"currentPeriod":      map[string]any{"end": periodEnd.Format(time.RFC3339Nano)},
+				"onDemandCap":        map[string]any{"val": 0},
+				"prepaidBalance":     map[string]any{"val": 0},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	s := newAdminTestServer(t, upstream.URL)
+	defer s.Close()
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/credentials", bytes.NewReader(adminCredentialPayload(t, "paid-subject", serverTestJWTWithTier(4))))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Credential auth.CredentialInfo `json:"credential"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Credential.Billing == nil || !response.Credential.Billing.Exhausted || response.Credential.CooldownUntil == nil {
+		t.Fatalf("credential returned before billing cooldown: %#v", response.Credential)
+	}
+	if _, err := s.pool.Acquire(httptest.NewRequest(http.MethodGet, "/", nil).Context(), auth.Affinity{}, "grok-4", nil); err == nil {
+		t.Fatal("exhausted uploaded credential became schedulable")
+	}
+}
+
 func TestAdminCredentialUploadValidation(t *testing.T) {
 	s := newAdminTestServer(t, "http://127.0.0.1:1")
 	defer s.Close()
@@ -1570,6 +1616,12 @@ func adminCredentialPayload(t *testing.T, subject, token string) []byte {
 		t.Fatal(err)
 	}
 	return payload
+}
+
+func serverTestJWTWithTier(tier int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"tier":%d}`, tier)))
+	return header + "." + payload + ".signature"
 }
 
 func newTestHandlerWithTokens(t *testing.T, upstream string, keys, tokens []string) http.Handler {

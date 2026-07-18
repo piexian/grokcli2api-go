@@ -42,6 +42,8 @@ const freeModelQuotaReason = "model_free_quota_exhausted"
 
 const billingExhaustedReason = "billing_exhausted"
 
+const quotaExhaustedReason = "quota_exhausted"
+
 const defaultBillingRefreshInterval = 5 * time.Minute
 
 type APIError struct {
@@ -154,6 +156,9 @@ func NewHTTPClient(cfg config.Config) (*http.Client, error) {
 }
 
 func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Client, error) {
+	if pool == nil {
+		return nil, errors.New("credential pool is required")
+	}
 	if cfg.StreamCompression == "" {
 		cfg.StreamCompression = "identity"
 	}
@@ -182,6 +187,7 @@ func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Cl
 			return nil, err
 		}
 	}
+	pool.EnableBillingPreflight()
 	return &Client{cfg: cfg, pool: pool, http: httpClient, modelClose: make(chan struct{})}, nil
 }
 
@@ -354,7 +360,7 @@ func (c *Client) RefreshBilling(ctx context.Context, force bool) error {
 		go func() {
 			defer wg.Done()
 			for id := range jobs {
-				results <- c.fetchAccountBilling(ctx, id, false)
+				results <- c.refreshAccountBilling(ctx, id)
 			}
 		}()
 	}
@@ -382,6 +388,22 @@ func (c *Client) RefreshBilling(ctx context.Context, force bool) error {
 	return nil
 }
 
+// RefreshAccountBilling immediately refreshes one eligible account after an
+// administrator upload. Non-eligible tiers are a no-op.
+func (c *Client) RefreshAccountBilling(ctx context.Context, accountID string) error {
+	c.billingMu.Lock()
+	defer c.billingMu.Unlock()
+	if !c.pool.AccountNeedsBillingRefresh(accountID, 0) {
+		return nil
+	}
+	return c.refreshAccountBilling(ctx, accountID)
+}
+
+func (c *Client) refreshAccountBilling(ctx context.Context, accountID string) error {
+	defer c.pool.CompleteBillingRefresh(accountID)
+	return c.fetchAccountBilling(ctx, accountID, false)
+}
+
 func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refreshed bool) error {
 	lease, err := c.pool.AcquireAccountForMetadata(ctx, accountID)
 	if err != nil {
@@ -400,6 +422,9 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
 		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
+			if !c.pool.AccountNeedsBillingRefresh(accountID, 0) {
+				return nil
+			}
 			return c.fetchAccountBilling(ctx, accountID, true)
 		}
 		return apiErr
@@ -412,7 +437,10 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 		return err
 	}
 	if !info.Exhausted {
-		c.pool.ClearCooldownReason(accountID, billingExhaustedReason)
+		if billingHasAvailableCapacity(info) {
+			c.pool.ClearCooldownReason(accountID, billingExhaustedReason)
+			c.pool.ClearCooldownReason(accountID, quotaExhaustedReason)
+		}
 		return nil
 	}
 	duration := c.cfg.QuotaCooldown
@@ -424,8 +452,16 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 			duration = untilReset
 		}
 	}
-	c.pool.MarkCooldownIfNoOtherReason(accountID, billingExhaustedReason, duration)
+	c.pool.MarkCooldown(accountID, billingExhaustedReason, duration)
 	return nil
+}
+
+func billingHasAvailableCapacity(info auth.BillingInfo) bool {
+	if info.UsagePercent != nil && *info.UsagePercent < 100 {
+		return true
+	}
+	return info.OnDemandRemainingCents != nil && *info.OnDemandRemainingCents > 0 ||
+		info.PrepaidBalanceCents != nil && *info.PrepaidBalanceCents > 0
 }
 
 func (c *Client) fetchAccountModels(ctx context.Context, accountID string, refreshed bool) ([]string, error) {
@@ -625,6 +661,12 @@ func (c *Client) modelRefreshLoop() {
 			ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
 			if err := c.RefreshBilling(ctx, false); err != nil {
 				slog.Warn("account billing refresh failed", "error", err)
+			}
+			cancel()
+		case <-c.pool.BillingRefreshSignal():
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := c.RefreshBilling(ctx, false); err != nil {
+				slog.Warn("triggered account billing refresh failed", "error", err)
 			}
 			cancel()
 		case <-c.modelClose:
@@ -915,7 +957,7 @@ func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
 		return true
 	}
 	if strings.EqualFold(err.UpstreamCode, quotaErrorCode) {
-		c.pool.MarkCooldown(accountID, "quota_exhausted", c.cfg.QuotaCooldown)
+		c.pool.MarkCooldown(accountID, quotaExhaustedReason, c.cfg.QuotaCooldown)
 		return true
 	}
 	if err.Status == http.StatusTooManyRequests {
@@ -1079,7 +1121,7 @@ func (s *EventStream) observe(data []byte) {
 		code = stringField(inner, "code")
 	}
 	if strings.EqualFold(code, quotaErrorCode) {
-		s.pool.MarkCooldown(s.accountID, "quota_exhausted", s.quotaCooldown)
+		s.pool.MarkCooldown(s.accountID, quotaExhaustedReason, s.quotaCooldown)
 		return
 	}
 	if isFreeModelQuotaExhausted(&APIError{Status: http.StatusTooManyRequests, Body: string(data)}) {
