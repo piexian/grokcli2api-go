@@ -728,6 +728,96 @@ func TestRefreshReprobesBillingWhenEligibleTierChanges(t *testing.T) {
 	pool.CompleteBillingRefresh(id)
 }
 
+func TestAcquireRechecksBillingPreflightAfterOAuthRefresh(t *testing.T) {
+	acquisitions := []struct {
+		name    string
+		acquire func(context.Context, *Pool, string) (*Lease, error)
+	}{
+		{
+			name: "scheduler",
+			acquire: func(ctx context.Context, pool *Pool, _ string) (*Lease, error) {
+				return pool.Acquire(ctx, Affinity{}, "grok-4.5", nil)
+			},
+		},
+		{
+			name: "account",
+			acquire: func(ctx context.Context, pool *Pool, id string) (*Lease, error) {
+				return pool.AcquireAccount(ctx, id)
+			},
+		},
+	}
+	scenarios := []struct {
+		name        string
+		initialTier int64
+	}{
+		{name: "free_to_paid", initialTier: 0},
+		{name: "paid_without_billing_snapshot", initialTier: 4},
+	}
+	for _, scenario := range scenarios {
+		for _, acquisition := range acquisitions {
+			t.Run(scenario.name+"/"+acquisition.name, func(t *testing.T) {
+				var refreshCalls atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					refreshCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"access_token": testJWTWithTier(4),
+						"expires_in":   3600,
+					})
+				}))
+				defer server.Close()
+
+				dir := t.TempDir()
+				path := writeTestCredentialModels(t, dir, "account.json", "subject-a", testJWTWithTier(scenario.initialTier), time.Now().Add(30*time.Second), server.URL, []string{"grok-4.5"})
+				cred, err := loadCredential(path, "tui")
+				if err != nil {
+					t.Fatal(err)
+				}
+				a := &account{id: accountID(cred.Subject), credential: cred, agentID: "agent", sessionID: "session"}
+				a.generation.Store(1)
+				pool := &Pool{
+					cfg: PoolConfig{Dir: dir, RefreshConcurrency: 1, AccountMaxInflight: 1}, http: server.Client(),
+					accounts: map[string]*account{a.id: a}, files: map[string]fileEntry{}, states: map[string]accountState{},
+					affinity: newAffinityCache(time.Hour, 100), refreshSem: make(chan struct{}, 1), capacityCh: make(chan struct{}),
+					rebuildCh: make(chan struct{}, 1), billingCh: make(chan struct{}, 1), closed: make(chan struct{}),
+				}
+				pool.active.Store([]*account{a})
+				pool.activeByModel.Store(map[string][]*account{"grok-4.5": {a}})
+				pool.billingGate.Store(true)
+				defer pool.Close()
+
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				lease, err := acquisition.acquire(ctx, pool, a.id)
+				if err == nil {
+					lease.Release()
+					t.Fatal("request lease bypassed billing preflight after OAuth refresh")
+				}
+				if refreshCalls.Load() != 1 {
+					t.Fatalf("OAuth refresh calls = %d, want 1", refreshCalls.Load())
+				}
+				info, ok := pool.Credential(a.id)
+				if !ok || info.SubscriptionTier != "x_premium_plus" || info.Status != "pending_billing" || info.Usable {
+					t.Fatalf("refreshed account did not enter billing preflight: %#v", info)
+				}
+				if a.inflight.Load() != 0 {
+					t.Fatalf("rejected request retained %d in-flight slots", a.inflight.Load())
+				}
+				select {
+				case <-pool.BillingRefreshSignal():
+				default:
+					t.Fatal("OAuth tier transition did not request a billing refresh")
+				}
+				metadataLease, err := pool.AcquireAccountForMetadata(ctx, a.id)
+				if err != nil {
+					t.Fatalf("metadata acquisition was blocked by billing preflight: %v", err)
+				}
+				metadataLease.Release()
+			})
+		}
+	}
+}
+
 func TestModelCooldownIsScopedAndPersists(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCredentialModels(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "", []string{"grok-alpha", "grok-beta"})

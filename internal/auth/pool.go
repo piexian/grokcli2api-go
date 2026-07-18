@@ -301,6 +301,26 @@ func (p *Pool) newLease(a *account) *Lease {
 	return &Lease{pool: p, account: a, credential: cred, generation: generation}
 }
 
+func (p *Pool) newRequestLease(a *account, model string) (*Lease, bool) {
+	now := time.Now()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	until, _ := cooldownDeadline(a.cooldowns, now)
+	if a.disabled || a.billingPending || !until.IsZero() || a.credential == nil || !a.credential.usable(now) {
+		return nil, false
+	}
+	if model != "" {
+		index := sort.SearchStrings(a.credential.Models, model)
+		if index >= len(a.credential.Models) || a.credential.Models[index] != model {
+			return nil, false
+		}
+		if cooldown, ok := a.modelCooldowns[model]; ok && now.Before(cooldown.Until) {
+			return nil, false
+		}
+	}
+	return &Lease{pool: p, account: a, credential: a.credential, generation: a.currentGeneration()}, true
+}
+
 func (l *Lease) Session() Session {
 	if l.credential == nil {
 		return Session{}
@@ -481,10 +501,21 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 							retryCandidates = true
 							break
 						}
+						lease, requestUsable := p.newRequestLease(selected, model)
+						if !requestUsable {
+							selected.inflight.Add(-1)
+							p.notifyCapacity()
+							if refreshFailed == nil {
+								refreshFailed = make(map[string]struct{})
+							}
+							refreshFailed[selected.id] = struct{}{}
+							retryCandidates = true
+							break
+						}
 						if affinity.Key != "" {
 							p.affinity.Set(cacheKey, selected.id)
 						}
-						return p.newLease(selected), nil
+						return lease, nil
 					}
 				}
 				if !retryCandidates {
@@ -626,7 +657,13 @@ func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[stri
 		p.notifyCapacity()
 		return nil, err
 	}
-	return p.newLease(a), nil
+	lease, requestUsable := p.newRequestLease(a, model)
+	if !requestUsable {
+		a.inflight.Add(-1)
+		p.notifyCapacity()
+		return nil, ErrNoAuth
+	}
+	return lease, nil
 }
 
 func (p *Pool) Bind(affinity Affinity, model, accountID string) {
