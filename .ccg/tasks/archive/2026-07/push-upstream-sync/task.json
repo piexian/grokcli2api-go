@@ -1,0 +1,12 @@
+{
+  "id": "push-upstream-sync",
+  "title": "推送上游同步结果",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "low",
+  "domain": "repository",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-20T12:02:49Z",
+  "branch": "feature/paid-tier-scheduler-upstream"
+}
