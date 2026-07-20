@@ -21,7 +21,7 @@
 
 `grokcli2api-go` 是一个使用 Go 编写的非官方 API 兼容服务。它将 Grok CLI 使用的上游接口转换为 OpenAI Chat Completions、OpenAI Responses 与 Anthropic Messages 格式，让现有应用通常只需调整 API Base URL 即可接入。
 
-项目运行时仅依赖 Go 标准库，提供多账号 OAuth 凭证池、自动刷新、模型发现、会话亲和、失败重试与容量背压等能力，适合本地开发、内网服务和容器化部署。
+项目运行时仅依赖 Go 标准库，提供多账号/多 scope 凭证池、自动刷新、账号级模型发现与动态 backend 路由、会话连续性、失败重试和容量背压等能力，适合本地开发、内网服务和容器化部署。
 
 > [!IMPORTANT]
 > 本项目是非官方兼容层，与 xAI、X、OpenAI 或 Anthropic 均无隶属或合作关系。使用者应自行遵守相关服务条款，并承担使用非公开上游接口可能产生的兼容性、可用性与账号风险。
@@ -32,11 +32,11 @@
 | --- | --- |
 | API 兼容 | OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Grok CLI 原生 Responses 透传 |
 | 响应模式 | 流式 SSE 与非流式响应，兼容常见 SDK 和 HTTP 客户端 |
-| 凭证管理 | 多账号 OAuth 凭证池、自动刷新、目录热加载、刷新结果原子写回 |
-| 智能调度 | 官方订阅层级识别、付费账号优先、会话亲和、按模型能力调度、失败重试与额度冷却 |
+| 凭证管理 | 多账号/多 scope 凭证池、OIDC 自动刷新、目录热加载、锁内原子写回 |
+| 智能调度 | 官方订阅层级识别、付费账号优先、会话亲和、按账号模型 backend/能力动态路由、失败重试与额度冷却 |
 | 并发治理 | 账号级并发上限与容量背压，降低高并发场景下的 429 重试风暴 |
 | 模型发现 | 按账号获取上游模型目录，缓存、聚合并输出去重后的模型列表 |
-| 访问保护 | 可配置一个或多个本地 API Key，兼容 Bearer、`x-api-key` 与 `api-key` 请求头 |
+| 访问保护 | 可配置一个或多个本地 API Key，并以 Key 派生 tenant namespace 隔离连续性状态 |
 | 网络支持 | HTTP、HTTPS、SOCKS5、SOCKS5H 出站代理及标准 `NO_PROXY` 规则 |
 | 部署体验 | 单一二进制、优雅退出、Docker 多阶段构建与 Docker Compose 编排 |
 
@@ -68,21 +68,25 @@ flowchart LR
 
 兼容层会尽可能保留常用的请求字段、响应结构和流式事件，但不保证覆盖官方 API 的全部参数与行为。接入 New API 等 API 聚合项目时，请开启所有请求参数的**透传**。
 
-### Chat Completions 请求清洗
+### 按账号动态路由与静默清洗
 
-`POST /v1/chat/completions` 会在转发前按 Grok CLI 上游结构重建请求体。支持消息、多模态文本/图片、函数工具、结构化输出、搜索参数及推理强度；常见别名会转换为上游字段，包括 `max_completion_tokens` → `max_tokens`、`functions` → `tools`、`function_call` → `tool_choice`、`user` → `user_id`。上游未声明的顶层字段和嵌套元数据会被移除，清洗路径仅在 `DEBUG` 日志中记录且不包含字段值。
+推理协议以 Grok CLI `0.2.102`（`SOURCE_REV=124d85bc5dc6e7805560215fcc6d5413944920e1`）为基准。服务先验证对外协议的必需结构，再在选定账号后读取该账号、该模型的描述符；描述符中的 wire model 与 `apiBackend` 决定本次请求实际发送到上游 `chat/completions`、`responses` 或 `messages`。同一个公开模型在不同账号上可以使用不同 backend，重试切换账号时会重新渲染路径、请求体、reasoning、工具别名和 SSE 转换。描述符没有声明 backend 时使用 `chat_completions`。
 
-格式错误或会破坏消息、工具调用关系的内容会在本地返回 OpenAI 格式的 `422 invalid_request_error`。`grok-4.5*` 与 `composer` 模型族还会移除其不支持的采样惩罚和停止参数。
+Chat Completions、Responses 与 Anthropic Messages 三个对外接口都可以按账号描述符发送到上述任一 backend。同协议时使用原生清洗，跨协议时只转换双方都能表达的消息、工具与参数；因此 Messages 请求不再固定通过 Responses backend 执行。
 
-### Responses 格式分流
+无法安全映射的字段、内容块、工具状态或协议专属状态会被静默删除，响应中不会包含兼容 warning 或删除清单。仅当保留字段本身类型非法、缺少公共协议必需字段，或清洗后已没有合法最小输入时返回 `400 invalid_request_error`；请求体超过 16 MiB 返回 `413`。如果 `previous_response_id`、加密 reasoning 或 thinking signature 因目标 backend 无法表达而被删除，本次请求会解除对应 hard affinity 并以新会话执行。
 
-`POST /v1/responses` 默认按 OpenAI Responses API 处理：请求字段会按 Grok CLI 0.2.99 的 Responses 类型清洗，非流式响应与 SSE 事件会移除 Grok 原生扩展。只有请求包含明确的 Grok CLI 标识时才启用原生透传，包括 `X-XAI-Token-Auth: xai-grok-cli`、`x-grok-client-version`、已知的 Grok 客户端名称/标识，或 `grok-cli/`、`grok-shell/`、`grok-pager/` 等 User-Agent。任意或未知的 `x-grok-client-*` 值不会触发原生格式。
+### Reasoning effort
 
-兼容分支未指定 `store` 时按 OpenAI 默认值使用 `store: true`。后续请求可通过 `previous_response_id` 续接，并会固定回到生成该 Response 的上游账号；同一 Response ID 可派生多个独立分支。该账号亲和与工具回放状态仅保存在当前服务进程内，重启后不会恢复。显式 `store: false` 时，普通 previous ID 会由上游返回 not-found；函数工具调用可在缓存仍有效时使用最小调用结构本地续接，服务不会额外缓存用户文本或图片。
+用户显式提供的 reasoning effort 不会因兼容性而被删除。服务会去除首尾空白并统一为小写：模型明确支持的 `minimal`、`low`、`medium`、`high`、`xhigh` 保持不变；`none`、任意未知字符串、模型未列出的档位，以及模型未声明 reasoning 能力时，一律向上游发送 `low`，即使描述符本身没有列出 `low` 也如此。
 
-兼容范围包括文本、多轮、Function/custom/namespace/tool-search、并行工具结果、Web Search、HTTPS 或 Base64 data URI 图片、`text.format.json_schema` 以及 typed SSE。错误请求返回 `400 invalid_request_error` 和准确的 `param` 路径，请求体超过 16 MiB 返回 `413`。当前不提供 `/v1/conversations`、`/v1/files`、音频、后台任务轮询、图片生成输出，以及 Web Search 之外的托管工具执行；相关参数会返回明确的 `unsupported_parameter`，不会静默忽略。
+Chat backend 使用 `reasoning_effort`，Responses backend 使用 `reasoning.effort`，Messages backend 使用 `output_config.effort`。Messages 仅在模型明确支持 `xhigh` 时将其编码为 wire 值 `max`；Anthropic `thinking.type` 仍按独立的 thinking 协议处理。
 
-`POST /v1/messages` 仍以 Anthropic 格式对外，并通过上游 Responses API 执行。Anthropic `metadata.user_id` 会映射为 Responses 的 `safety_identifier`；`stop_sequences` 由兼容层在非流式与流式响应中执行。文本、图片、图片型工具结果、并行函数工具及 Web Search server-tool 结果均会转换为对应的 Anthropic 内容块；只有请求显式启用 `thinking` 时才返回 thinking/signature 块。格式错误或断裂的 `tool_use` / `tool_result` 关系会在本地返回 Anthropic `400 invalid_request_error`。
+### Responses 与原生 CLI 格式
+
+普通 `POST /v1/responses` 请求未指定 `store` 时默认发送 `store: true`；明确识别为 Grok CLI 的原生请求默认发送 `store: false`。只有请求包含明确的 Grok CLI 标识时才启用原生响应扩展，包括 `X-XAI-Token-Auth: xai-grok-cli`、`x-grok-client-version`、已知的 Grok 客户端名称/标识，或 `grok-cli/`、`grok-shell/`、`grok-pager/` 等 User-Agent。任意或未知的 `x-grok-client-*` 值不会触发原生格式，普通 Responses 客户端也不会收到 `grok.*` 私有事件。
+
+保留下来的 `previous_response_id` 会固定回到创建该 Response 的账号。显式 `store: false` 的函数工具续接可在进程内回放缓存仍有效时恢复最小调用结构；重启后回放缺失的工具 item 会按静默清洗规则删除，服务不会持久化用户文本、图片、工具参数或 reasoning 内容。
 
 ## 快速开始
 
@@ -135,7 +139,7 @@ Copy-Item .env.example .env
 New-Item -ItemType Directory -Force auths
 ```
 
-将每个账号的 OAuth JSON 文件直接放在 `auths/` 下，一份文件对应一个账号：
+将 Grok CLI 的 `auth.json` 或兼容凭证文件直接放在 `auths/` 下。一个物理文件既可以是旧版单凭证，也可以通过 scope 或 `tokens` 包装包含多个逻辑凭证：
 
 ```text
 auths/
@@ -144,10 +148,10 @@ auths/
 └── account-n.json
 ```
 
-凭证通常需要包含可用的访问令牌、刷新信息与稳定的账号标识。服务只扫描该目录的第一层，不递归读取子目录。
+凭证通常需要包含可用的访问令牌或 API Key、刷新信息与稳定的 principal。服务只扫描该目录的第一层，不递归读取子目录；多 scope 文件中的每个逻辑凭证会独立进入账号池。
 
 > [!CAUTION]
-> `auths/` 已被 Git 忽略，但仍应作为敏感目录妥善保管。服务会热加载凭证，并将刷新后的令牌和模型目录写回原文件，因此目录与文件必须可写。
+> `auths/` 已被 Git 忽略，但仍应作为敏感目录妥善保管。服务会热加载凭证，并在跨进程文件锁保护下将刷新的目标 scope 原子写回原文件，因此目录与文件必须可写。结构化模型目录与 ETag 保存在独立的 state v2 文件中，不会写入新的 CLI 凭证。
 
 ### 2. 配置本地访问密钥
 
@@ -157,7 +161,7 @@ auths/
 GROK_API_KEYS=sk-kfcvivo50
 ```
 
-本地 API Key 只用于保护当前服务，与上游 OAuth 凭证相互独立。留空可关闭访问保护，但不建议在任何可被其他设备访问的环境中这样做。
+本地 API Key 与上游凭证相互独立，同时也是连续性状态的租户边界：服务使用持久 namespace key 对本地 Key 做 HMAC，为不同 Key 生成不可逆 tenant ID，原始 Key 不会写入状态文件。留空会关闭访问保护，并让所有调用方共享 `public` tenant，无法隔离彼此的会话状态，因此不建议在任何可被其他设备访问的环境中这样做。
 
 ### 3. 启动服务
 
@@ -301,14 +305,18 @@ curl http://localhost:8088/v1/messages \
 X-Grok-Session-ID: conversation-123
 ```
 
-服务也会依次识别以下字段作为亲和标识：
+服务按以下优先级识别亲和标识：
 
 - OpenAI `previous_response_id`
+- `X-Grok-Session-ID`
+- Responses 加密 reasoning 或 Anthropic thinking signature
 - OpenAI `prompt_cache_key`
 - OpenAI `user`
 - Anthropic `metadata.user_id`
 
-本地 API Key 与客户端 IP 不会被用作账号亲和标识。亲和关系仅保存在内存中，并受 TTL 与容量上限控制。
+`previous_response_id`、显式 session ID 和状态签名属于 hard affinity；`GROK_AUTHS_DIR` 下的 `.grokcli2api-affinity.json` 只保存加入 tenant namespace 后的哈希 binding、账号、模型、backend、上游 session、下一 turn 与过期时间。`prompt_cache_key`、用户字段等 soft affinity 与 `store:false` 工具回放仍只保存在内存中。所有映射都受 TTL 与容量上限控制；本地 API Key 不直接选择账号，但会隔离不同 tenant 的 affinity、Response ownership、状态签名与工具回放。客户端 IP 不参与亲和。
+
+容器重建或 affinity 状态丢失后，请求中的 Responses `reasoning.encrypted_content` 或 Anthropic thinking signature 可能在当前 tenant 中没有 binding。服务会删除这部分未知 opaque state，并以新上游 session 继续其余对话，而不会把密文转发给随机账号；已经存在但互相指向不同账号/session 的有效 binding 仍会被拒绝。未知 `previous_response_id` 继续返回 404。
 
 没有既有亲和的新请求会先在可用付费账号间按负载轮转；当付费账号不支持目标模型、被禁用、进入冷却或达到并发上限时，调度器才会使用 free 或层级未知的账号。已有亲和仍优先保证多轮与 `previous_response_id` 连续性。
 
@@ -364,7 +372,7 @@ curl http://localhost:8088/v1/admin/credentials \
   -F "file=@auth.json;type=application/json"
 ```
 
-服务端根据凭证中的稳定账号标识生成脱敏 ID；重复上传同一账号会原子覆盖原凭证。上传后会立即尝试发现模型；对支持 usage 的层级还会立即读取 credits，临时探测失败不会删除已经保存的凭证。状态响应还会返回从 JWT 派生的官方订阅层级 key 与显示名称。
+服务端按规范化 scope、认证模式与稳定 principal 生成脱敏 ID；旧版无 scope 凭证保持兼容 ID。上传多 scope 文件时，响应通过 `credentials[]` 返回每个逻辑凭证及其 `model_discovery` 状态；单 scope 上传同时保留旧版顶层 `credential`、`created` 与 `model_discovery` 字段。重复上传同一逻辑凭证会在原文件中原子更新目标 scope。上传后会立即尝试发现模型；对支持 usage 的层级还会立即读取 credits，临时探测失败不会删除已经保存的凭证。状态响应还会返回从 JWT 派生的官方订阅层级 key、显示名称与计费快照。
 
 列出脱敏后的凭证状态：
 
@@ -373,12 +381,14 @@ curl http://localhost:8088/v1/admin/credentials \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
 
-删除凭证时使用列表返回的 24 位脱敏 ID：
+删除逻辑凭证时使用列表返回的 24 位脱敏 ID；多 scope 文件只会移除对应 scope：
 
 ```bash
 curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
+
+上游返回 HTTP `403`，并且错误内容包含区分大小写的关键词 `Access to the chat endpoint is denied` 时，服务会自动删除命中的逻辑凭证并尝试其他账号。关键词之后的说明文字、标点以及 JSON 层级可以不同；非 `403` 或大小写不同不会触发删除。多 scope 文件仍只删除被拒绝的 scope；若文件锁或写盘失败，账号会先被禁用，避免再次调度。
 
 管理接口响应带有 `Cache-Control: no-store`。上传文件限制为 1 MiB，服务会校验 JSON、使用账号身份生成保存路径并以 `0600` 权限原子写入，不会采用客户端提供的文件名。建议优先在服务器本机或 SSH 隧道中管理；如需跨网络访问，必须使用 HTTPS，并在反向代理层限制来源和频率。
 
@@ -396,7 +406,7 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络错误与上游 5xx 错误的基础退避时间 |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 上游 429 未提供 `Retry-After` 时的冷却时间 |
 | `GROK_QUOTA_COOLDOWN` | `24h` | 额度耗尽后的默认冷却时间 |
-| `GROK_AFFINITY_TTL` | `1h` | 内存会话亲和关系的有效期 |
+| `GROK_AFFINITY_TTL` | `1h` | hard/soft affinity 的有效期；hard binding 可持久化，soft binding 仅在内存中 |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | 会话亲和缓存的容量上限 |
 
 免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。账号级冷却按原因独立追踪，因此计费耗尽、429 与其他上游冷却可以同时生效，清理其中一个原因不会提前放行仍受其他原因限制的账号。官方开放 usage 的高层级账号会读取 `billing?format=credits`（Free 与 X Basic 不主动轮询）：管理员上传、目录热加载或 OAuth tier 进入该范围时会立即触发探测，之后按配置周期刷新。只有 included usage 达到 100%，且没有剩余 on-demand 或 prepaid 额度时，才主动冷却到服务端返回的周期结束时间；明确恢复的余额会清理 `billing_exhausted` 和上游 spending-limit 对应的 `quota_exhausted`，但不会清理 429、鉴权或模型级冷却。用量快照仅保存在内存并通过管理员凭证状态的 `billing` 字段展示，不写回 OAuth 文件。
@@ -409,6 +419,10 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | --- | --- | --- |
 | `GROK_CHAT_PROXY_BASE_URL` | `https://cli-chat-proxy.grok.com` | Grok CLI 上游地址 |
 | `GROK_CHAT_PROXY_VERSION` | `v1` | 上游 API 版本 |
+| `GROK_XAI_API_BASE_URL` | `https://api.x.ai` | API Key 账号使用的 xAI API origin；远端模型元数据不能覆盖 |
+| `GROK_CLIENT_VERSION` | `0.2.102` | 对齐的 Grok CLI 协议版本 |
+| `GROK_CLIENT_MODE` | `headless` | 上游 `x-grok-client-mode`，可选 `headless` 或 `interactive` |
+| `GROK_DEPLOYMENT_ID` | 空 | 可选的托管部署 ID，请求时作为 `x-grok-deployment-id` 发送 |
 | `GROK_STREAM_COMPRESSION` | `identity` | `identity` 避免 gzip 缓冲 SSE；`gzip` 用于兼容回退 |
 | `GROK_PROXY_URL` | 空 | 出站代理，支持 HTTP(S)、SOCKS5 与 SOCKS5H |
 | `GROK_NO_PROXY` | 空 | 逗号分隔的代理绕过规则 |
@@ -452,9 +466,9 @@ go run ./cmd/grok2api -version
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/admin/credentials` | 列出脱敏的凭证状态、官方订阅层级和模型目录 |
-| `POST` | `/v1/admin/credentials` | 上传或覆盖 JSON 凭证，支持 JSON 请求体和 multipart `file` 字段 |
-| `DELETE` | `/v1/admin/credentials/{id}` | 删除凭证并立即从调度池移除 |
+| `GET` | `/v1/admin/credentials` | 列出脱敏的凭证状态、官方订阅层级、计费快照和模型目录 |
+| `POST` | `/v1/admin/credentials` | 上传或覆盖单 scope/多 scope JSON 凭证，支持 JSON 请求体和 multipart `file` 字段 |
+| `DELETE` | `/v1/admin/credentials/{id}` | 删除对应逻辑凭证并立即从调度池移除 |
 
 ### Grok 只读透传接口
 
@@ -467,7 +481,9 @@ go run ./cmd/grok2api -version
 | `GET` | `/v1/grok/mcp/tools/list` |
 | `GET` | `/v1/grok/feedback/config` |
 
-启动时，服务会读取凭证 JSON 中缓存的模型目录，并为缺失目录或超过刷新周期的账号请求上游 `/v1/models`。新增账号也会在目录热加载后自动完成模型发现。规范化后的 `models` 与 `models_updated_at` 字段会持久化到对应凭证文件，并在刷新令牌时保留。
+启动时，服务会从 `GROK_AUTHS_DIR` 下的 `.grokcli2api-state.json` v2 读取账号级结构化模型目录、ETag、首次发现时间、冷却状态、全局 agent ID 与 namespace key，并为缺失或超过刷新周期的账号请求上游 `/v1/models`。新增账号也会在目录热加载后自动完成模型发现；旧凭证中的 `models` 字符串数组只在首次联网刷新前作为临时目录。模型目录和 ETag 不再写入新的 CLI 凭证。
+
+`/v1/models` 仍返回标准 OpenAI 模型对象，并在有结构化描述符时附加 `x_grok` 元数据，包括账号间聚合后的 `api_backends`、上下文与输出上限、`reasoning_efforts`、backend search 和流式工具调用能力。backend 取并集，数值上限取最小有效值，reasoning 档位取交集，布尔能力仅在全部候选账号都支持时为 `true`。
 
 实际支持的模型始终以上游账号返回结果为准。调用生成接口前建议先查询 `/v1/models`，并使用返回的准确模型 ID。
 
@@ -493,13 +509,25 @@ go run ./cmd/grok2api -version
 
 ```bash
 gofmt -w path/to/changed.go
-go test ./...
-go test -race ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
 go vet ./...
-go build ./cmd/grok2api
+go build -trimpath ./cmd/grok2api
+docker build .
 ```
 
-> `go test -race ./...` 需要当前平台支持 Go Race Detector；项目 CI 会在 Linux 环境执行该检查。
+> `go test -race -count=1 ./...` 需要当前平台支持 Go Race Detector；项目 CI 会在 Linux 环境执行该检查。
+
+### 安全真实 Smoke
+
+只有上面的全部离线门禁（包括 Linux race 与 Docker build）通过后，才可显式运行最多 6 次生成的安全 smoke：
+
+```bash
+GROK_LIVE_SMOKE=1 GROK_LIVE_SMOKE_OFFLINE_GATES=passed \
+go test -count=1 -run '^TestLiveInferenceSmoke$' ./internal/grok
+```
+
+默认源文件是 `auths/live-01.json`，也可用 `GROK_LIVE_SMOKE_AUTH_FILE` 指定。源文件必须只包含一个逻辑凭证；测试仅向服务提供移除了 refresh token、ID token、邮箱和旧模型目录的 `0600` 临时副本，并在结束时核对源文件 SHA-256 与 Git 工作树完全未变。响应正文、Token、账号标识和上游错误体不会输出。
 
 ### 真实负载测试
 

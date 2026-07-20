@@ -23,6 +23,7 @@ import (
 
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
+	"github.com/Futureppo/grokcli2api-go/internal/modelcatalog"
 	"github.com/Futureppo/grokcli2api-go/internal/openai"
 )
 
@@ -141,10 +142,18 @@ func TestChatProxySanitizesStreamingAndNonStreamingBodies(t *testing.T) {
 		if body["max_tokens"] != float64(128) {
 			t.Fatalf("request[%d] max_tokens = %#v", index, body["max_tokens"])
 		}
-		for _, key := range []string{"max_completion_tokens", "parallel_tool_calls", "stream_options", "unknown_extension"} {
+		for _, key := range []string{"max_completion_tokens", "parallel_tool_calls", "unknown_extension"} {
 			if _, exists := body[key]; exists {
 				t.Fatalf("request[%d] leaked %s: %#v", index, key, body)
 			}
+		}
+		streaming, _ := body["stream"].(bool)
+		streamOptions, hasStreamOptions := body["stream_options"].(map[string]any)
+		if streaming && (!hasStreamOptions || streamOptions["include_usage"] != true) {
+			t.Fatalf("request[%d] missing streaming usage request: %#v", index, body)
+		}
+		if !streaming && hasStreamOptions {
+			t.Fatalf("request[%d] leaked non-stream stream_options: %#v", index, body)
 		}
 		messages := body["messages"].([]any)
 		first := messages[0].(map[string]any)
@@ -154,7 +163,36 @@ func TestChatProxySanitizesStreamingAndNonStreamingBodies(t *testing.T) {
 	}
 }
 
-func TestChatProxyReturnsLocal422BeforeMalformedToolHistoryReachesUpstream(t *testing.T) {
+func TestChatFinishReasonAtEOFCommitsExplicitSessionContinuity(t *testing.T) {
+	var sessions, turns []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessions = append(sessions, r.Header.Get("x-grok-session-id"))
+		turns = append(turns, r.Header.Get("x-grok-turn-idx"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	}))
+	defer upstream.Close()
+	h := newTestHandler(t, upstream.URL, nil)
+	body := `{"model":"grok-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	for request := 0; request < 2; request++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("X-Grok-Session-ID", "downstream-session")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "data: [DONE]") {
+			t.Fatalf("request %d status=%d body=%s", request, rec.Code, rec.Body.String())
+		}
+	}
+	if len(sessions) != 2 || sessions[0] == "" || sessions[0] != sessions[1] {
+		t.Fatalf("upstream sessions=%#v", sessions)
+	}
+	if len(turns) != 2 || turns[0] != "0" || turns[1] != "1" {
+		t.Fatalf("upstream turns=%#v", turns)
+	}
+}
+
+func TestChatProxySilentlyDropsMalformedToolHistoryBeforeUpstream(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -166,7 +204,7 @@ func TestChatProxyReturnsLocal422BeforeMalformedToolHistoryReachesUpstream(t *te
 	rec := httptest.NewRecorder()
 	body := `{"model":"grok-4","messages":[{"role":"tool","tool_call_id":"missing","content":"result"}]}`
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
-	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "does not reference an earlier assistant tool call") {
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "no representable input after cleaning") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if calls.Load() != 0 {
@@ -206,7 +244,7 @@ func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	}
 }
 
-func TestPermanentChatDenialDisablesAccountAndRetries(t *testing.T) {
+func TestChatDenialKeywordDeletesAccountAndRetries(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string
 	deniedToken := ""
@@ -222,7 +260,7 @@ func TestPermanentChatDenialDisablesAccountAndRetries(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if denied {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
+			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into ***.x.ai and update the permissions, or contact support."}`)
 			return
 		}
 		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
@@ -248,7 +286,7 @@ func TestPermanentChatDenialDisablesAccountAndRetries(t *testing.T) {
 	}
 }
 
-func TestPermanentChatDenialDisablesAccountAndRetriesStream(t *testing.T) {
+func TestChatDenialKeywordDeletesAccountAndRetriesStream(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string
 	deniedToken := ""
@@ -263,7 +301,7 @@ func TestPermanentChatDenialDisablesAccountAndRetriesStream(t *testing.T) {
 		mu.Unlock()
 		if denied {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"error":{"message":"Access to the chat endpoint is denied"}}`)
+			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -284,12 +322,12 @@ func TestPermanentChatDenialDisablesAccountAndRetriesStream(t *testing.T) {
 	}
 }
 
-func TestPermanentChatDenialStopsUsingOnlyAccount(t *testing.T) {
+func TestChatDenialKeywordDeletesOnlyAccount(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `{"error":"Access to the chat endpoint is denied"}`)
+		_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
 	}))
 	defer upstream.Close()
 	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a"})
@@ -306,7 +344,7 @@ func TestPermanentChatDenialStopsUsingOnlyAccount(t *testing.T) {
 		t.Fatalf("second status=%d, want 503", status)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("disabled account called upstream %d times, want 1", got)
+		t.Fatalf("deleted account called upstream %d times, want 1", got)
 	}
 }
 
@@ -599,16 +637,16 @@ func TestStreamingHeadersAndTextFlushBeforeCompletion(t *testing.T) {
 			doneEvent: "data: [DONE]\n\n",
 		},
 		{
-			name: "responses", route: "/v1/responses", upstreamPath: "/v1/responses", want: "hello",
+			name: "responses", route: "/v1/responses", upstreamPath: "/v1/chat/completions", want: "hello",
 			body:      `{"model":"grok-4","input":"hi","stream":true}`,
-			textEvent: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
-			doneEvent: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+			textEvent: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+			doneEvent: "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
 		},
 		{
-			name: "anthropic", route: "/v1/messages", upstreamPath: "/v1/responses", want: "hello",
+			name: "anthropic", route: "/v1/messages", upstreamPath: "/v1/chat/completions", want: "hello",
 			body:      `{"model":"grok-4","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true}`,
-			textEvent: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"item-1\",\"delta\":\"hello\"}\n\n",
-			doneEvent: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+			textEvent: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+			doneEvent: "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
 		},
 	}
 	for _, test := range tests {
@@ -744,7 +782,7 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 		})
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello"}`)))
 	if rec.Code != 200 {
@@ -781,7 +819,7 @@ func TestResponsesForwardsPreviousResponseID(t *testing.T) {
 		writeJSON(w, http.StatusOK, map[string]any{"id": "resp_child", "previous_response_id": "resp_parent", "output": []any{}})
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"continue","previous_response_id":"resp_parent"}`)))
 	if rec.Code != http.StatusOK {
@@ -827,7 +865,7 @@ func TestResponsesStoreAwareToolContinuationWireBodies(t *testing.T) {
 				writeJSON(w, http.StatusOK, map[string]any{"id": "resp_next_" + test.name, "output": []any{}})
 			}))
 			defer upstream.Close()
-			h := newTestHandler(t, upstream.URL, nil)
+			h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 			rec := httptest.NewRecorder()
 			requestBody := fmt.Sprintf(`{"model":"grok-4","previous_response_id":%q,"input":[{"type":"function_call_output","call_id":%q,"output":"ok"}]}`, test.responseID, callID)
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(requestBody)))
@@ -839,11 +877,43 @@ func TestResponsesStoreAwareToolContinuationWireBodies(t *testing.T) {
 				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 					t.Fatal(err)
 				}
-				if response["previous_response_id"] != test.responseID {
-					t.Fatalf("response previous=%#v", response["previous_response_id"])
+				if _, exists := response["previous_response_id"]; exists {
+					t.Fatalf("stateless continuation synthesized previous id: %#v", response)
 				}
 			}
 		})
+	}
+}
+
+func TestTenantStoreFalseReplayMissStartsFreshConversation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["previous_response_id"] != nil {
+			t.Fatalf("lost state handle reached upstream: %#v", body)
+		}
+		input, _ := body["input"].([]any)
+		if len(input) != 1 || openai.String(input[0].(map[string]any), "type", "") != "message" {
+			t.Fatalf("orphan output was not silently removed: %#v", input)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "resp_fresh", "status": "completed", "output": []any{}})
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokensForBackend(t, upstream.URL, []string{"local-key"}, []string{"token"}, modelcatalog.BackendResponses)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"grok-4","store":false,"previous_response_id":"resp_lost",
+		"input":[
+			{"type":"function_call_output","call_id":"lost","output":"opaque"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`))
+	req.Header.Set("Authorization", "Bearer local-key")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -867,7 +937,7 @@ func TestResponsesConvertsNamespaceToolsAndRestoresCall(t *testing.T) {
 		})
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	body := `{"model":"grok-4","input":"fetch","tools":[{"type":"namespace","name":"mcp__github__","tools":[{"type":"function","name":"fetch","parameters":{"type":"object","properties":{}}}]}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
@@ -902,7 +972,7 @@ func TestResponsesRejectsUnknownInputBeforeUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := payload["error"].(map[string]any)
-	if inner["param"] != "input[0].type" || inner["type"] != "invalid_request_error" {
+	if inner["param"] != "input" || inner["type"] != "invalid_request_error" {
 		t.Fatalf("error=%#v", inner)
 	}
 }
@@ -915,7 +985,7 @@ func TestResponsesStreamRestoresNamespace(t *testing.T) {
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"name\":\"ns__lookup\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}]}}\n\n")
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	body := `{"model":"grok-4","input":"lookup","stream":true,"tools":[{"type":"namespace","name":"ns__","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
@@ -929,13 +999,13 @@ func TestResponsesGrokBuildClientUsesNativePassThrough(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body["grok_extension"] != "native" || body["model"] != "grok-build" {
+		if body["grok_extension"] != nil || body["model"] != "grok-build" || body["store"] != false {
 			t.Fatalf("wire=%#v", body)
 		}
 		writeJSON(w, 200, map[string]any{"native": true, "grok_field": "kept"})
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-build","input":"hello","grok_extension":"native"}`))
 	req.Header.Set("x-grok-client-name", "grok-shell")
 	rec := httptest.NewRecorder()
@@ -983,7 +1053,7 @@ func TestResponsesStreamPreservesEventsWithoutDone(t *testing.T) {
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\ndata: [DONE]\n\n")
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello","stream":true}`)))
 	text := rec.Body.String()
@@ -1005,7 +1075,7 @@ func TestResponsesStreamEmitsErrorOnPrematureEOF(t *testing.T) {
 		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello","stream":true}`)))
 	text := rec.Body.String()
@@ -1014,24 +1084,24 @@ func TestResponsesStreamEmitsErrorOnPrematureEOF(t *testing.T) {
 	}
 }
 
-func TestResponsesValidationUses400AndPreciseParam(t *testing.T) {
+func TestResponsesNativeHTTPImageReachesUpstream(t *testing.T) {
+	var received map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("invalid request reached upstream")
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "resp_image", "status": "completed", "output": []any{}})
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"http://example.com/a.png"}]}]}`)))
-	if rec.Code != http.StatusBadRequest {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	inner := payload["error"].(map[string]any)
-	if inner["param"] != "input[0].content[1].image_url" || inner["code"] != "invalid_value" {
-		t.Fatalf("error=%#v", inner)
+	encoded, _ := json.Marshal(received)
+	if !strings.Contains(string(encoded), "http://example.com/a.png") {
+		t.Fatalf("image was not represented on native Responses wire: %#v", received)
 	}
 }
 
@@ -1049,22 +1119,25 @@ func TestResponsesOversizedBodyUses413(t *testing.T) {
 	}
 }
 
-func TestGrokBuildNativeStreamPreservesRawSSE(t *testing.T) {
+func TestGrokBuildNativeResponsesRequiresTerminalEvent(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: grok.custom\nid: native-1\nretry: 500\ndata: {\"type\":\"grok.custom\",\"value\":1}\n\ndata: [DONE]\n\n")
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-build","input":"hello","stream":true}`))
 	req.Header.Set("User-Agent", "grok-shell/0.2.93")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	text := rec.Body.String()
-	for _, expected := range []string{"event: grok.custom", "id: native-1", "retry: 500", "data: [DONE]"} {
+	for _, expected := range []string{"event: grok.custom", "id: native-1", "retry: 500", "event: error", "upstream_stream_incomplete"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("%q missing from native stream: %s", expected, text)
 		}
+	}
+	if strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("Responses [DONE] must not be treated as a terminal event: %s", text)
 	}
 }
 
@@ -1081,7 +1154,7 @@ func TestAnthropicMessagesAndXAPIKey(t *testing.T) {
 		})
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, []string{"anthropic-key"})
+	h := newTestHandlerForBackend(t, upstream.URL, []string{"anthropic-key"}, modelcatalog.BackendResponses)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-4","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("x-api-key", "anthropic-key")
 	rec := httptest.NewRecorder()
@@ -1144,7 +1217,7 @@ func TestAnthropicMessagesAlwaysSendsToolTypes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			h := newTestHandler(t, upstream.URL, nil)
+			h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(encoded))))
 			if rec.Code != http.StatusOK {
@@ -1164,7 +1237,7 @@ func TestAnthropicMessagesStreamingSequence(t *testing.T) {
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n")
 	}))
 	defer upstream.Close()
-	h := newTestHandler(t, upstream.URL, nil)
+	h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-4","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
 	text := rec.Body.String()
@@ -1204,7 +1277,7 @@ func TestAnthropicMessagesAppliesResponseOptions(t *testing.T) {
 				})
 			}))
 			defer upstream.Close()
-			h := newTestHandler(t, upstream.URL, nil)
+			h := newTestHandlerForBackend(t, upstream.URL, nil, modelcatalog.BackendResponses)
 			body := fmt.Sprintf(`{"model":"grok-4","max_tokens":128,"stream":%t,"stop_sequences":["STOP"],"messages":[{"role":"user","content":"hi"}]}`, stream)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
@@ -1226,7 +1299,7 @@ func TestAnthropicMessagesRejectsOrphanToolResult(t *testing.T) {
 		"model":"grok-4","max_tokens":64,
 		"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_missing","content":"x"}]}]
 	}`)))
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"type":"error"`) || !strings.Contains(rec.Body.String(), "does not match a pending tool_use") {
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"type":"error"`) || !strings.Contains(rec.Body.String(), "no representable input after cleaning") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
@@ -1499,7 +1572,8 @@ func TestModelsEndpointAggregatesCredentialCatalogs(t *testing.T) {
 	}
 	var response struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
@@ -1508,9 +1582,113 @@ func TestModelsEndpointAggregatesCredentialCatalogs(t *testing.T) {
 	ids := make([]string, 0, len(response.Data))
 	for _, model := range response.Data {
 		ids = append(ids, model.ID)
+		if want := s.pool.ModelFirstSeen()[model.ID]; want <= 0 || model.Created != want {
+			t.Fatalf("model %q created = %d, want persisted first-seen %d", model.ID, model.Created, want)
+		}
 	}
 	if got, want := strings.Join(ids, ","), "grok-alpha,grok-beta,grok-shared"; got != want {
 		t.Fatalf("models = %q, want %q", got, want)
+	}
+
+	single := httptest.NewRecorder()
+	s.Handler().ServeHTTP(single, httptest.NewRequest(http.MethodGet, "/v1/models/grok-shared", nil))
+	if single.Code != http.StatusOK {
+		t.Fatalf("single model status = %d, body=%s", single.Code, single.Body.String())
+	}
+	var selected struct {
+		Created int64 `json:"created"`
+	}
+	if err := json.Unmarshal(single.Body.Bytes(), &selected); err != nil {
+		t.Fatal(err)
+	}
+	if want := s.pool.ModelFirstSeen()["grok-shared"]; selected.Created != want {
+		t.Fatalf("single model created = %d, want list first-seen %d", selected.Created, want)
+	}
+}
+
+func TestModelsEndpointSerializesConservativeXGrokMetadata(t *testing.T) {
+	dir := t.TempDir()
+	writeCredentialFileModels(t, dir, "subject-a", "token-a", []string{"grok-shared"})
+	writeCredentialFileModels(t, dir, "subject-b", "token-b", []string{"grok-shared"})
+	cfg := config.Config{
+		ChatProxyBaseURL: "http://127.0.0.1:1", ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, ModelsRefreshInterval: 6 * time.Hour,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 3,
+		RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
+		ClientName: "grok-shell", ClientVersion: "0.2.102", ClientSurface: "headless", ClientMode: "headless",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	accountIDs := s.pool.AccountIDs()
+	if len(accountIDs) != 2 {
+		t.Fatalf("account count = %d, want 2", len(accountIDs))
+	}
+	provisionalCreated := s.pool.ModelFirstSeen()["grok-shared"]
+	if provisionalCreated <= 0 {
+		t.Fatal("provisional model has no first-seen timestamp")
+	}
+	firstSeen := time.Now().Add(-2 * time.Minute).UTC().Truncate(time.Second)
+	descriptors := [][]modelcatalog.ModelDescriptor{
+		{{
+			ID: "grok-shared", WireModel: "wire-responses", Backend: modelcatalog.BackendResponses,
+			ContextWindow: 500000, MaxCompletionTokens: 32768, SupportsReasoningEffort: true,
+			ReasoningEfforts: []string{"low", "medium", "high"}, SupportsBackendSearch: true, StreamToolCalls: true,
+		}},
+		{{
+			ID: "grok-shared", WireModel: "wire-messages", Backend: modelcatalog.BackendMessages,
+			ContextWindow: 300000, MaxCompletionTokens: 16384, SupportsReasoningEffort: true,
+			ReasoningEfforts: []string{"low", "high", "xhigh"}, StreamToolCalls: true,
+		}},
+	}
+	for index, accountID := range accountIDs {
+		if err := s.pool.UpdateModelDescriptors(accountID, descriptors[index], fmt.Sprintf(`"etag-%d"`, index), firstSeen.Add(time.Duration(index)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+			XGrok   struct {
+				APIBackends             []string `json:"api_backends"`
+				ContextWindow           uint64   `json:"context_window"`
+				MaxCompletionTokens     uint32   `json:"max_completion_tokens"`
+				ReasoningEfforts        []string `json:"reasoning_efforts"`
+				SupportsReasoningEffort bool     `json:"supports_reasoning_effort"`
+				SupportsBackendSearch   bool     `json:"supports_backend_search"`
+				StreamToolCalls         bool     `json:"stream_tool_calls"`
+			} `json:"x_grok"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Object != "list" || len(response.Data) != 1 {
+		t.Fatalf("response = %#v", response)
+	}
+	model := response.Data[0]
+	if model.ID != "grok-shared" || model.Object != "model" || model.OwnedBy != "xai" || model.Created != provisionalCreated {
+		t.Fatalf("model identity = %#v", model)
+	}
+	if !reflect.DeepEqual(model.XGrok.APIBackends, []string{"messages", "responses"}) ||
+		model.XGrok.ContextWindow != 300000 || model.XGrok.MaxCompletionTokens != 16384 ||
+		!reflect.DeepEqual(model.XGrok.ReasoningEfforts, []string{"high", "low"}) ||
+		!model.XGrok.SupportsReasoningEffort || model.XGrok.SupportsBackendSearch || !model.XGrok.StreamToolCalls {
+		t.Fatalf("x_grok = %#v", model.XGrok)
 	}
 }
 
@@ -1587,6 +1765,10 @@ func newTestHandler(t *testing.T, upstream string, keys []string) http.Handler {
 	return newTestHandlerWithTokens(t, upstream, keys, []string{"upstream-token"})
 }
 
+func newTestHandlerForBackend(t *testing.T, upstream string, keys []string, backend modelcatalog.Backend) http.Handler {
+	return newTestHandlerWithTokensForBackend(t, upstream, keys, []string{"upstream-token"}, backend)
+}
+
 func newAdminTestServer(t *testing.T, upstream string) *Server {
 	t.Helper()
 	cfg := config.Config{
@@ -1628,7 +1810,15 @@ func newTestHandlerWithTokens(t *testing.T, upstream string, keys, tokens []stri
 	return newTestHandlerWithTokensAndCompression(t, upstream, keys, tokens, "")
 }
 
+func newTestHandlerWithTokensForBackend(t *testing.T, upstream string, keys, tokens []string, backend modelcatalog.Backend) http.Handler {
+	return newTestHandlerWithTokensForBackendAndCompression(t, upstream, keys, tokens, backend, "")
+}
+
 func newTestHandlerWithTokensAndCompression(t *testing.T, upstream string, keys, tokens []string, compression string) http.Handler {
+	return newTestHandlerWithTokensForBackendAndCompression(t, upstream, keys, tokens, "", compression)
+}
+
+func newTestHandlerWithTokensForBackendAndCompression(t *testing.T, upstream string, keys, tokens []string, backend modelcatalog.Backend, compression string) http.Handler {
 	t.Helper()
 	dir := t.TempDir()
 	for i, token := range tokens {
@@ -1638,6 +1828,17 @@ func newTestHandlerWithTokensAndCompression(t *testing.T, upstream string, keys,
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if backend != "" {
+		for _, accountID := range s.pool.AccountIDs() {
+			if err := s.pool.UpdateModelDescriptors(accountID, []modelcatalog.ModelDescriptor{
+				{ID: "grok-4", WireModel: "grok-4", Backend: backend, SupportedInAPI: true},
+				{ID: "grok-build", WireModel: "grok-build", Backend: backend, SupportedInAPI: true},
+			}, "", time.Now()); err != nil {
+				s.Close()
+				t.Fatal(err)
+			}
+		}
 	}
 	t.Cleanup(s.Close)
 	return s.Handler()

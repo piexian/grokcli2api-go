@@ -1,0 +1,35 @@
+[
+  {
+    "id": "fixture-chat",
+    "model": "fixture-chat-wire",
+    "apiBackend": "chat_completions",
+    "contextWindow": 131072,
+    "maxCompletionTokens": 8192,
+    "supportsReasoningEffort": true,
+    "reasoningEfforts": ["minimal", "low", "medium"],
+    "supportsBackendSearch": true,
+    "streamToolCalls": false
+  },
+  {
+    "id": "fixture-responses",
+    "model": "fixture-responses-wire",
+    "apiBackend": "responses",
+    "contextWindow": 500000,
+    "maxCompletionTokens": 32768,
+    "supportsReasoningEffort": true,
+    "reasoningEfforts": ["low", "medium", "high", "xhigh"],
+    "supportsBackendSearch": true,
+    "streamToolCalls": true
+  },
+  {
+    "id": "fixture-messages",
+    "model": "fixture-messages-wire",
+    "apiBackend": "messages",
+    "contextWindow": 200000,
+    "maxCompletionTokens": 16384,
+    "supportsReasoningEffort": false,
+    "reasoningEfforts": [],
+    "supportsBackendSearch": false,
+    "streamToolCalls": false
+  }
+]

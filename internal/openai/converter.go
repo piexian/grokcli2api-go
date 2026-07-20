@@ -521,14 +521,12 @@ func normalizeReasoningEffort(value string) string {
 	switch value {
 	case "":
 		return ""
-	case "none", "minimal", "low":
+	case "none":
 		return "low"
-	case "adaptive", "medium":
-		return "medium"
-	case "high", "xhigh":
-		return "high"
+	case "minimal", "low", "medium", "high", "xhigh":
+		return value
 	default:
-		return "medium"
+		return "low"
 	}
 }
 

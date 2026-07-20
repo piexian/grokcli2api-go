@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.2.102",
+  "source_rev": "124d85bc5dc6e7805560215fcc6d5413944920e1",
+  "generated": true,
+  "sources": [
+    {
+      "path": "crates/codegen/xai-grok-shell/src/remote/client.rs",
+      "sha256": "9c5b3366a71865347970dd8ecf97b49e1728644b6574939e1166ad596a0595b0"
+    },
+    {
+      "path": "crates/codegen/xai-grok-sampling-types/src/messages.rs",
+      "sha256": "8835ba26ca23f1d36f19c0a553b019feea1f344c7fd3345c46681763e4649c73"
+    },
+    {
+      "path": "crates/codegen/xai-grok-sampling-types/src/types.rs",
+      "sha256": "8ec61f64f6f818b2a4ad4fb37ee9d95497e4faca956c5d8e56e444447d6799a1"
+    },
+    {
+      "path": "crates/codegen/xai-grok-sampler/src/client.rs",
+      "sha256": "0cfebe106cbb75b4bd33d53ab1059198c0d8ed276fa28c0e6fb114edac18384a"
+    }
+  ],
+  "fixtures": [
+    "model-descriptors.json",
+    "reasoning-efforts.json"
+  ]
+}

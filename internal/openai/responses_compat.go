@@ -60,7 +60,7 @@ type StreamEvent struct {
 // PrepareCompatibleResponses maps current OpenAI/Codex Responses request
 // shapes to the subset understood by the Grok CLI upstream.
 func PrepareCompatibleResponses(body map[string]any) (map[string]any, *ResponsesCompatibility, error) {
-	return PrepareCompatibleResponsesWithCache(body, DefaultToolReplay)
+	return PrepareCompatibleResponsesWithTenant(body, DefaultToolReplay, publicToolReplayTenant)
 }
 
 // PrepareCompatibleResponsesWithCache is the testable entry point that accepts
@@ -76,6 +76,12 @@ func PrepareCompatibleResponses(body map[string]any) (map[string]any, *Responses
 // still go through this package's alias rewrite. Cached function_call items
 // are already minimal ModelInput shapes.
 func PrepareCompatibleResponsesWithCache(body map[string]any, cache *ToolReplayCache) (map[string]any, *ResponsesCompatibility, error) {
+	return PrepareCompatibleResponsesWithTenant(body, cache, publicToolReplayTenant)
+}
+
+// PrepareCompatibleResponsesWithTenant applies local continuation replay only
+// inside tenant. The namespace must already be a non-secret derived ID.
+func PrepareCompatibleResponsesWithTenant(body map[string]any, cache *ToolReplayCache, tenant string) (map[string]any, *ResponsesCompatibility, error) {
 	out := PrepareResponses(body)
 	removeEncryptedReasoningInclude(out)
 	previousResponseID := String(body, "previous_response_id", "")
@@ -107,15 +113,15 @@ func PrepareCompatibleResponsesWithCache(body map[string]any, cache *ToolReplayC
 	if input, ok := out["input"].([]any); ok {
 		statefulPrevious := false
 		if previousResponseID != "" {
-			if record, found := cache.getRecord(model, "prev-resp:"+previousResponseID); found && record.storeKnown && record.store {
+			if record, found := cache.getRecordForTenant(tenant, model, "prev-resp:"+previousResponseID); found && record.storeKnown && record.store {
 				statefulPrevious = true
 			}
 		}
 		if !statefulPrevious {
-			input = expandItemReferences(cache, model, input)
+			input = expandItemReferencesForTenant(cache, tenant, model, input)
 		}
 		probe := map[string]any{"input": input}
-		compat.localReplay = applyToolCallReplay(cache, model, probe, previousResponseID, promptCacheKey)
+		compat.localReplay = applyToolCallReplayForTenant(cache, tenant, model, probe, previousResponseID, promptCacheKey)
 		if compat.localReplay && previousResponseID != "" {
 			delete(out, "previous_response_id")
 		}

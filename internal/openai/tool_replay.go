@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
@@ -13,16 +14,19 @@ import (
 // Only tool calls are cached — never encrypted reasoning — so a multi-account
 // pool cannot re-inject another account's opaque ciphertext.
 type ToolReplayCache struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	max     int
-	entries map[string]toolReplayEntry
+	mu       sync.Mutex
+	ttl      time.Duration
+	max      int
+	maxBytes int
+	bytes    int
+	entries  map[string]toolReplayEntry
 }
 
 type toolReplayEntry struct {
 	items      []map[string]any
 	store      bool
 	storeKnown bool
+	bytes      int
 	expiresAt  time.Time
 }
 
@@ -33,33 +37,47 @@ type toolReplayRecord struct {
 }
 
 const (
-	defaultToolReplayTTL = time.Hour
-	defaultToolReplayMax = 10240
+	defaultToolReplayTTL   = time.Hour
+	defaultToolReplayMax   = 10240
+	defaultToolReplayBytes = 32 << 20
+	publicToolReplayTenant = "public"
 )
 
 // DefaultToolReplay is the process-wide cache used by the Responses path.
 var DefaultToolReplay = NewToolReplayCache(defaultToolReplayTTL, defaultToolReplayMax)
 
 func NewToolReplayCache(ttl time.Duration, maxEntries int) *ToolReplayCache {
+	return NewToolReplayCacheWithByteBudget(ttl, maxEntries, defaultToolReplayBytes)
+}
+
+func NewToolReplayCacheWithByteBudget(ttl time.Duration, maxEntries, maxBytes int) *ToolReplayCache {
 	if ttl <= 0 {
 		ttl = defaultToolReplayTTL
 	}
 	if maxEntries < 1 {
 		maxEntries = defaultToolReplayMax
 	}
+	if maxBytes < 1 {
+		maxBytes = defaultToolReplayBytes
+	}
 	return &ToolReplayCache{
-		ttl:     ttl,
-		max:     maxEntries,
+		ttl: ttl, max: maxEntries, maxBytes: maxBytes,
 		entries: make(map[string]toolReplayEntry),
 	}
 }
 
-func toolReplayKey(model, key string) string {
-	return model + "\x00" + key
+func toolReplayKey(tenant, model, key string) string {
+	return normalizeToolReplayTenant(tenant) + "\x00" + model + "\x00" + key
 }
 
 func (c *ToolReplayCache) Get(model, key string) []map[string]any {
-	record, ok := c.getRecord(model, key)
+	return c.GetForTenant(publicToolReplayTenant, model, key)
+}
+
+// GetForTenant reads an entry inside a caller-isolated namespace. tenant is a
+// derived identifier, never the downstream API key itself.
+func (c *ToolReplayCache) GetForTenant(tenant, model, key string) []map[string]any {
+	record, ok := c.getRecordForTenant(tenant, model, key)
 	if !ok {
 		return nil
 	}
@@ -67,30 +85,44 @@ func (c *ToolReplayCache) Get(model, key string) []map[string]any {
 }
 
 func (c *ToolReplayCache) getRecord(model, key string) (toolReplayRecord, bool) {
+	return c.getRecordForTenant(publicToolReplayTenant, model, key)
+}
+
+func (c *ToolReplayCache) getRecordForTenant(tenant, model, key string) (toolReplayRecord, bool) {
 	if c == nil || model == "" || key == "" {
 		return toolReplayRecord{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[toolReplayKey(model, key)]
+	cacheKey := toolReplayKey(tenant, model, key)
+	entry, ok := c.entries[cacheKey]
 	if !ok {
 		return toolReplayRecord{}, false
 	}
 	if time.Now().After(entry.expiresAt) {
-		delete(c.entries, toolReplayKey(model, key))
+		c.bytes -= entry.bytes
+		delete(c.entries, cacheKey)
 		return toolReplayRecord{}, false
 	}
 	// Sliding TTL: each successful read refreshes the entry expiry.
 	entry.expiresAt = time.Now().Add(c.ttl)
-	c.entries[toolReplayKey(model, key)] = entry
+	c.entries[cacheKey] = entry
 	return toolReplayRecord{items: cloneToolReplayItems(entry.items), store: entry.store, storeKnown: entry.storeKnown}, true
 }
 
 func (c *ToolReplayCache) Put(model, key string, items []map[string]any) {
-	c.put(model, key, items, false, false)
+	c.PutForTenant(publicToolReplayTenant, model, key, items)
+}
+
+func (c *ToolReplayCache) PutForTenant(tenant, model, key string, items []map[string]any) {
+	c.putForTenant(tenant, model, key, items, false, false)
 }
 
 func (c *ToolReplayCache) put(model, key string, items []map[string]any, store, storeKnown bool) {
+	c.putForTenant(publicToolReplayTenant, model, key, items, store, storeKnown)
+}
+
+func (c *ToolReplayCache) putForTenant(tenant, model, key string, items []map[string]any, store, storeKnown bool) {
 	if c == nil || model == "" || key == "" || len(items) == 0 {
 		return
 	}
@@ -98,28 +130,75 @@ func (c *ToolReplayCache) put(model, key string, items []map[string]any, store, 
 	if len(normalized) == 0 {
 		return
 	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil || len(encoded) > c.maxBytes {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	cacheKey := toolReplayKey(tenant, model, key)
+	if existing, ok := c.entries[cacheKey]; ok {
+		c.bytes -= existing.bytes
+		delete(c.entries, cacheKey)
+	}
 	if len(c.entries) >= c.max {
 		c.evictExpiredLocked(time.Now())
 	}
-	if len(c.entries) >= c.max {
+	for len(c.entries) >= c.max || c.bytes+len(encoded) > c.maxBytes {
+		if len(c.entries) == 0 {
+			break
+		}
 		for existing := range c.entries {
+			c.bytes -= c.entries[existing].bytes
 			delete(c.entries, existing)
 			break
 		}
 	}
-	c.entries[toolReplayKey(model, key)] = toolReplayEntry{
+	c.entries[cacheKey] = toolReplayEntry{
 		items:      cloneToolReplayItems(normalized),
 		store:      store,
 		storeKnown: storeKnown,
+		bytes:      len(encoded),
 		expiresAt:  time.Now().Add(c.ttl),
+	}
+	c.bytes += len(encoded)
+}
+
+func normalizeToolReplayTenant(tenant string) string {
+	if tenant = strings.TrimSpace(tenant); tenant != "" {
+		return tenant
+	}
+	return publicToolReplayTenant
+}
+
+// TenantToolReplayCache is a lightweight namespaced view over a shared cache.
+// It owns no goroutines or storage and is safe to create per request.
+type TenantToolReplayCache struct {
+	cache  *ToolReplayCache
+	tenant string
+}
+
+func (c *ToolReplayCache) WithTenant(tenant string) *TenantToolReplayCache {
+	return &TenantToolReplayCache{cache: c, tenant: normalizeToolReplayTenant(tenant)}
+}
+
+func (c *TenantToolReplayCache) Get(model, key string) []map[string]any {
+	if c == nil {
+		return nil
+	}
+	return c.cache.GetForTenant(c.tenant, model, key)
+}
+
+func (c *TenantToolReplayCache) Put(model, key string, items []map[string]any) {
+	if c != nil {
+		c.cache.PutForTenant(c.tenant, model, key, items)
 	}
 }
 
 func (c *ToolReplayCache) evictExpiredLocked(now time.Time) {
 	for key, entry := range c.entries {
 		if now.After(entry.expiresAt) {
+			c.bytes -= entry.bytes
 			delete(c.entries, key)
 		}
 	}
@@ -195,13 +274,21 @@ func normalizeReplayItems(items []map[string]any) []map[string]any {
 //   - cache:{prompt_cache_key} when present
 //   - item:{item.id} for each tool call
 func RememberCompletedResponse(cache *ToolReplayCache, model string, response map[string]any, promptCacheKey string) {
-	RememberCompletedResponseWithStore(cache, model, response, promptCacheKey, false)
+	RememberCompletedResponseForTenant(cache, publicToolReplayTenant, model, response, promptCacheKey)
+}
+
+func RememberCompletedResponseForTenant(cache *ToolReplayCache, tenant, model string, response map[string]any, promptCacheKey string) {
+	RememberCompletedResponseWithStoreForTenant(cache, tenant, model, response, promptCacheKey, false)
 }
 
 // RememberCompletedResponseWithStore also records whether the upstream can
 // restore the response. Only store:false responses are eligible for local
 // minimal tool-call replay.
 func RememberCompletedResponseWithStore(cache *ToolReplayCache, model string, response map[string]any, promptCacheKey string, store bool) {
+	RememberCompletedResponseWithStoreForTenant(cache, publicToolReplayTenant, model, response, promptCacheKey, store)
+}
+
+func RememberCompletedResponseWithStoreForTenant(cache *ToolReplayCache, tenant, model string, response map[string]any, promptCacheKey string, store bool) {
 	if cache == nil || response == nil || strings.TrimSpace(model) == "" {
 		return
 	}
@@ -211,14 +298,14 @@ func RememberCompletedResponseWithStore(cache *ToolReplayCache, model string, re
 	}
 	responseID := String(response, "id", "")
 	if responseID != "" {
-		cache.put(model, "prev-resp:"+responseID, items, store, true)
+		cache.putForTenant(tenant, model, "prev-resp:"+responseID, items, store, true)
 	}
 	if promptCacheKey = strings.TrimSpace(promptCacheKey); promptCacheKey != "" {
-		cache.put(model, "cache:"+promptCacheKey, items, store, true)
+		cache.putForTenant(tenant, model, "cache:"+promptCacheKey, items, store, true)
 	}
 	for _, item := range items {
 		if id := String(item, "id", ""); id != "" {
-			cache.put(model, "item:"+id, []map[string]any{item}, store, true)
+			cache.putForTenant(tenant, model, "item:"+id, []map[string]any{item}, store, true)
 		}
 	}
 }
@@ -228,10 +315,18 @@ func RememberCompletedResponseWithStore(cache *ToolReplayCache, model string, re
 // patching empty output; item:{id} is safe to write immediately so
 // item_reference works mid-stream.
 func RememberStreamToolCall(cache *ToolReplayCache, model string, item map[string]any, responseID, promptCacheKey string) {
-	RememberStreamToolCallWithStore(cache, model, item, responseID, promptCacheKey, false)
+	RememberStreamToolCallForTenant(cache, publicToolReplayTenant, model, item, responseID, promptCacheKey)
+}
+
+func RememberStreamToolCallForTenant(cache *ToolReplayCache, tenant, model string, item map[string]any, responseID, promptCacheKey string) {
+	RememberStreamToolCallWithStoreForTenant(cache, tenant, model, item, responseID, promptCacheKey, false)
 }
 
 func RememberStreamToolCallWithStore(cache *ToolReplayCache, model string, item map[string]any, responseID, promptCacheKey string, store bool) {
+	RememberStreamToolCallWithStoreForTenant(cache, publicToolReplayTenant, model, item, responseID, promptCacheKey, store)
+}
+
+func RememberStreamToolCallWithStoreForTenant(cache *ToolReplayCache, tenant, model string, item map[string]any, responseID, promptCacheKey string, store bool) {
 	if cache == nil || item == nil || strings.TrimSpace(model) == "" {
 		return
 	}
@@ -240,14 +335,14 @@ func RememberStreamToolCallWithStore(cache *ToolReplayCache, model string, item 
 		return
 	}
 	if responseID = strings.TrimSpace(responseID); responseID != "" {
-		cache.put(model, "prev-resp:"+responseID, mergeReplayItems(cache.Get(model, "prev-resp:"+responseID), items), store, true)
+		cache.putForTenant(tenant, model, "prev-resp:"+responseID, mergeReplayItems(cache.GetForTenant(tenant, model, "prev-resp:"+responseID), items), store, true)
 	}
 	if promptCacheKey = strings.TrimSpace(promptCacheKey); promptCacheKey != "" {
-		cache.put(model, "cache:"+promptCacheKey, mergeReplayItems(cache.Get(model, "cache:"+promptCacheKey), items), store, true)
+		cache.putForTenant(tenant, model, "cache:"+promptCacheKey, mergeReplayItems(cache.GetForTenant(tenant, model, "cache:"+promptCacheKey), items), store, true)
 	}
 	for _, normalized := range items {
 		if id := String(normalized, "id", ""); id != "" {
-			cache.put(model, "item:"+id, []map[string]any{normalized}, store, true)
+			cache.putForTenant(tenant, model, "item:"+id, []map[string]any{normalized}, store, true)
 		}
 	}
 }
@@ -303,6 +398,10 @@ func extractReplayToolCalls(raw any) []map[string]any {
 // expandItemReferences replaces item_reference with cached tool calls.
 // Unresolved references are left for normalize to drop.
 func expandItemReferences(cache *ToolReplayCache, model string, input []any) []any {
+	return expandItemReferencesForTenant(cache, publicToolReplayTenant, model, input)
+}
+
+func expandItemReferencesForTenant(cache *ToolReplayCache, tenant, model string, input []any) []any {
 	if cache == nil || len(input) == 0 {
 		return input
 	}
@@ -322,7 +421,7 @@ func expandItemReferences(cache *ToolReplayCache, model string, input []any) []a
 			}
 			continue
 		}
-		cached := cache.Get(model, "item:"+id)
+		cached := cache.GetForTenant(tenant, model, "item:"+id)
 		if len(cached) == 0 {
 			if out != nil {
 				out = append(out, raw)
@@ -346,6 +445,10 @@ func expandItemReferences(cache *ToolReplayCache, model string, input []any) []a
 // applyToolCallReplay re-inserts cached function/custom calls for matching
 // tool outputs from previous_response_id / prompt_cache_key sessions.
 func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]any, previousResponseID, promptCacheKey string) bool {
+	return applyToolCallReplayForTenant(cache, publicToolReplayTenant, model, body, previousResponseID, promptCacheKey)
+}
+
+func applyToolCallReplayForTenant(cache *ToolReplayCache, tenant, model string, body map[string]any, previousResponseID, promptCacheKey string) bool {
 	if cache == nil {
 		return false
 	}
@@ -381,13 +484,13 @@ func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]a
 	// Prefer previous_response_id session, then prompt_cache_key session.
 	var candidates []map[string]any
 	if previousResponseID != "" {
-		record, found := cache.getRecord(model, "prev-resp:"+previousResponseID)
+		record, found := cache.getRecordForTenant(tenant, model, "prev-resp:"+previousResponseID)
 		if !found || !record.storeKnown || record.store {
 			return false
 		}
 		candidates = append(candidates, record.items...)
 	} else if promptCacheKey != "" {
-		candidates = append(candidates, cache.Get(model, "cache:"+promptCacheKey)...)
+		candidates = append(candidates, cache.GetForTenant(tenant, model, "cache:"+promptCacheKey)...)
 	}
 	if len(candidates) == 0 {
 		return false
@@ -471,4 +574,49 @@ func applyToolCallReplay(cache *ToolReplayCache, model string, body map[string]a
 	rewritten = append(rewritten, input[insertAt:]...)
 	body["input"] = rewritten
 	return true
+}
+
+// PrepareResponsesReplayWithTenant performs only local, tenant-scoped
+// stateless tool continuation. It deliberately does not normalize protocol
+// fields, tools or content: account-specific request renderers own that work
+// after a model descriptor has been selected.
+//
+// The returned map is a shallow top-level copy. RequestPlan takes the final
+// deep immutable snapshot before any renderer runs.
+func PrepareResponsesReplayWithTenant(body map[string]any, cache *ToolReplayCache, tenant string) map[string]any {
+	out := clone(body)
+	model := String(body, "model", "")
+	previousResponseID := String(body, "previous_response_id", "")
+	promptCacheKey := String(body, "prompt_cache_key", "")
+	input, ok := out["input"].([]any)
+	if !ok {
+		return out
+	}
+
+	statefulPrevious := false
+	previousKnown := false
+	if previousResponseID != "" && cache != nil {
+		if record, found := cache.getRecordForTenant(tenant, model, "prev-resp:"+previousResponseID); found && record.storeKnown {
+			previousKnown = true
+			statefulPrevious = record.store
+		}
+	}
+	if !statefulPrevious {
+		input = expandItemReferencesForTenant(cache, tenant, model, input)
+	}
+	out["input"] = input
+	localReplay := applyToolCallReplayForTenant(cache, tenant, model, out, previousResponseID, promptCacheKey)
+	if localReplay && previousResponseID != "" {
+		delete(out, "previous_response_id")
+		return out
+	}
+
+	// A store:false continuation cannot rely on upstream response storage. If
+	// the in-memory replay disappeared after restart, drop the opaque state
+	// handle and let the descriptor renderer silently prune orphan outputs.
+	store, storeSupplied := body["store"].(bool)
+	if previousResponseID != "" && (previousKnown && !statefulPrevious || storeSupplied && !store) {
+		delete(out, "previous_response_id")
+	}
+	return out
 }

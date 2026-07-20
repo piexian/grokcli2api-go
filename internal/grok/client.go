@@ -26,13 +26,12 @@ import (
 
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
+	"github.com/Futureppo/grokcli2api-go/internal/modelcatalog"
 )
 
 const quotaErrorCode = "personal-team-blocked:spending-limit"
 
-const permanentChatDenialMessage = "access to the chat endpoint is denied"
-
-const genericAccessDenialMessage = "access denied"
+const permanentChatDenialKeyword = "Access to the chat endpoint is denied"
 
 const permanentChatDenialReason = "chat_endpoint_denied"
 
@@ -54,6 +53,7 @@ type APIError struct {
 	UpstreamMessage string
 	UpstreamParam   string
 	RetryAfter      time.Duration
+	ShouldRetry     *bool
 }
 
 func (e *APIError) Error() string {
@@ -74,15 +74,18 @@ func (e *APIError) Error() string {
 }
 
 type Client struct {
-	cfg        config.Config
-	pool       *auth.Pool
-	http       *http.Client
-	modelsMu   sync.Mutex
-	billingMu  sync.Mutex
-	modelStart sync.Once
-	modelClose chan struct{}
-	modelWG    sync.WaitGroup
-	closeOnce  sync.Once
+	cfg            config.Config
+	pool           *auth.Pool
+	http           *http.Client
+	modelsMu       sync.Mutex
+	billingMu      sync.Mutex
+	modelStart     sync.Once
+	modelClose     chan struct{}
+	modelRefreshCh chan string
+	modelPending   sync.Map
+	modelWG        sync.WaitGroup
+	closeOnce      sync.Once
+	lastInference  sync.Map // account ID -> time.Time
 }
 
 type SSEEvent struct {
@@ -103,6 +106,22 @@ type EventStream struct {
 	quotaCooldown time.Duration
 	timing        *RequestTiming
 	closeOnce     sync.Once
+	seenFirstLine bool
+}
+
+const (
+	maxSSELineBytes  = 64 << 20
+	maxSSEEventBytes = 64 << 20
+)
+
+// StreamIdleTimeoutError indicates that an established SSE stream stopped
+// producing decoded bytes for the configured per-model deadline.
+type StreamIdleTimeoutError struct {
+	Timeout time.Duration
+}
+
+func (e *StreamIdleTimeoutError) Error() string {
+	return fmt.Sprintf("upstream inference stream idle for %s", e.Timeout)
 }
 
 type timedReadCloser struct {
@@ -188,7 +207,10 @@ func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Cl
 		}
 	}
 	pool.EnableBillingPreflight()
-	return &Client{cfg: cfg, pool: pool, http: httpClient, modelClose: make(chan struct{})}, nil
+	return &Client{
+		cfg: cfg, pool: pool, http: httpClient, modelClose: make(chan struct{}),
+		modelRefreshCh: make(chan string, 64),
+	}, nil
 }
 
 func splitProxyPatterns(raw string) []string {
@@ -260,9 +282,23 @@ func (c *Client) StartModelRefresh() {
 // catalog. Credential writes are serialized by the pool; avoiding the batch
 // refresh mutex here keeps the caller's context deadline authoritative.
 func (c *Client) RefreshAccountModels(ctx context.Context, accountID string) error {
-	models, err := c.fetchAccountModels(ctx, accountID, false)
+	return c.refreshAccountModelsPath(ctx, accountID, "models")
+}
+
+// RefreshAccountModelsV2 mirrors the CLI session-resume metadata refresh.
+func (c *Client) RefreshAccountModelsV2(ctx context.Context, accountID string) error {
+	return c.refreshAccountModelsPath(ctx, accountID, "models-v2")
+}
+
+func (c *Client) refreshAccountModelsPath(ctx context.Context, accountID, path string) error {
+	result, err := c.fetchAccountModelsPath(ctx, accountID, false, path)
 	if err == nil {
-		err = c.pool.UpdateModels(accountID, models, time.Now())
+		now := time.Now()
+		if result.NotModified {
+			err = c.pool.TouchModelCatalog(accountID, now)
+		} else {
+			err = c.pool.UpdateModelDescriptors(accountID, result.Descriptors, result.ETag, now)
+		}
 	}
 	c.pool.RebuildSchedulingSnapshot()
 	return err
@@ -293,9 +329,14 @@ func (c *Client) RefreshModels(ctx context.Context, force bool) error {
 		go func() {
 			defer wg.Done()
 			for id := range jobs {
-				models, err := c.fetchAccountModels(ctx, id, false)
+				result, err := c.fetchAccountModels(ctx, id, false)
 				if err == nil {
-					err = c.pool.UpdateModels(id, models, time.Now())
+					now := time.Now()
+					if result.NotModified {
+						err = c.pool.TouchModelCatalog(id, now)
+					} else {
+						err = c.pool.UpdateModelDescriptors(id, result.Descriptors, result.ETag, now)
+					}
 				}
 				results <- err
 			}
@@ -464,71 +505,89 @@ func billingHasAvailableCapacity(info auth.BillingInfo) bool {
 		info.PrepaidBalanceCents != nil && *info.PrepaidBalanceCents > 0
 }
 
-func (c *Client) fetchAccountModels(ctx context.Context, accountID string, refreshed bool) ([]string, error) {
+type modelFetchResult struct {
+	Descriptors []modelcatalog.ModelDescriptor
+	ETag        string
+	NotModified bool
+}
+
+func (c *Client) fetchAccountModels(ctx context.Context, accountID string, refreshed bool) (modelFetchResult, error) {
+	return c.fetchAccountModelsPath(ctx, accountID, refreshed, "models")
+}
+
+func (c *Client) fetchAccountModelsPath(ctx context.Context, accountID string, refreshed bool, path string) (modelFetchResult, error) {
 	lease, err := c.pool.AcquireAccountForMetadata(ctx, accountID)
 	if err != nil {
-		return nil, err
+		return modelFetchResult{}, err
 	}
 	defer lease.Release()
-	resp, _, err := c.do(ctx, lease, http.MethodGet, "models", nil, NewID(), "", false, false)
+	extraHeaders := make(http.Header)
+	if etag := strings.TrimSpace(c.pool.ModelCatalogETag(accountID)); etag != "" {
+		extraHeaders.Set("If-None-Match", etag)
+	}
+	identity := identityWithLeaseDefaults(logicalRequestIdentity(ctx, NewID(), ""), lease)
+	resp, _, err := c.doWithIdentity(ctx, lease, http.MethodGet, path, nil, identity, false, false, extraHeaders)
 	if err != nil {
-		return nil, err
+		return modelFetchResult{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return modelFetchResult{ETag: c.pool.ModelCatalogETag(accountID), NotModified: true}, nil
+	}
 	payload, err := readResponseBody(resp, 4<<20)
 	if err != nil {
-		return nil, err
+		return modelFetchResult{}, err
 	}
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
 		if isPermanentAccountDenial(apiErr) {
-			c.pool.Disable(accountID, permanentChatDenialReason)
-			return nil, apiErr
+			c.deletePermanentlyDeniedCredential(accountID)
+			return modelFetchResult{}, apiErr
 		}
 		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
-			return c.fetchAccountModels(ctx, accountID, true)
+			return c.fetchAccountModelsPath(ctx, accountID, true, path)
 		}
-		return nil, apiErr
+		return modelFetchResult{}, apiErr
 	}
-	return parseModelIDs(payload)
+	descriptors, err := parseModelDescriptors(payload)
+	if err != nil {
+		return modelFetchResult{}, err
+	}
+	etag := strings.TrimSpace(resp.Header.Get("ETag"))
+	if etag == "" {
+		etag = strings.TrimSpace(resp.Header.Get("x-models-etag"))
+	}
+	return modelFetchResult{Descriptors: descriptors, ETag: etag}, nil
 }
 
-func parseModelIDs(payload []byte) ([]string, error) {
+func parseModelDescriptors(payload []byte) ([]modelcatalog.ModelDescriptor, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil, err
 	}
-	seen := map[string]struct{}{}
+	seen := map[string]modelcatalog.ModelDescriptor{}
 	collect := func(values any) {
 		items, _ := values.([]any)
 		for _, item := range items {
-			switch value := item.(type) {
-			case string:
-				if strings.TrimSpace(value) != "" {
-					seen[strings.TrimSpace(value)] = struct{}{}
-				}
-			case map[string]any:
-				id := stringField(value, "id")
-				if id == "" {
-					id = stringField(value, "name")
-				}
-				if id != "" {
-					seen[id] = struct{}{}
-				}
+			if value, ok := item.(string); ok {
+				item = map[string]any{"id": value, "model": value}
+			}
+			if descriptor, ok := modelcatalog.ParseDescriptor(item); ok {
+				seen[descriptor.ID] = descriptor
 			}
 		}
 	}
 	collect(raw["data"])
 	collect(raw["models"])
-	models := make([]string, 0, len(seen))
-	for id := range seen {
-		models = append(models, id)
+	descriptors := make([]modelcatalog.ModelDescriptor, 0, len(seen))
+	for _, descriptor := range seen {
+		descriptors = append(descriptors, descriptor)
 	}
-	sort.Strings(models)
-	if len(models) == 0 {
+	sort.Slice(descriptors, func(i, j int) bool { return descriptors[i].ID < descriptors[j].ID })
+	if len(descriptors) == 0 {
 		return nil, errors.New("upstream returned an empty model catalog")
 	}
-	return models, nil
+	return descriptors, nil
 }
 
 type billingCreditsResponse struct {
@@ -669,9 +728,33 @@ func (c *Client) modelRefreshLoop() {
 				slog.Warn("triggered account billing refresh failed", "error", err)
 			}
 			cancel()
+		case accountID := <-c.modelRefreshCh:
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := c.RefreshAccountModels(ctx, accountID); err != nil {
+				slog.Warn("account model refresh after ETag change failed", "error", err)
+			}
+			cancel()
+			c.modelPending.Delete(accountID)
 		case <-c.modelClose:
 			return
 		}
+	}
+}
+
+func (c *Client) requestModelRefresh(accountID, advertisedETag string) {
+	advertisedETag = strings.TrimSpace(advertisedETag)
+	if accountID == "" || advertisedETag == "" || advertisedETag == strings.TrimSpace(c.pool.ModelCatalogETag(accountID)) {
+		return
+	}
+	if _, loaded := c.modelPending.LoadOrStore(accountID, struct{}{}); loaded {
+		return
+	}
+	select {
+	case c.modelRefreshCh <- accountID:
+	case <-c.modelClose:
+		c.modelPending.Delete(accountID)
+	default:
+		c.modelPending.Delete(accountID)
 	}
 }
 
@@ -679,8 +762,50 @@ func (c *Client) URL(path string) string {
 	return c.cfg.ChatProxyBaseURL + "/" + c.cfg.ChatProxyVersion + "/" + strings.TrimLeft(path, "/")
 }
 
+// URLForSession selects only operator-controlled origins. API-key credentials
+// use the configured xAI API origin; all other modes use cli-chat-proxy.
+func (c *Client) URLForSession(session auth.Session, path string) string {
+	baseURL := c.cfg.ChatProxyBaseURL
+	version := strings.Trim(c.cfg.ChatProxyVersion, "/")
+	if session.IsAPIKey() {
+		baseURL = c.cfg.XAIAPIBaseURL
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = "https://api.x.ai"
+		}
+		// GROK_CHAT_PROXY_VERSION belongs to the private CLI proxy. The
+		// operator-configured xAI origin always uses the public /v1 API.
+		version = "v1"
+	}
+	return strings.TrimRight(baseURL, "/") + "/" + version + "/" + strings.TrimLeft(path, "/")
+}
+
+func logicalRequestIdentity(ctx context.Context, convID, model string) RequestIdentity {
+	identity, _ := RequestIdentityFromContext(ctx)
+	if identity.RequestID == "" {
+		identity.RequestID = NewID()
+	}
+	if identity.ConversationID == "" {
+		identity.ConversationID = convID
+	}
+	if identity.Model == "" {
+		identity.Model = model
+	}
+	return identity
+}
+
+func identityWithLeaseDefaults(identity RequestIdentity, lease *auth.Lease) RequestIdentity {
+	if identity.AgentID == "" {
+		identity.AgentID = lease.AgentID()
+	}
+	if identity.SessionID == "" {
+		identity.SessionID = lease.SessionID()
+	}
+	return identity
+}
+
 func (c *Client) DoJSON(ctx context.Context, method, path string, body map[string]any, affinity auth.Affinity, convID, model string, trace bool) (map[string]any, error) {
 	timing := RequestTimingFromContext(ctx)
+	identity := logicalRequestIdentity(ctx, convID, model)
 	payload, err := marshalBody(body)
 	if err != nil {
 		return nil, err
@@ -716,8 +841,9 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		}
 		accountID := lease.AccountID()
 		generation := lease.Generation()
+		identity = identityWithLeaseDefaults(identity, lease)
 		used[accountID] = struct{}{}
-		resp, wrote, err := c.do(ctx, lease, method, path, payload, convID, model, trace, false)
+		resp, wrote, err := c.doWithIdentity(ctx, lease, method, path, payload, identity, trace, false, nil)
 		if err != nil {
 			lease.Release()
 			lastErr = err
@@ -729,6 +855,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			}
 			continue
 		}
+		c.observeModelHeaders(accountID, model, resp.Header)
 		data, readErr := readResponseBody(resp, 16<<20)
 		resp.Body.Close()
 		if readErr != nil {
@@ -740,7 +867,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			lease.Release()
 			lastErr = apiErr
 			if isPermanentAccountDenial(apiErr) {
-				c.pool.Disable(accountID, permanentChatDenialReason)
+				c.deletePermanentlyDeniedCredential(accountID)
 				if len(used) < c.cfg.RetryMaxAttempts {
 					continue
 				}
@@ -775,7 +902,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 				return nil, apiErr
 			}
 			if apiErr.Status >= 500 {
-				if err := c.backoff(ctx, len(used)); err != nil {
+				if err := c.backoffForAPI(ctx, len(used), apiErr); err != nil {
 					return nil, err
 				}
 			}
@@ -807,6 +934,7 @@ func (c *Client) decodeSuccess(payload []byte, affinity auth.Affinity, model, ac
 
 func (c *Client) OpenStream(ctx context.Context, path string, body map[string]any, affinity auth.Affinity, convID, model string, trace bool) (*EventStream, error) {
 	timing := RequestTimingFromContext(ctx)
+	identity := logicalRequestIdentity(ctx, convID, model)
 	payload, err := marshalBody(body)
 	if err != nil {
 		return nil, err
@@ -842,8 +970,9 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		}
 		accountID := lease.AccountID()
 		generation := lease.Generation()
+		identity = identityWithLeaseDefaults(identity, lease)
 		used[accountID] = struct{}{}
-		resp, wrote, err := c.do(ctx, lease, http.MethodPost, path, payload, convID, model, trace, true)
+		resp, wrote, err := c.doWithIdentity(ctx, lease, http.MethodPost, path, payload, identity, trace, true, nil)
 		if err != nil {
 			lease.Release()
 			lastErr = err
@@ -855,6 +984,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			continue
 		}
+		c.observeModelHeaders(accountID, model, resp.Header)
 		if resp.StatusCode >= 400 {
 			data, readErr := readResponseBody(resp, 4<<20)
 			resp.Body.Close()
@@ -865,7 +995,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			apiErr := parseAPIError(resp, data)
 			lastErr = apiErr
 			if isPermanentAccountDenial(apiErr) {
-				c.pool.Disable(accountID, permanentChatDenialReason)
+				c.deletePermanentlyDeniedCredential(accountID)
 				if len(used) < c.cfg.RetryMaxAttempts {
 					continue
 				}
@@ -901,15 +1031,22 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 				return nil, apiErr
 			}
 			if apiErr.Status >= 500 {
-				if err := c.backoff(ctx, len(used)); err != nil {
+				if err := c.backoffForAPI(ctx, len(used), apiErr); err != nil {
 					return nil, err
 				}
 			}
 			continue
 		}
 		c.pool.Bind(affinity, model, accountID)
-		scanner := bufio.NewScanner(responseReader(resp))
-		scanner.Buffer(make([]byte, 8*1024), 4<<20)
+		if err := decodeResponseBody(resp); err != nil {
+			resp.Body.Close()
+			lease.Release()
+			return nil, fmt.Errorf("decode upstream stream: %w", err)
+		}
+		if identity.IdleTimeout > 0 {
+			resp.Body = newIdleReadCloser(resp.Body, identity.IdleTimeout)
+		}
+		scanner := newSSEScanner(resp.Body)
 		return &EventStream{response: resp, scanner: scanner, pool: c.pool, lease: lease, accountID: accountID, model: model, quotaCooldown: c.cfg.QuotaCooldown, timing: timing}, nil
 	}
 	if lastErr != nil {
@@ -918,20 +1055,63 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 	return nil, auth.ErrNoAuth
 }
 
+func (c *Client) observeModelHeaders(accountID, model string, headers http.Header) {
+	if headers == nil {
+		return
+	}
+	c.requestModelRefresh(accountID, headers.Get("x-models-etag"))
+	contextWindow, _ := strconv.ParseUint(strings.TrimSpace(headers.Get("x-grok-context-window")), 10, 64)
+	maxRaw, _ := strconv.ParseUint(strings.TrimSpace(headers.Get("x-grok-max-completion-tokens")), 10, 32)
+	maxCompletionTokens := uint32(maxRaw)
+	if contextWindow == 0 && maxCompletionTokens == 0 {
+		return
+	}
+	descriptor, ok := c.pool.AccountDescriptor(accountID, model)
+	if !ok {
+		return
+	}
+	contextChanged := contextWindow > 0 && descriptor.ContextWindow != contextWindow
+	maxChanged := maxCompletionTokens > 0 && descriptor.MaxCompletionTokens != maxCompletionTokens
+	if contextChanged || maxChanged {
+		if err := c.pool.UpdateModelLimits(accountID, model, contextWindow, maxCompletionTokens); err != nil {
+			slog.Warn("persist inference model metadata failed", "error", err)
+		}
+	}
+}
+
 func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, convID, model string, trace, stream bool) (*http.Response, bool, error) {
+	identity := identityWithLeaseDefaults(logicalRequestIdentity(ctx, convID, model), lease)
+	return c.doWithIdentity(ctx, lease, method, path, payload, identity, trace, stream, nil)
+}
+
+func (c *Client) doWithIdentity(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, identity RequestIdentity, trace, stream bool, extraHeaders http.Header) (*http.Response, bool, error) {
 	var wrote atomic.Bool
 	timing := RequestTimingFromContext(ctx)
 	timing.MarkAttempt()
-	requestCtx := httptrace.WithClientTrace(ctx, timing.ClientTrace(func() { wrote.Store(true) }))
+	requestCtx := httptrace.WithClientTrace(ctx, timing.ClientTrace(func() {
+		// A request without a body remains safe to replay after a transport
+		// failure. For inference POSTs, WroteRequest means the body was handed
+		// to the connection and an unknown failure must not be cross-account
+		// replayed.
+		if len(payload) > 0 {
+			wrote.Store(true)
+		}
+	}))
 	var reader io.Reader
 	if payload != nil {
 		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequestWithContext(requestCtx, method, c.URL(path), reader)
+	req, err := http.NewRequestWithContext(requestCtx, method, c.URLForSession(lease.Session(), path), reader)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header = BuildHeaders(c.cfg, lease.Session(), lease.AgentID(), lease.SessionID(), convID, model, trace)
+	req.Header = BuildInferenceHeaders(c.cfg, lease.Session(), identity, trace)
+	for name, values := range extraHeaders {
+		req.Header.Del(name)
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -952,6 +1132,9 @@ func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string,
 }
 
 func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
+	if err.ShouldRetry != nil && !*err.ShouldRetry {
+		return false
+	}
 	if isFreeModelQuotaExhausted(err) {
 		c.pool.MarkModelCooldown(accountID, model, freeModelQuotaReason, c.cfg.QuotaCooldown)
 		return true
@@ -971,7 +1154,13 @@ func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
 		c.pool.MarkCooldown(accountID, "rate_limited", cooldown)
 		return true
 	}
-	return err.Status == http.StatusBadGateway || err.Status == http.StatusServiceUnavailable || err.Status == http.StatusGatewayTimeout
+	switch err.Status {
+	case http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 520:
+		return true
+	default:
+		return false
+	}
 }
 
 func isAuthError(err *APIError) bool {
@@ -989,17 +1178,24 @@ func isPermanentAccountDenial(err *APIError) bool {
 	if err == nil || err.Status != http.StatusForbidden {
 		return false
 	}
-	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
-	if strings.Contains(text, permanentChatDenialMessage) {
-		return true
+	return strings.Contains(err.UpstreamMessage, permanentChatDenialKeyword) ||
+		strings.Contains(err.Body, permanentChatDenialKeyword)
+}
+
+// deletePermanentlyDeniedCredential removes the exact logical credential
+// rejected by the upstream. DeleteCredential is scope-aware, so a denial for
+// one scope in a multi-scope auth.json does not remove its siblings. A failed
+// filesystem deletion falls back to disabling the account so it cannot be
+// scheduled again while the operator investigates the write/lock failure.
+func (c *Client) deletePermanentlyDeniedCredential(accountID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.pool.DeleteCredential(ctx, accountID); err != nil && !errors.Is(err, auth.ErrCredentialNotFound) {
+		c.pool.Disable(accountID, permanentChatDenialReason)
+		slog.Error("delete credential after exact chat endpoint denial failed", "account", accountID, "error", err)
+		return
 	}
-	for _, candidate := range []string{err.UpstreamCode, err.UpstreamMessage, err.Body} {
-		normalized := strings.Trim(strings.ToLower(strings.TrimSpace(candidate)), " .!\t\r\n")
-		if normalized == genericAccessDenialMessage {
-			return true
-		}
-	}
-	return false
+	slog.Warn("credential deleted after exact chat endpoint denial", "account", accountID)
 }
 
 func isFreeModelQuotaExhausted(err *APIError) bool {
@@ -1035,6 +1231,24 @@ func (c *Client) backoff(ctx context.Context, attempt int) error {
 	}
 }
 
+func (c *Client) backoffForAPI(ctx context.Context, attempt int, apiErr *APIError) error {
+	if apiErr != nil && apiErr.RetryAfter > 0 {
+		delay := apiErr.RetryAfter
+		if delay > 120*time.Second {
+			delay = 120 * time.Second
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.backoff(ctx, attempt)
+}
+
 func (s *EventStream) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
@@ -1055,8 +1269,13 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 	}
 	var event SSEEvent
 	hasField := false
+	dataSeen := false
 	for s.scanner.Scan() {
 		line := strings.TrimSuffix(s.scanner.Text(), "\r")
+		if !s.seenFirstLine {
+			s.seenFirstLine = true
+			line = strings.TrimPrefix(line, "\uFEFF")
+		}
 		if line == "" {
 			if hasField {
 				s.timing.MarkFirstEvent()
@@ -1077,10 +1296,16 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 		case "event":
 			event.Event, hasField = value, true
 		case "data":
-			if event.Data != nil {
+			if dataSeen {
 				event.Data = append(event.Data, '\n')
 			}
+			if len(event.Data)+len(value) > maxSSEEventBytes {
+				s.done = true
+				_ = s.Close()
+				return SSEEvent{}, false, fmt.Errorf("upstream SSE event exceeds %d bytes", maxSSEEventBytes)
+			}
 			event.Data = append(event.Data, value...)
+			dataSeen = true
 			hasField = true
 		case "id":
 			event.ID, hasField = value, true
@@ -1114,18 +1339,24 @@ func (s *EventStream) observe(data []byte) {
 		s.timing.MarkFirstUpstreamText()
 	}
 	if id := responseID(payload); id != "" {
-		s.pool.BindResponseID(id, s.model, s.accountID)
+		if s.pool != nil {
+			s.pool.BindResponseID(id, s.model, s.accountID)
+		}
 	}
 	code := stringField(payload, "code")
 	if inner, ok := payload["error"].(map[string]any); ok && code == "" {
 		code = stringField(inner, "code")
 	}
 	if strings.EqualFold(code, quotaErrorCode) {
-		s.pool.MarkCooldown(s.accountID, quotaExhaustedReason, s.quotaCooldown)
+		if s.pool != nil {
+			s.pool.MarkCooldown(s.accountID, quotaExhaustedReason, s.quotaCooldown)
+		}
 		return
 	}
 	if isFreeModelQuotaExhausted(&APIError{Status: http.StatusTooManyRequests, Body: string(data)}) {
-		s.pool.MarkModelCooldown(s.accountID, s.model, freeModelQuotaReason, s.quotaCooldown)
+		if s.pool != nil {
+			s.pool.MarkModelCooldown(s.accountID, s.model, freeModelQuotaReason, s.quotaCooldown)
+		}
 	}
 }
 
@@ -1169,7 +1400,11 @@ func marshalBody(body map[string]any) ([]byte, error) {
 }
 
 func parseAPIError(resp *http.Response, body []byte) *APIError {
-	e := &APIError{Status: resp.StatusCode, Body: string(body), RequestID: resp.Header.Get("x-grok-req-id"), RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	e := &APIError{
+		Status: resp.StatusCode, Body: string(body), RequestID: resp.Header.Get("x-grok-req-id"),
+		RetryAfter:  parseRetryAfter(resp.Header.Get("Retry-After")),
+		ShouldRetry: parseShouldRetry(resp.Header.Get("x-should-retry")),
+	}
 	var parsed map[string]any
 	if json.Unmarshal(body, &parsed) == nil {
 		e.UpstreamCode, _ = parsed["code"].(string)
@@ -1193,6 +1428,19 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 	return e
 }
 
+func parseShouldRetry(raw string) *bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true":
+		value := true
+		return &value
+	case "false":
+		value := false
+		return &value
+	default:
+		return nil
+	}
+}
+
 func parseRetryAfter(raw string) time.Duration {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1207,17 +1455,11 @@ func parseRetryAfter(raw string) time.Duration {
 	return 0
 }
 
-func responseReader(resp *http.Response) io.Reader {
-	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		if gz, err := gzip.NewReader(resp.Body); err == nil {
-			return gz
-		}
-	}
-	return resp.Body
-}
-
 func readResponseBody(resp *http.Response, max int64) ([]byte, error) {
-	b, err := io.ReadAll(io.LimitReader(responseReader(resp), max+1))
+	if err := decodeResponseBody(resp); err != nil {
+		return nil, fmt.Errorf("decode upstream response: %w", err)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
 		return nil, err
 	}
@@ -1225,4 +1467,91 @@ func readResponseBody(resp *http.Response, max int64) ([]byte, error) {
 		return nil, fmt.Errorf("upstream response exceeds %d bytes", max)
 	}
 	return b, nil
+}
+
+func newSSEScanner(reader io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 8*1024), maxSSELineBytes)
+	return scanner
+}
+
+type gzipReadCloser struct {
+	*gzip.Reader
+	upstream  io.ReadCloser
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *gzipReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		gzipErr := r.Reader.Close()
+		upstreamErr := r.upstream.Close()
+		if gzipErr != nil {
+			r.closeErr = gzipErr
+		} else {
+			r.closeErr = upstreamErr
+		}
+	})
+	return r.closeErr
+}
+
+// decodeResponseBody installs an explicit gzip decoder. Because requests set
+// Accept-Encoding themselves, net/http does not transparently decode these
+// responses. A malformed gzip header is an error rather than a raw-body
+// fallback, which prevents compressed garbage from being mistaken for SSE.
+func decodeResponseBody(resp *http.Response) error {
+	if resp == nil || resp.Body == nil || !strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip") {
+		return nil
+	}
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body = &gzipReadCloser{Reader: gz, upstream: resp.Body}
+	resp.Header.Del("Content-Encoding")
+	return nil
+}
+
+type idleReadResult struct {
+	data []byte
+	err  error
+}
+
+type idleReadCloser struct {
+	upstream  io.ReadCloser
+	timeout   time.Duration
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newIdleReadCloser(upstream io.ReadCloser, timeout time.Duration) io.ReadCloser {
+	if timeout <= 0 {
+		return upstream
+	}
+	return &idleReadCloser{upstream: upstream, timeout: timeout}
+}
+
+func (r *idleReadCloser) Read(p []byte) (int, error) {
+	// Read into private storage so a transport that is slow to unwind after
+	// Close cannot race with Scanner reusing p after the timeout is returned.
+	resultCh := make(chan idleReadResult, 1)
+	buffer := make([]byte, len(p))
+	go func() {
+		n, err := r.upstream.Read(buffer)
+		resultCh <- idleReadResult{data: buffer[:n], err: err}
+	}()
+	timer := time.NewTimer(r.timeout)
+	defer timer.Stop()
+	select {
+	case result := <-resultCh:
+		return copy(p, result.data), result.err
+	case <-timer.C:
+		_ = r.Close()
+		return 0, &StreamIdleTimeoutError{Timeout: r.timeout}
+	}
+}
+
+func (r *idleReadCloser) Close() error {
+	r.closeOnce.Do(func() { r.closeErr = r.upstream.Close() })
+	return r.closeErr
 }

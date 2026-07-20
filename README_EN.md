@@ -21,7 +21,7 @@ A lightweight, deployable Go compatibility layer with streaming and multi-accoun
 
 `grokcli2api-go` is an unofficial API compatibility service written in Go. It translates the upstream API used by Grok CLI into OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages formats, allowing existing applications to connect by changing their API Base URL in most cases.
 
-The project uses only the Go standard library at runtime and provides a multi-account OAuth credential pool, automatic token refresh, model discovery, session affinity, retries, and capacity backpressure. It is suitable for local development, internal services, and containerized deployments.
+The project uses only the Go standard library at runtime and provides a multi-account, multi-scope credential pool, automatic refresh, per-account model discovery and dynamic backend routing, conversation continuity, retries, and capacity backpressure. It is suitable for local development, internal services, and containerized deployments.
 
 > [!IMPORTANT]
 > This project is an unofficial compatibility layer and is not affiliated with or endorsed by xAI, X, OpenAI, or Anthropic. Users are responsible for complying with applicable terms of service and for any compatibility, availability, or account risks associated with using a non-public upstream API.
@@ -32,11 +32,11 @@ The project uses only the Go standard library at runtime and provides a multi-ac
 | --- | --- |
 | API compatibility | OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and native Grok CLI Responses passthrough |
 | Response modes | Streaming SSE and non-streaming responses for common SDKs and HTTP clients |
-| Credential management | Multi-account OAuth pool, automatic refresh, directory hot reload, and atomic persistence |
-| Smart scheduling | Official subscription-tier detection, paid-account preference, session affinity, capability-aware routing, retries, and quota cooldowns |
+| Credential management | Multi-account/multi-scope pool, OIDC refresh, directory hot reload, and locked atomic persistence |
+| Smart scheduling | Official subscription-tier detection, paid-account preference, session affinity, per-account model backend/capability routing, retries, and quota cooldowns |
 | Concurrency control | Per-account concurrency limits and capacity backpressure to reduce 429 retry storms |
 | Model discovery | Per-account upstream catalogs with caching, aggregation, and deduplication |
-| Access protection | One or more local API keys through Bearer, `x-api-key`, or `api-key` headers |
+| Access protection | One or more local API keys, with a derived tenant namespace isolating continuity state for each key |
 | Network support | HTTP, HTTPS, SOCKS5, and SOCKS5H outbound proxies with standard `NO_PROXY` rules |
 | Deployment | Single binary, graceful shutdown, multi-stage Docker build, and Docker Compose configuration |
 
@@ -68,21 +68,25 @@ The service derives the official subscription tier from OAuth tokens. New reques
 
 The compatibility layer preserves commonly used request fields, response structures, and streaming events where possible, but it does not guarantee support for every parameter or behavior of the official APIs. When integrating through an API aggregation project such as New API, enable **passthrough** for all request parameters.
 
-### Chat Completions request sanitization
+### Per-account routing and silent sanitization
 
-Before forwarding `POST /v1/chat/completions`, the service rebuilds the body using the Grok CLI upstream request shape. It supports messages, text/image content, function tools, structured output, search parameters, and reasoning effort. Common aliases are mapped to their upstream forms, including `max_completion_tokens` → `max_tokens`, `functions` → `tools`, `function_call` → `tool_choice`, and `user` → `user_id`. Undeclared top-level fields and nested client metadata are removed; sanitized paths are recorded only at `DEBUG` level and field values are never logged.
+The inference contract tracks Grok CLI `0.2.102` (`SOURCE_REV=124d85bc5dc6e7805560215fcc6d5413944920e1`). The service first validates the required public-protocol structure, then reads the selected account's descriptor for that model. The descriptor's wire model and `apiBackend` choose the actual upstream `chat/completions`, `responses`, or `messages` endpoint. The same public model may use different backends on different accounts; when a retry switches accounts, the path, body, reasoning, tool aliases, and SSE adapter are rendered again. A descriptor without a backend uses `chat_completions`.
 
-Malformed content or broken message/tool-call relationships return an OpenAI-shaped local `422 invalid_request_error`. The `grok-4.5*` and `composer` model families also drop unsupported sampling penalties and stop parameters.
+All three public endpoints—Chat Completions, Responses, and Anthropic Messages—can target any of those account-level backends. Matching protocols use native sanitization; cross-protocol requests convert only the common message, tool, and parameter subset. Messages requests therefore no longer always execute through the Responses backend.
 
-### Responses format selection
+Fields, content blocks, tool state, and protocol-specific state that cannot be mapped safely are silently removed. The response contains no compatibility warning or deletion list. A `400 invalid_request_error` is returned only when a retained field has an invalid type, a required public field is missing, or no valid minimum input remains after cleaning; bodies over 16 MiB return `413`. If `previous_response_id`, encrypted reasoning, or a thinking signature must be removed because the target backend cannot represent it, that hard affinity is released for this request and a new upstream session is used.
 
-`POST /v1/responses` uses the OpenAI Responses API format by default. Request fields are sanitized against the Grok CLI 0.2.99 Responses types, while Grok-native extensions are removed from non-streaming responses and SSE events. Native passthrough is enabled only for an explicit Grok CLI identity: `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version`, a recognized Grok client name/identifier, or a `grok-cli/`, `grok-shell/`, or `grok-pager/` User-Agent. Arbitrary or unknown `x-grok-client-*` values do not select the native format.
+### Reasoning effort
 
-When `store` is omitted, the compatibility branch follows the OpenAI default and sends `store: true`. Later requests can continue with `previous_response_id` and are pinned to the upstream account that created the Response; one Response ID may be used for multiple independent branches. Account affinity and tool-replay state are in-memory and do not survive a service restart. With explicit `store: false`, an ordinary previous ID produces the upstream not-found error. Function-tool continuations can still use a cached minimal call shape while the cache entry is alive; user text and images are not additionally cached.
+An explicitly supplied reasoning effort is never dropped for compatibility. It is trimmed and lowercased: supported `minimal`, `low`, `medium`, `high`, and `xhigh` values are preserved; `none`, every unknown string, any value absent from the model's supported list, and every value sent to a model without declared reasoning capability become `low`. This fallback is still sent even if the descriptor itself does not list `low`.
 
-The supported surface includes text, multi-turn state, Function/custom/namespace/tool-search tools, parallel tool results, Web Search, HTTPS or Base64 data URI images, `text.format.json_schema`, and typed SSE. Invalid requests return `400 invalid_request_error` with an exact `param` path; bodies over 16 MiB return `413`. The proxy does not currently provide `/v1/conversations`, `/v1/files`, audio, background-task polling, image-generation output, or managed tool execution other than Web Search. Those parameters return an explicit `unsupported_parameter` instead of being silently dropped.
+Chat backends receive `reasoning_effort`, Responses backends receive `reasoning.effort`, and Messages backends receive `output_config.effort`. Messages encode `xhigh` as the wire value `max` only when the model explicitly supports `xhigh`. Anthropic `thinking.type` remains a separate thinking-protocol setting.
 
-`POST /v1/messages` remains Anthropic-shaped externally and executes through the upstream Responses API. Anthropic `metadata.user_id` maps to the Responses `safety_identifier`; `stop_sequences`, which the Responses request cannot represent, is not forwarded and produces a compatibility warning.
+### Responses and native CLI format
+
+An ordinary `POST /v1/responses` request defaults an omitted `store` to `true`; a request explicitly recognized as native Grok CLI defaults it to `false`. Native response extensions are enabled only for an explicit Grok CLI identity: `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version`, a recognized Grok client name/identifier, or a `grok-cli/`, `grok-shell/`, or `grok-pager/` User-Agent. Arbitrary or unknown `x-grok-client-*` values do not select the native format, and ordinary Responses clients do not receive private `grok.*` events.
+
+A preserved `previous_response_id` is pinned to the account that created the Response. Function-tool continuation with explicit `store: false` can restore the minimum call shape while its in-process replay entry remains available. After a restart, missing replay items are handled by the same silent-cleaning rule; user text, images, tool arguments, and reasoning content are never persisted by this replay cache.
 
 ## Quick Start
 
@@ -135,7 +139,7 @@ Copy-Item .env.example .env
 New-Item -ItemType Directory -Force auths
 ```
 
-Place each account's OAuth JSON file directly under `auths/`, with one account per file:
+Place Grok CLI `auth.json` or compatible credential files directly under `auths/`. One physical file may contain either a legacy single credential or multiple logical credentials through scopes or a `tokens` wrapper:
 
 ```text
 auths/
@@ -144,10 +148,10 @@ auths/
 └── account-n.json
 ```
 
-Credentials typically need a usable access token, refresh metadata, and a stable account identity. The service scans only the first level of this directory and does not search subdirectories recursively.
+Credentials typically need a usable access token or API key, refresh metadata, and a stable principal. The service scans only the first level of this directory and does not search subdirectories recursively; every logical entry in a multi-scope file joins the account pool independently.
 
 > [!CAUTION]
-> `auths/` is ignored by Git, but it must still be treated as a sensitive directory. The service hot-reloads credentials and writes refreshed tokens and model catalogs back to their original files, so the directory and files must be writable.
+> `auths/` is ignored by Git, but it must still be treated as a sensitive directory. The service hot-reloads credentials and atomically writes only the refreshed target scope back under a cross-process file lock, so the directory and files must be writable. Structured model catalogs and ETags live in the separate state v2 file and are not added to clean CLI credentials.
 
 ### 2. Configure a Local Access Key
 
@@ -157,7 +161,7 @@ Edit `.env` and replace the example value with a strong random key used only by 
 GROK_API_KEYS=sk-kfcvivo50
 ```
 
-Local API keys protect this service and are separate from upstream OAuth credentials. Leaving the value empty disables access protection, which is not recommended in any environment reachable by other devices.
+Local API keys are separate from upstream credentials, but they also define continuity tenants. A persistent namespace key HMACs each local key into a non-reversible tenant ID, and the raw key is never written to state. Leaving the value empty disables access protection and puts every caller in the shared `public` tenant, which cannot isolate callers' conversation state; this is not recommended in any environment reachable by other devices.
 
 ### 3. Start the Service
 
@@ -301,14 +305,18 @@ When multiple clients share one local API key, send a stable, non-sensitive iden
 X-Grok-Session-ID: conversation-123
 ```
 
-The service also recognizes the following fields as affinity identifiers, in order:
+The service recognizes affinity inputs in this priority order:
 
 - OpenAI `previous_response_id`
+- `X-Grok-Session-ID`
+- encrypted Responses reasoning or an Anthropic thinking signature
 - OpenAI `prompt_cache_key`
 - OpenAI `user`
 - Anthropic `metadata.user_id`
 
-Local API keys and client IP addresses are never used for account affinity. Affinity mappings are stored only in memory and are bounded by a TTL and maximum capacity.
+`previous_response_id`, an explicit session ID, and state signatures create hard affinity. The `.grokcli2api-affinity.json` file under `GROK_AUTHS_DIR` contains only the tenant-namespaced hashed binding, account, model, backend, upstream session, next turn, and expiry. Soft affinity from cache/user fields and `store:false` tool replay remain in memory only. Every mapping is bounded by the configured TTL and capacity. A local API key does not directly choose an account, but it isolates affinity, Response ownership, state signatures, and replay data between tenants; client IP addresses are not used.
+
+After a container rebuild or affinity-state loss, Responses `reasoning.encrypted_content` or an Anthropic thinking signature may have no binding in the current tenant. The service removes only that unknown opaque state and continues the remaining conversation with a fresh upstream session instead of forwarding ciphertext through a random account. Valid bindings that point to different accounts or sessions are still rejected. An unknown `previous_response_id` continues to return 404.
 
 New requests without an existing affinity rotate across available paid accounts first. The scheduler uses free or unknown-tier accounts only when paid accounts do not advertise the model, are disabled, are cooling down, or have reached their concurrency limit. Existing affinity still wins to preserve multi-turn and `previous_response_id` continuity.
 
@@ -364,7 +372,7 @@ curl http://localhost:8088/v1/admin/credentials \
   -F "file=@auth.json;type=application/json"
 ```
 
-The server derives a redacted ID from the credential's stable account identity. Uploading the same account again atomically replaces its existing credential. Model discovery runs immediately after upload, and tiers with official usage support also receive an immediate credits probe; a temporary discovery failure does not remove the saved credential. Status responses also include the official subscription-tier key and display name derived from the JWT.
+The server derives a redacted ID from the normalized scope, authentication mode, and stable principal; legacy unscoped credentials retain the compatible ID rule. A multi-scope upload returns every logical entry and its `model_discovery` status in `credentials[]`; a single-scope upload also retains the legacy top-level `credential`, `created`, and `model_discovery` fields. Uploading the same logical credential atomically updates only its target scope. Model discovery runs immediately after upload, and tiers with official usage support also receive an immediate credits probe; a temporary probe failure does not remove the saved credential. Status responses include the official subscription-tier key, display name, and billing snapshot derived from the current token and credits response.
 
 List redacted credential status:
 
@@ -373,12 +381,14 @@ curl http://localhost:8088/v1/admin/credentials \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
 
-Delete a credential using the 24-character redacted ID returned by the list endpoint:
+Delete a logical credential using the 24-character redacted ID returned by the list endpoint. For a multi-scope file, only that scope is removed:
 
 ```bash
 curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
+
+When the upstream returns HTTP `403` and the error content contains the case-sensitive keyword `Access to the chat endpoint is denied`, the service automatically deletes that logical credential and tries another account. Suffix text, punctuation, and JSON nesting may differ; non-`403` responses and differently cased text do not trigger deletion. A multi-scope file still loses only the rejected scope. If the file lock or write fails, the account is disabled first so it cannot be scheduled again.
 
 Administrator responses include `Cache-Control: no-store`. Uploads are limited to 1 MiB; the service validates the JSON, derives the destination from the account identity, and atomically writes it with mode `0600` instead of trusting the client filename. Prefer administration over loopback or an SSH tunnel. Cross-network access must use HTTPS with source and rate restrictions at the reverse proxy.
 
@@ -396,7 +406,7 @@ Administrator responses include `Cache-Control: no-store`. Uploads are limited t
 | `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and upstream 5xx failures |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | Cooldown when an upstream 429 omits `Retry-After` |
 | `GROK_QUOTA_COOLDOWN` | `24h` | Default cooldown after quota exhaustion |
-| `GROK_AFFINITY_TTL` | `1h` | Lifetime of in-memory session-affinity mappings |
+| `GROK_AFFINITY_TTL` | `1h` | Lifetime of hard and soft affinity; hard bindings may persist, while soft bindings remain in memory |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | Maximum number of affinity-cache entries |
 
 Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account. Account-level cooldowns are tracked independently by reason, so billing exhaustion, 429s, and other upstream cooldowns can overlap without clearing one reason prematurely releasing the account. Higher tiers on which the official client exposes usage poll `billing?format=credits`; Free and X Basic are not proactively polled. Administrator uploads, directory hot reloads, and OAuth tier transitions into that set trigger an immediate probe, followed by the configured periodic refresh. Proactive cooldown occurs only when included usage reaches 100% and neither on-demand nor prepaid credit remains; the cooldown lasts until the server-provided period end. An explicitly recovered balance clears `billing_exhausted` and the upstream spending-limit `quota_exhausted` reason, but never a 429, authentication, or model-level cooldown. The redacted snapshot is kept in memory and exposed through the administrator credential status `billing` field; it is not written to OAuth files.
@@ -409,6 +419,10 @@ Scheduling distinguishes known paid tiers from free or unknown tiers; it does no
 | --- | --- | --- |
 | `GROK_CHAT_PROXY_BASE_URL` | `https://cli-chat-proxy.grok.com` | Grok CLI upstream URL |
 | `GROK_CHAT_PROXY_VERSION` | `v1` | Upstream API version |
+| `GROK_XAI_API_BASE_URL` | `https://api.x.ai` | Operator-controlled xAI API origin for API-key accounts; remote model metadata cannot override it |
+| `GROK_CLIENT_VERSION` | `0.2.102` | Grok CLI protocol version advertised upstream |
+| `GROK_CLIENT_MODE` | `headless` | Upstream `x-grok-client-mode`; `headless` or `interactive` |
+| `GROK_DEPLOYMENT_ID` | empty | Optional managed deployment ID sent as `x-grok-deployment-id` |
 | `GROK_STREAM_COMPRESSION` | `identity` | `identity` avoids buffering SSE through gzip; `gzip` is a compatibility fallback |
 | `GROK_PROXY_URL` | empty | HTTP(S), SOCKS5, or SOCKS5H outbound proxy |
 | `GROK_NO_PROXY` | empty | Comma-separated proxy bypass rules |
@@ -452,9 +466,9 @@ These endpoints are registered only when `GROK_ADMIN_KEY` is set, and normal API
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/v1/admin/credentials` | List redacted credential status, official subscription tiers, and model catalogs |
-| `POST` | `/v1/admin/credentials` | Upload or replace a JSON credential using a JSON body or multipart `file` field |
-| `DELETE` | `/v1/admin/credentials/{id}` | Delete a credential and immediately remove it from scheduling |
+| `GET` | `/v1/admin/credentials` | List redacted credential status, official subscription tiers, billing snapshots, and model catalogs |
+| `POST` | `/v1/admin/credentials` | Upload or replace single- or multi-scope JSON credentials using a JSON body or multipart `file` field |
+| `DELETE` | `/v1/admin/credentials/{id}` | Delete the matching logical credential and immediately remove it from scheduling |
 
 ### Read-only Grok Passthrough APIs
 
@@ -467,7 +481,9 @@ These endpoints are registered only when `GROK_ADMIN_KEY` is set, and normal API
 | `GET` | `/v1/grok/mcp/tools/list` |
 | `GET` | `/v1/grok/feedback/config` |
 
-At startup, the service reads cached model catalogs from credential JSON files and requests upstream `/v1/models` for accounts whose catalog is missing or older than the refresh interval. Newly hot-loaded accounts are discovered automatically. Normalized `models` and `models_updated_at` fields are persisted to the corresponding credential files and preserved during token refresh.
+At startup, the service reads per-account structured catalogs, ETags, first-seen times, cooldowns, the global agent ID, and the namespace key from the `.grokcli2api-state.json` v2 file under `GROK_AUTHS_DIR`. It requests upstream `/v1/models` for accounts whose catalog is missing or stale, and newly hot-loaded accounts are discovered automatically. A legacy credential's `models` string array is only a provisional catalog until the first online refresh. Catalogs and ETags are no longer added to clean CLI credentials.
+
+`/v1/models` remains an OpenAI model list and adds `x_grok` metadata when a structured descriptor is available: aggregated `api_backends`, context and output limits, `reasoning_efforts`, backend-search support, and streaming tool-call support. Backends are unioned, positive numeric limits use the minimum, efforts are intersected, and booleans are `true` only when every candidate account supports them.
 
 Actual model availability is always controlled by the upstream account. Query `/v1/models` before generating content and use the exact model ID returned by the service.
 
@@ -493,13 +509,25 @@ Local `.env` and `auths/` data remain external configuration and credential stor
 
 ```bash
 gofmt -w path/to/changed.go
-go test ./...
-go test -race ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
 go vet ./...
-go build ./cmd/grok2api
+go build -trimpath ./cmd/grok2api
+docker build .
 ```
 
-> `go test -race ./...` requires a platform supported by the Go Race Detector. The project CI runs this check on Linux.
+> `go test -race -count=1 ./...` requires a platform supported by the Go Race Detector. The project CI runs this check on Linux.
+
+### Safe Live Smoke
+
+Run the at-most-six-generation live smoke only after every offline gate above, including the Linux race test and Docker build, has passed:
+
+```bash
+GROK_LIVE_SMOKE=1 GROK_LIVE_SMOKE_OFFLINE_GATES=passed \
+go test -count=1 -run '^TestLiveInferenceSmoke$' ./internal/grok
+```
+
+The default source is `auths/live-01.json`; override it with `GROK_LIVE_SMOKE_AUTH_FILE`. The source must contain exactly one logical credential. Only a `0600` temporary copy with refresh tokens, ID tokens, email fields, and stale legacy model lists removed is exposed to the service. The test verifies that the source SHA-256 and Git worktree remain unchanged, and never prints response bodies, tokens, account identifiers, or upstream error bodies.
 
 ### Live Load Testing
 

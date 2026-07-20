@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,10 +17,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Futureppo/grokcli2api-go/internal/modelcatalog"
 )
 
 const (
 	stateFileName          = ".grokcli2api-state.json"
+	affinityStateFileName  = ".grokcli2api-affinity.json"
 	billingExhaustedReason = "billing_exhausted"
 	refreshBackoffReason   = "refresh_backoff"
 )
@@ -37,8 +41,9 @@ const (
 )
 
 type Affinity struct {
-	Key  string
-	Mode AffinityMode
+	Key    string
+	Mode   AffinityMode
+	Tenant string
 }
 
 type PoolConfig struct {
@@ -56,12 +61,17 @@ type PoolConfig struct {
 // excludes subjects, file paths, client IDs, and token values.
 type CredentialInfo struct {
 	ID                      string       `json:"id"`
+	Scope                   string       `json:"scope,omitempty"`
+	AuthMode                AuthMode     `json:"auth_mode,omitempty"`
 	Status                  string       `json:"status"`
 	Usable                  bool         `json:"usable"`
 	Disabled                bool         `json:"disabled"`
 	ExpiresAt               *time.Time   `json:"expires_at,omitempty"`
 	CooldownUntil           *time.Time   `json:"cooldown_until,omitempty"`
 	Models                  []string     `json:"models"`
+	DiscoveryStatus         string       `json:"discovery_status"`
+	CatalogETag             string       `json:"catalog_etag,omitempty"`
+	CatalogUpdated          *time.Time   `json:"catalog_updated_at,omitempty"`
 	HasRefreshToken         bool         `json:"has_refresh_token"`
 	SubscriptionTier        string       `json:"subscription_tier,omitempty"`
 	SubscriptionTierDisplay string       `json:"subscription_tier_display,omitempty"`
@@ -106,10 +116,14 @@ type account struct {
 
 	mu             sync.RWMutex
 	credential     *credential
+	descriptors    map[string]modelcatalog.ModelDescriptor
+	catalogETag    string
+	catalogUpdated time.Time
 	cooldowns      map[string]cooldownState
 	modelCooldowns map[string]cooldownState
 	disabled       bool
 	disableReason  string
+	deleting       bool
 	billing        *BillingInfo
 	billingPending bool
 	refreshOnce    sync.Once
@@ -167,12 +181,45 @@ func (a *account) supportsModel(model string) bool {
 	if a.disabled || a.credential == nil {
 		return false
 	}
-	index := sort.SearchStrings(a.credential.Models, model)
-	if index >= len(a.credential.Models) || a.credential.Models[index] != model {
+	if !a.hasModelLocked(model) {
 		return false
 	}
 	cooldown, cooling := a.modelCooldowns[model]
 	return !cooling || !time.Now().Before(cooldown.Until)
+}
+
+func (a *account) hasModelLocked(model string) bool {
+	if len(a.descriptors) > 0 {
+		descriptor, exists := a.descriptors[model]
+		if !exists || descriptor.Hidden {
+			return false
+		}
+		return a.credential.AuthMode != AuthModeAPIKey || descriptor.SupportedInAPI
+	}
+	index := sort.SearchStrings(a.credential.Models, model)
+	return index < len(a.credential.Models) && a.credential.Models[index] == model
+}
+
+func (a *account) descriptor(model string) (modelcatalog.ModelDescriptor, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	descriptor, ok := a.descriptors[model]
+	descriptor.ReasoningEfforts = append([]string(nil), descriptor.ReasoningEfforts...)
+	return descriptor, ok
+}
+
+func (a *account) modelIDsLocked() []string {
+	if len(a.descriptors) == 0 {
+		return append([]string(nil), a.credential.Models...)
+	}
+	models := make([]string, 0, len(a.descriptors))
+	for model := range a.descriptors {
+		if a.hasModelLocked(model) {
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	return models
 }
 
 func (a *account) snapshot() (*credential, time.Time, bool) {
@@ -186,11 +233,23 @@ type fileEntry struct {
 	size    int64
 	modTime time.Time
 	cred    *credential
+	creds   []*credential
 }
 
 type persistedState struct {
-	Version  int                     `json:"version"`
-	Accounts map[string]accountState `json:"accounts"`
+	Version       int                     `json:"version"`
+	GlobalAgentID string                  `json:"global_agent_id,omitempty"`
+	NamespaceKey  string                  `json:"namespace_key,omitempty"`
+	Accounts      map[string]accountState `json:"accounts"`
+	Catalogs      map[string]catalogState `json:"catalogs,omitempty"`
+}
+
+type catalogState struct {
+	ETag        string                                  `json:"etag,omitempty"`
+	UpdatedAt   time.Time                               `json:"updated_at,omitempty"`
+	Models      map[string]modelcatalog.ModelDescriptor `json:"models,omitempty"`
+	Provisional []string                                `json:"provisional_models,omitempty"`
+	FirstSeen   map[string]int64                        `json:"first_seen,omitempty"`
 }
 
 type accountState struct {
@@ -268,6 +327,9 @@ type Pool struct {
 	accounts      map[string]*account
 	files         map[string]fileEntry
 	states        map[string]accountState
+	catalogs      map[string]catalogState
+	globalAgentID string
+	namespaceKey  string
 	active        atomic.Value // []*account
 	activeByModel atomic.Value // map[string][]*account
 	cursor        atomic.Uint64
@@ -290,15 +352,23 @@ type Lease struct {
 	account    *account
 	credential *credential
 	generation uint64
+	model      string
+	descriptor modelcatalog.ModelDescriptor
+	described  bool
 	once       sync.Once
 }
 
-func (p *Pool) newLease(a *account) *Lease {
+func (p *Pool) newLease(a *account, model string) *Lease {
 	a.mu.RLock()
 	cred := a.credential
 	generation := a.currentGeneration()
+	descriptor, described := a.descriptors[model]
+	descriptor.ReasoningEfforts = append([]string(nil), descriptor.ReasoningEfforts...)
 	a.mu.RUnlock()
-	return &Lease{pool: p, account: a, credential: cred, generation: generation}
+	return &Lease{
+		pool: p, account: a, credential: cred, generation: generation, model: model,
+		descriptor: descriptor, described: described,
+	}
 }
 
 func (p *Pool) newRequestLease(a *account, model string) (*Lease, bool) {
@@ -310,15 +380,19 @@ func (p *Pool) newRequestLease(a *account, model string) (*Lease, bool) {
 		return nil, false
 	}
 	if model != "" {
-		index := sort.SearchStrings(a.credential.Models, model)
-		if index >= len(a.credential.Models) || a.credential.Models[index] != model {
+		if !a.hasModelLocked(model) {
 			return nil, false
 		}
 		if cooldown, ok := a.modelCooldowns[model]; ok && now.Before(cooldown.Until) {
 			return nil, false
 		}
 	}
-	return &Lease{pool: p, account: a, credential: a.credential, generation: a.currentGeneration()}, true
+	descriptor, described := a.descriptors[model]
+	descriptor.ReasoningEfforts = append([]string(nil), descriptor.ReasoningEfforts...)
+	return &Lease{
+		pool: p, account: a, credential: a.credential, generation: a.currentGeneration(), model: model,
+		descriptor: descriptor, described: described,
+	}, true
 }
 
 func (l *Lease) Session() Session {
@@ -331,6 +405,21 @@ func (l *Lease) AccountID() string  { return l.account.id }
 func (l *Lease) AgentID() string    { return l.account.agentID }
 func (l *Lease) SessionID() string  { return l.account.sessionID }
 func (l *Lease) Generation() uint64 { return l.generation }
+
+// Descriptor returns the immutable descriptor selected with this lease. A
+// false result means scheduling used only a legacy provisional []string list.
+func (l *Lease) Descriptor() (modelcatalog.ModelDescriptor, bool) {
+	return l.descriptor, l.described
+}
+
+// DescriptorFor is useful for metadata leases that were not acquired for a
+// particular model.
+func (l *Lease) DescriptorFor(model string) (modelcatalog.ModelDescriptor, bool) {
+	if l == nil || l.account == nil {
+		return modelcatalog.ModelDescriptor{}, false
+	}
+	return l.account.descriptor(model)
+}
 func (l *Lease) Release() {
 	if l == nil || l.account == nil {
 		return
@@ -370,15 +459,45 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	}
 	p := &Pool{
 		cfg: cfg, http: client, accounts: map[string]*account{}, files: map[string]fileEntry{},
-		states: map[string]accountState{}, affinity: newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
+		states: map[string]accountState{}, catalogs: map[string]catalogState{},
+		affinity:   newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
 		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), capacityCh: make(chan struct{}),
 		rebuildCh: make(chan struct{}, 1), billingCh: make(chan struct{}, 1), closed: make(chan struct{}),
 	}
 	p.active.Store([]*account{})
 	p.activeByModel.Store(map[string][]*account{})
-	_ = p.loadState()
+	resetPersistedAffinity := false
+	if err := p.loadState(); err != nil {
+		// Corrupt/unreadable state is never guessed. Fresh identity material below
+		// makes every old affinity key unreachable.
+		slog.Warn("credential state ignored", "reason", "invalid_state")
+		p.states = map[string]accountState{}
+		p.catalogs = map[string]catalogState{}
+		p.globalAgentID = ""
+		p.namespaceKey = ""
+		resetPersistedAffinity = true
+	}
+	if !validGlobalAgentID(p.globalAgentID) {
+		p.globalAgentID = randomHex(16)
+		resetPersistedAffinity = true
+	}
+	if !validNamespaceKey(p.namespaceKey) {
+		p.namespaceKey = randomHex(32)
+		p.affinity = newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries)
+		resetPersistedAffinity = true
+	}
+	if resetPersistedAffinity {
+		if err := os.Remove(filepath.Join(cfg.Dir, affinityStateFileName)); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("clear stale affinity state: %w", err)
+		}
+	}
 	if err := p.scan(); err != nil {
 		return nil, err
+	}
+	// Persist generated v2 identity material and any migrated v1 cooldowns
+	// before serving requests.
+	if err := p.persistState(); err != nil {
+		return nil, fmt.Errorf("persist credential state: %w", err)
 	}
 	if len(p.accounts) == 0 && !cfg.AllowEmpty {
 		return nil, ErrNoAuth
@@ -406,7 +525,7 @@ func (p *Pool) Close() {
 }
 
 func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exclude map[string]struct{}) (*Lease, error) {
-	cacheKey := modelAffinityKey(affinity.Key, model)
+	cacheKey := affinityModelKey(affinity, model)
 	var refreshFailed map[string]struct{}
 	for {
 		capacity := p.capacitySignal()
@@ -539,6 +658,92 @@ func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exc
 	}
 }
 
+// AcquireForBackends prefers accounts whose structured descriptor uses the
+// requested backends, in order. Legacy provisional model lists are considered
+// only after every structured choice has been exhausted.
+func (p *Pool) AcquireForBackends(
+	ctx context.Context,
+	affinity Affinity,
+	model string,
+	preferred []modelcatalog.Backend,
+	exclude map[string]struct{},
+) (*Lease, error) {
+	if len(preferred) == 0 {
+		return p.Acquire(ctx, affinity, model, exclude)
+	}
+	var lastErr error
+	seenBackend := make(map[modelcatalog.Backend]struct{}, len(preferred))
+	for _, backend := range preferred {
+		if _, duplicate := seenBackend[backend]; duplicate {
+			continue
+		}
+		seenBackend[backend] = struct{}{}
+		allowed := p.accountsForBackend(model, backend, false)
+		if len(allowed) == 0 {
+			continue
+		}
+		lease, err := p.Acquire(ctx, affinity, model, exclusionsExcept(allowed, p.AccountIDs(), exclude))
+		if err == nil {
+			return lease, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		lastErr = err
+	}
+	provisional := p.accountsForBackend(model, "", true)
+	if len(provisional) > 0 {
+		lease, err := p.Acquire(ctx, affinity, model, exclusionsExcept(provisional, p.AccountIDs(), exclude))
+		if err == nil {
+			return lease, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	if !p.hasAccounts() {
+		return nil, p.unavailable(model)
+	}
+	if model != "" && !p.hasKnownModel(model) {
+		return nil, &ModelUnavailableError{Model: model}
+	}
+	return nil, p.unavailable(model)
+}
+
+func (p *Pool) accountsForBackend(model string, backend modelcatalog.Backend, provisional bool) map[string]struct{} {
+	result := make(map[string]struct{})
+	p.mu.RLock()
+	for id, a := range p.accounts {
+		a.mu.RLock()
+		if !a.disabled && a.credential != nil {
+			if provisional {
+				if len(a.descriptors) == 0 && a.hasModelLocked(model) {
+					result[id] = struct{}{}
+				}
+			} else if descriptor, ok := a.descriptors[model]; ok && descriptor.Backend == backend && a.hasModelLocked(model) {
+				result[id] = struct{}{}
+			}
+		}
+		a.mu.RUnlock()
+	}
+	p.mu.RUnlock()
+	return result
+}
+
+func exclusionsExcept(allowed map[string]struct{}, all []string, existing map[string]struct{}) map[string]struct{} {
+	result := make(map[string]struct{}, len(existing)+len(all))
+	for id := range existing {
+		result[id] = struct{}{}
+	}
+	for _, id := range all {
+		if _, ok := allowed[id]; !ok {
+			result[id] = struct{}{}
+		}
+	}
+	return result
+}
+
 func (p *Pool) hasAccounts() bool {
 	p.mu.RLock()
 	hasAccounts := len(p.accounts) > 0
@@ -619,6 +824,47 @@ func (p *Pool) AcquireAccount(ctx context.Context, id string) (*Lease, error) {
 	}
 }
 
+// AcquireAccountForModel obtains a hard-pinned account while validating the
+// model catalog and model-scoped cooldown, and snapshots its descriptor.
+func (p *Pool) AcquireAccountForModel(ctx context.Context, id, model string) (*Lease, error) {
+	for {
+		capacity := p.capacitySignal()
+		lease, err := p.acquireID(ctx, id, model, nil)
+		if !errors.Is(err, errAccountBusy) {
+			if errors.Is(err, ErrNoAuth) {
+				err = p.boundAccountUnavailable(id, model)
+			}
+			return lease, err
+		}
+		if err := p.waitForCapacity(ctx, capacity); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (p *Pool) boundAccountUnavailable(id, model string) error {
+	p.mu.RLock()
+	a := p.accounts[id]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.disabled || a.billingPending || a.credential == nil || !a.hasModelLocked(model) {
+		return ErrNoAuth
+	}
+	now := time.Now()
+	until, _ := cooldownDeadline(a.cooldowns, now)
+	if cooldown, ok := a.modelCooldowns[model]; ok && cooldown.Until.After(until) {
+		until = cooldown.Until
+	}
+	if now.Before(until) {
+		return &UnavailableError{Cooling: true, RetryAfter: time.Until(until)}
+	}
+	return ErrNoAuth
+}
+
 // AcquireAccountForMetadata ignores quota/rate cooldowns so non-generative
 // capability discovery can still refresh an account's model catalog.
 func (p *Pool) AcquireAccountForMetadata(ctx context.Context, id string) (*Lease, error) {
@@ -636,7 +882,7 @@ func (p *Pool) AcquireAccountForMetadata(ctx context.Context, id string) (*Lease
 		return nil, err
 	}
 	a.inflight.Add(1)
-	return p.newLease(a), nil
+	return p.newLease(a, ""), nil
 }
 
 func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[string]struct{}) (*Lease, error) {
@@ -668,14 +914,42 @@ func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[stri
 
 func (p *Pool) Bind(affinity Affinity, model, accountID string) {
 	if affinity.Key != "" && accountID != "" {
-		p.affinity.Set(modelAffinityKey(affinity.Key, model), accountID)
+		p.affinity.Set(affinityModelKey(affinity, model), accountID)
+	}
+}
+
+// Unbind removes the current request's scheduler affinity when a renderer
+// silently drops the state field that made the request hard-affine.
+func (p *Pool) Unbind(affinity Affinity, model string) {
+	if affinity.Key != "" {
+		p.affinity.Delete(affinityModelKey(affinity, model))
 	}
 }
 
 func (p *Pool) BindResponseID(responseID, model, accountID string) {
+	p.BindResponseIDForTenant("public", responseID, model, accountID)
+}
+
+func (p *Pool) BindResponseIDForTenant(tenant, responseID, model, accountID string) {
 	if responseID != "" {
-		p.affinity.Set(modelAffinityKey("previous:"+responseID, model), accountID)
+		p.affinity.Set(affinityModelKey(Affinity{Tenant: tenant, Key: "previous:" + responseID}, model), accountID)
 	}
+}
+
+// TenantID derives a non-reversible namespace for downstream continuity. The
+// raw local API key is never retained or persisted. Without a configured key,
+// all callers intentionally share the public tenant.
+func (p *Pool) TenantID(apiKey string) string {
+	if apiKey == "" {
+		return "public"
+	}
+	key, err := hex.DecodeString(p.namespaceKey)
+	if err != nil || len(key) != 32 {
+		return "public"
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(apiKey))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // AccountIDs returns anonymous stable identifiers for diagnostics and tests.
@@ -724,7 +998,22 @@ func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
 		info.Status = "unavailable"
 		return info
 	}
-	info.Models = append(info.Models, a.credential.Models...)
+	info.Models = a.modelIDsLocked()
+	info.Scope = a.credential.Scope
+	info.AuthMode = a.credential.AuthMode
+	info.CatalogETag = a.catalogETag
+	if !a.catalogUpdated.IsZero() {
+		updated := a.catalogUpdated.UTC()
+		info.CatalogUpdated = &updated
+	}
+	switch {
+	case len(a.descriptors) > 0:
+		info.DiscoveryStatus = "ready"
+	case len(a.credential.Models) > 0:
+		info.DiscoveryStatus = "provisional"
+	default:
+		info.DiscoveryStatus = "pending"
+	}
 	info.HasRefreshToken = a.credential.RefreshToken != ""
 	info.SubscriptionTier = a.credential.Tier.Key
 	info.SubscriptionTierDisplay = a.credential.Tier.Display
@@ -748,7 +1037,7 @@ func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
 		info.Status = "cooling_down"
 	case !a.credential.usable(now):
 		info.Status = "needs_refresh"
-	case len(a.credential.Models) == 0:
+	case len(info.Models) == 0:
 		info.Status = "pending_models"
 	default:
 		info.Status = "ready"
@@ -760,53 +1049,234 @@ func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
 // Account identity, rather than a caller-supplied filename, determines the
 // destination so remote uploads cannot escape the configured directory.
 func (p *Pool) ImportCredential(ctx context.Context, raw []byte) (CredentialInfo, bool, error) {
-	parsed, err := parseCredential(raw, "", p.cfg.Surface)
+	results, err := p.ImportCredentials(ctx, raw)
 	if err != nil {
 		return CredentialInfo{}, false, err
 	}
-	id := accountID(parsed.Subject)
+	if len(results) == 0 {
+		return CredentialInfo{}, false, ErrInvalidCredential
+	}
+	return results[0].Credential, results[0].Created, nil
+}
+
+type CredentialImportResult struct {
+	Credential CredentialInfo `json:"credential"`
+	Created    bool           `json:"created"`
+}
+
+// ImportCredentials imports every logical scope from one physical auth.json.
+// The legacy ImportCredential API returns the first entry for old callers.
+func (p *Pool) ImportCredentials(ctx context.Context, raw []byte) ([]CredentialImportResult, error) {
+	parsed, err := parseCredentials(raw, "", p.cfg.Surface)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(parsed))
+	seenIDs := make(map[string]struct{}, len(parsed))
+	uploaded := make(map[string]*credential, len(parsed))
+	for _, credential := range parsed {
+		id := credential.accountID()
+		if _, duplicate := seenIDs[id]; duplicate {
+			continue
+		}
+		seenIDs[id] = struct{}{}
+		ids = append(ids, id)
+		uploaded[id] = credential
+	}
+	sort.Strings(ids)
 	p.mutationMu.Lock()
 	defer p.mutationMu.Unlock()
 
-	p.mu.RLock()
-	existing := p.accounts[id]
-	p.mu.RUnlock()
-	created := existing == nil
-	path := filepath.Join(p.cfg.Dir, id+".json")
-	if existing != nil {
-		if err := existing.acquireRefresh(ctx); err != nil {
-			return CredentialInfo{}, false, err
+	locked := make([]*account, 0, len(ids))
+	created := make(map[string]bool, len(ids))
+	paths := make(map[string]string, len(ids))
+	for _, id := range ids {
+		p.mu.RLock()
+		existing := p.accounts[id]
+		p.mu.RUnlock()
+		created[id] = existing == nil
+		paths[id] = filepath.Join(p.cfg.Dir, id+".json")
+		if existing == nil {
+			continue
 		}
-		defer existing.releaseRefresh()
+		if err := existing.acquireRefresh(ctx); err != nil {
+			for _, item := range locked {
+				item.releaseRefresh()
+			}
+			return nil, err
+		}
+		locked = append(locked, existing)
 		existing.mu.RLock()
 		if existing.credential != nil && existing.credential.Path != "" {
-			path = existing.credential.Path
+			paths[id] = existing.credential.Path
 		}
 		existing.mu.RUnlock()
 	}
+	defer func() {
+		for _, item := range locked {
+			item.releaseRefresh()
+		}
+	}()
 
-	if _, statErr := os.Stat(path); statErr != nil && !os.IsNotExist(statErr) {
-		return CredentialInfo{}, false, statErr
+	// Existing logical credentials may live in different physical auth files.
+	// Merge each uploaded scope into its own current file so an update cannot
+	// overwrite an unmentioned sibling scope or leave a stale copy selected by
+	// the directory scanner. New logical credentials get independent,
+	// account-derived filenames.
+	byPath := make(map[string][]string, len(ids))
+	for _, id := range ids {
+		byPath[paths[id]] = append(byPath[paths[id]], id)
 	}
-	if err := writeCredentialAtomicMode(path, parsed.Raw, 0o600); err != nil {
-		return CredentialInfo{}, false, err
+	orderedPaths := make([]string, 0, len(byPath))
+	for path := range byPath {
+		orderedPaths = append(orderedPaths, path)
+		sort.Strings(byPath[path])
 	}
-	// Do not let a same-size, same-timestamp replacement reuse cached content.
-	p.mu.Lock()
-	delete(p.files, path)
-	p.mu.Unlock()
-	if err := p.scanUnlocked(); err != nil {
-		return CredentialInfo{}, false, err
+	sort.Strings(orderedPaths)
+	for _, path := range orderedPaths {
+		fileLock, lockErr := acquireAuthFileLock(ctx, path)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		root := make(map[string]any)
+		var current []*credential
+		body, readErr := os.ReadFile(path)
+		switch {
+		case readErr == nil:
+			if json.Unmarshal(body, &root) != nil || root == nil {
+				fileLock.Close()
+				return nil, ErrInvalidCredentialJSON
+			}
+			current, _ = parseCredentials(body, path, p.cfg.Surface)
+		case os.IsNotExist(readErr):
+			// A new per-account file starts as an empty merge target.
+		default:
+			fileLock.Close()
+			return nil, readErr
+		}
+		for _, id := range byPath[path] {
+			var existing *credential
+			for _, candidate := range current {
+				if candidate.accountID() == id {
+					existing = candidate
+					break
+				}
+			}
+			if err := mergeImportedCredential(root, uploaded[id], existing); err != nil {
+				fileLock.Close()
+				return nil, err
+			}
+		}
+		if err := writeCredentialAtomicMode(path, root, 0o600); err != nil {
+			fileLock.Close()
+			return nil, err
+		}
+		if err := fileLock.Close(); err != nil {
+			return nil, err
+		}
+		// Do not let a same-size, same-timestamp replacement reuse cached content.
+		p.mu.Lock()
+		delete(p.files, path)
+		p.mu.Unlock()
 	}
-	info, ok := p.Credential(id)
-	if !ok {
-		return CredentialInfo{}, false, errors.New("credential was saved but not loaded")
+	// An explicit administrator import is the only in-process operation allowed
+	// to cancel a previous failed-delete tombstone. The normal scan path keeps
+	// deleting accounts fail-closed so a concurrent refresh cannot revive one.
+	p.mu.RLock()
+	for _, id := range ids {
+		if existing := p.accounts[id]; existing != nil {
+			existing.mu.Lock()
+			existing.deleting = false
+			existing.mu.Unlock()
+		}
 	}
-	return info, created, nil
+	p.mu.RUnlock()
+	stateChanged, err := p.scanUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	if stateChanged {
+		if err := p.persistState(); err != nil {
+			return nil, err
+		}
+	}
+	results := make([]CredentialImportResult, 0, len(ids))
+	for _, id := range ids {
+		info, ok := p.Credential(id)
+		if !ok {
+			return nil, errors.New("credential was saved but not loaded")
+		}
+		results = append(results, CredentialImportResult{Credential: info, Created: created[id]})
+	}
+	return results, nil
 }
 
-// DeleteCredential removes every valid file for an account and immediately
-// evicts that account from scheduling. Existing leases retain their snapshots.
+// mergeImportedCredential updates one logical credential without replacing
+// unrelated nodes in the physical auth file. Existing files retain their
+// direct-vs-tokens wrapper layout and original scope spelling.
+func mergeImportedCredential(root map[string]any, imported, existing *credential) error {
+	if imported == nil {
+		return ErrInvalidCredential
+	}
+	node := credentialNodeFor(imported.Raw, imported)
+	if node == nil {
+		return ErrInvalidCredential
+	}
+	node = cloneMap(node)
+	if !imported.Scoped {
+		replacement := cloneMap(imported.Raw)
+		for key := range root {
+			delete(root, key)
+		}
+		for key, value := range replacement {
+			root[key] = value
+		}
+		return nil
+	}
+
+	wrapper := imported.TokensWrapper
+	scopeKey := imported.ScopeKey
+	if existing != nil && existing.Scoped {
+		wrapper = existing.TokensWrapper
+		scopeKey = existing.ScopeKey
+	} else {
+		// When adding another scope to an existing scoped file, use the
+		// container already parsed by the CLI. Mixing direct scopes with a
+		// tokens wrapper would make one set invisible to credentialCandidates.
+		for _, candidate := range credentialCandidates(root) {
+			if candidate.scoped {
+				wrapper = candidate.tokensWrapper
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(scopeKey) == "" {
+		return ErrInvalidCredential
+	}
+	container := root
+	if wrapper {
+		var ok bool
+		container, ok = root["tokens"].(map[string]any)
+		if !ok {
+			container = make(map[string]any)
+			root["tokens"] = container
+		}
+	}
+	// Avoid introducing a second spelling of the same normalized scope.
+	for key := range container {
+		if normalizeScope(key) == imported.Scope {
+			scopeKey = key
+			break
+		}
+	}
+	container[scopeKey] = node
+	return nil
+}
+
+// DeleteCredential removes every valid file for an account. The account is
+// marked as deleting before any cross-process file-lock wait, making the
+// operation fail-closed for new leases and concurrent refreshes. Existing
+// leases retain their snapshots.
 func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 	p.mutationMu.Lock()
 	defer p.mutationMu.Unlock()
@@ -816,10 +1286,15 @@ func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 	if a == nil {
 		return ErrCredentialNotFound
 	}
+	p.markAccountDeleting(a, id)
 	if err := a.acquireRefresh(ctx); err != nil {
 		return err
 	}
 	defer a.releaseRefresh()
+	// A refresh which already held refreshLock when deletion began may have
+	// completed immediately before this acquisition. Reassert the terminal
+	// state while holding the same lock used by refreshCredential.
+	p.markAccountDeleting(a, id)
 
 	entries, err := os.ReadDir(p.cfg.Dir)
 	if err != nil {
@@ -831,13 +1306,68 @@ func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 			continue
 		}
 		path := filepath.Join(p.cfg.Dir, entry.Name())
-		cred, loadErr := loadCredential(path, p.cfg.Surface)
-		if loadErr != nil || accountID(cred.Subject) != id {
+		credentials, loadErr := loadCredentials(path, p.cfg.Surface)
+		if loadErr != nil {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
+		matches := make([]*credential, 0, 1)
+		for _, credential := range credentials {
+			if credential.accountID() == id {
+				matches = append(matches, credential)
+			}
 		}
+		if len(matches) == 0 {
+			continue
+		}
+		lock, lockErr := acquireAuthFileLock(ctx, path)
+		if lockErr != nil {
+			return lockErr
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			lock.Close()
+			return readErr
+		}
+		// The file may have changed while this process waited for auth.json.lock.
+		// Re-parse the locked snapshot and only remove logical credentials which
+		// still resolve to the requested account ID. In particular, do not delete
+		// a scope which another process replaced with a different principal or
+		// authentication mode after the optimistic scan above.
+		current, parseErr := parseCredentials(body, path, p.cfg.Surface)
+		if parseErr != nil {
+			lock.Close()
+			continue
+		}
+		lockedMatches := make([]*credential, 0, len(matches))
+		for _, credential := range current {
+			if credential.accountID() == id {
+				lockedMatches = append(lockedMatches, credential)
+			}
+		}
+		if len(lockedMatches) == 0 {
+			lock.Close()
+			continue
+		}
+		var root map[string]any
+		if json.Unmarshal(body, &root) != nil {
+			lock.Close()
+			return ErrInvalidCredentialJSON
+		}
+		for _, credential := range lockedMatches {
+			removeLogicalCredential(root, credential)
+		}
+		if len(credentialCandidates(root)) == 0 {
+			readErr = os.Remove(path)
+		} else {
+			readErr = writeCredentialAtomicMode(path, root, 0o600)
+		}
+		lock.Close()
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return readErr
+		}
+		p.mu.Lock()
+		delete(p.files, path)
+		p.mu.Unlock()
 		removed = true
 	}
 	if !removed {
@@ -845,11 +1375,67 @@ func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 	}
 	p.mu.Lock()
 	delete(p.states, id)
+	delete(p.catalogs, id)
 	p.mu.Unlock()
-	if err := p.scanUnlocked(); err != nil {
+	if _, err := p.scanUnlocked(); err != nil {
 		return err
 	}
 	return p.persistState()
+}
+
+func (p *Pool) markAccountDeleting(a *account, id string) {
+	if a == nil || id == "" {
+		return
+	}
+	a.mu.Lock()
+	fingerprint := credentialFingerprint(a.credential)
+	a.deleting = true
+	a.disabled = true
+	a.disableReason = "removed"
+	a.generation.Add(1)
+	a.mu.Unlock()
+	p.mu.Lock()
+	state := p.states[id]
+	state.Disabled = true
+	state.Reason = "removed"
+	state.CredentialFingerprint = fingerprint
+	p.states[id] = state
+	p.mu.Unlock()
+	p.rebuildActive()
+	p.notifyCapacity()
+	if err := p.persistState(); err != nil {
+		slog.Error("credential deleting state persistence failed", "account", id, "error", err)
+	}
+}
+
+func removeLogicalCredential(root map[string]any, credential *credential) {
+	if credential.Scoped {
+		container := root
+		if credential.TokensWrapper {
+			container, _ = root["tokens"].(map[string]any)
+		}
+		if container == nil {
+			return
+		}
+		if _, exists := container[credential.ScopeKey]; exists {
+			delete(container, credential.ScopeKey)
+			return
+		}
+		for scope := range container {
+			if normalizeScope(scope) == credential.Scope {
+				delete(container, scope)
+				return
+			}
+		}
+		return
+	}
+	if credential.TokensWrapper {
+		delete(root, "tokens")
+		return
+	}
+	for key := range root {
+		delete(root, key)
+	}
 }
 
 func (p *Pool) Models() []string {
@@ -858,7 +1444,7 @@ func (p *Pool) Models() []string {
 	for _, a := range p.accounts {
 		a.mu.RLock()
 		if !a.disabled && a.credential != nil {
-			for _, model := range a.credential.Models {
+			for _, model := range a.modelIDsLocked() {
 				seen[model] = struct{}{}
 			}
 		}
@@ -873,6 +1459,33 @@ func (p *Pool) Models() []string {
 	return models
 }
 
+// ModelFirstSeen returns the earliest persisted discovery time for every
+// currently exposed model. Provisional string catalogs deliberately remain
+// separate from structured descriptors, but still need stable OpenAI model
+// created timestamps before the first structured refresh.
+func (p *Pool) ModelFirstSeen() map[string]int64 {
+	result := make(map[string]int64)
+	p.mu.RLock()
+	for id, a := range p.accounts {
+		catalog := p.catalogs[id]
+		a.mu.RLock()
+		if !a.disabled && a.credential != nil {
+			for _, model := range a.modelIDsLocked() {
+				created := catalog.FirstSeen[model]
+				if created <= 0 {
+					created = a.descriptors[model].Created
+				}
+				if created > 0 && (result[model] == 0 || created < result[model]) {
+					result[model] = created
+				}
+			}
+		}
+		a.mu.RUnlock()
+	}
+	p.mu.RUnlock()
+	return result
+}
+
 func (p *Pool) HasModel(model string) bool {
 	if model == "" {
 		return true
@@ -881,11 +1494,7 @@ func (p *Pool) HasModel(model string) bool {
 	defer p.mu.RUnlock()
 	for _, a := range p.accounts {
 		a.mu.RLock()
-		index := 0
-		if a.credential != nil {
-			index = sort.SearchStrings(a.credential.Models, model)
-		}
-		available := !a.disabled && a.credential != nil && index < len(a.credential.Models) && a.credential.Models[index] == model
+		available := !a.disabled && a.credential != nil && a.hasModelLocked(model)
 		a.mu.RUnlock()
 		if available {
 			return true
@@ -902,11 +1511,7 @@ func (p *Pool) hasKnownModel(model string) bool {
 	defer p.mu.RUnlock()
 	for _, a := range p.accounts {
 		a.mu.RLock()
-		known := false
-		if cred := a.credential; cred != nil {
-			index := sort.SearchStrings(cred.Models, model)
-			known = index < len(cred.Models) && cred.Models[index] == model
-		}
+		known := a.credential != nil && a.hasModelLocked(model)
 		a.mu.RUnlock()
 		if known {
 			return true
@@ -921,7 +1526,11 @@ func (p *Pool) AccountsNeedingModelRefresh(interval time.Duration) []string {
 	ids := make([]string, 0, len(p.accounts))
 	for id, a := range p.accounts {
 		a.mu.RLock()
-		needs := !a.disabled && a.credential != nil && (len(a.credential.Models) == 0 || a.credential.ModelsUpdatedAt.IsZero() || now.Sub(a.credential.ModelsUpdatedAt) >= interval)
+		updatedAt := a.catalogUpdated
+		if updatedAt.IsZero() && a.credential != nil {
+			updatedAt = a.credential.ModelsUpdatedAt
+		}
+		needs := !a.disabled && a.credential != nil && (len(a.modelIDsLocked()) == 0 || updatedAt.IsZero() || now.Sub(updatedAt) >= interval)
 		a.mu.RUnlock()
 		if needs {
 			ids = append(ids, id)
@@ -1044,6 +1653,10 @@ func (p *Pool) UpdateBilling(accountID string, info BillingInfo) error {
 }
 
 func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now()
+	}
+	updatedAt = updatedAt.UTC()
 	p.mu.RLock()
 	a := p.accounts[accountID]
 	p.mu.RUnlock()
@@ -1065,23 +1678,249 @@ func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Ti
 	next := *cred
 	next.Raw = cloneMap(cred.Raw)
 	next.Models = normalized
-	next.ModelsUpdatedAt = updatedAt.UTC()
-	node := credentialNode(next.Raw)
-	node["models"] = normalized
-	node["models_updated_at"] = next.ModelsUpdatedAt.Format(time.RFC3339Nano)
-	if err := writeCredentialAtomic(next.Path, next.Raw); err != nil {
-		return err
+	next.ModelsUpdatedAt = updatedAt
+	// Preserve compatibility for files that already used the project's legacy
+	// models extension, but never introduce it into a clean CLI auth.json.
+	node := credentialNodeFor(next.Raw, cred)
+	_, hadLegacyModels := node["models"]
+	if hadLegacyModels {
+		node["models"] = normalized
+		node["models_updated_at"] = next.ModelsUpdatedAt.Format(time.RFC3339Nano)
+		if err := writeCredentialAtomic(next.Path, next.Raw); err != nil {
+			return err
+		}
 	}
 	a.mu.Lock()
 	a.credential = &next
+	a.catalogUpdated = updatedAt.UTC()
 	a.mu.Unlock()
 	p.mu.Lock()
-	if info, err := os.Stat(next.Path); err == nil {
-		p.files[next.Path] = fileEntry{size: info.Size(), modTime: info.ModTime(), cred: &next}
+	catalog := p.catalogs[accountID]
+	catalog.Provisional = normalized
+	catalog.UpdatedAt = updatedAt
+	seedModelFirstSeen(&catalog, normalized, updatedAt)
+	p.catalogs[accountID] = catalog
+	if hadLegacyModels {
+		p.replaceCachedCredentialLocked(accountID, &next)
 	}
 	p.mu.Unlock()
 	p.requestRebuild()
+	return p.persistState()
+}
+
+// UpdateModelDescriptors atomically publishes a structured account catalog in
+// state v2. It never writes model metadata, endpoints, or keys into auth.json.
+func (p *Pool) UpdateModelDescriptors(accountID string, descriptors []modelcatalog.ModelDescriptor, etag string, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now()
+	}
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	previous := p.catalogs[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	models := make(map[string]modelcatalog.ModelDescriptor, len(descriptors))
+	firstSeen := make(map[string]int64, len(previous.FirstSeen)+len(descriptors))
+	for model, created := range previous.FirstSeen {
+		if created > 0 {
+			firstSeen[model] = created
+		}
+	}
+	for _, descriptor := range descriptors {
+		descriptor = descriptor.Normalize()
+		if descriptor.ID == "" {
+			continue
+		}
+		if created := firstSeen[descriptor.ID]; created > 0 {
+			descriptor.Created = created
+		} else if old, exists := previous.Models[descriptor.ID]; exists && old.Created > 0 {
+			descriptor.Created = old.Created
+		}
+		if descriptor.Created <= 0 {
+			descriptor.Created = updatedAt.Unix()
+		}
+		firstSeen[descriptor.ID] = descriptor.Created
+		models[descriptor.ID] = descriptor
+	}
+	if len(models) == 0 {
+		return errors.New("upstream returned no valid model descriptors")
+	}
+	state := catalogState{
+		ETag: strings.TrimSpace(etag), UpdatedAt: updatedAt.UTC(), Models: cloneDescriptors(models), FirstSeen: firstSeen,
+	}
+	a.mu.Lock()
+	a.descriptors = cloneDescriptors(models)
+	a.catalogETag = state.ETag
+	a.catalogUpdated = state.UpdatedAt
+	a.mu.Unlock()
+	p.mu.Lock()
+	p.catalogs[accountID] = state
+	p.mu.Unlock()
+	p.requestRebuild()
+	if err := p.persistState(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (p *Pool) TouchModelCatalog(accountID string, updatedAt time.Time) error {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	a.mu.Lock()
+	a.catalogUpdated = updatedAt.UTC()
+	a.mu.Unlock()
+	p.mu.Lock()
+	catalog := p.catalogs[accountID]
+	catalog.UpdatedAt = updatedAt.UTC()
+	p.catalogs[accountID] = catalog
+	p.mu.Unlock()
+	return p.persistState()
+}
+
+func (p *Pool) ModelCatalogETag(accountID string) string {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	etag := a.catalogETag
+	a.mu.RUnlock()
+	return etag
+}
+
+// UpdateModelLimits applies authoritative inference response headers without
+// waiting for a full catalog refresh.
+func (p *Pool) UpdateModelLimits(accountID, model string, contextWindow uint64, maxCompletionTokens uint32) error {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	a.mu.Lock()
+	descriptor, ok := a.descriptors[model]
+	changed := false
+	if ok {
+		if contextWindow > 0 && descriptor.ContextWindow != contextWindow {
+			descriptor.ContextWindow = contextWindow
+			changed = true
+		}
+		if maxCompletionTokens > 0 && descriptor.MaxCompletionTokens != maxCompletionTokens {
+			descriptor.MaxCompletionTokens = maxCompletionTokens
+			changed = true
+		}
+		if changed {
+			a.descriptors[model] = descriptor
+		}
+	}
+	a.mu.Unlock()
+	if !ok || !changed {
+		return nil
+	}
+	p.mu.Lock()
+	catalog := p.catalogs[accountID]
+	if catalog.Models == nil {
+		catalog.Models = make(map[string]modelcatalog.ModelDescriptor)
+	}
+	catalog.Models[model] = descriptor
+	p.catalogs[accountID] = catalog
+	p.mu.Unlock()
+	return p.persistState()
+}
+
+// AccountDescriptor is a lock-safe, non-leasing lookup used to validate
+// persisted hard-affinity bindings after restart.
+func (p *Pool) AccountDescriptor(accountID, model string) (modelcatalog.ModelDescriptor, bool) {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return modelcatalog.ModelDescriptor{}, false
+	}
+	return a.descriptor(model)
+}
+
+func (p *Pool) AggregatedModels() []modelcatalog.AggregatedModel {
+	p.mu.RLock()
+	descriptors := make([]modelcatalog.ModelDescriptor, 0)
+	for _, a := range p.accounts {
+		a.mu.RLock()
+		if !a.disabled {
+			for _, descriptor := range a.descriptors {
+				if a.credential != nil && a.credential.AuthMode == AuthModeAPIKey && !descriptor.SupportedInAPI {
+					continue
+				}
+				descriptors = append(descriptors, descriptor)
+			}
+		}
+		a.mu.RUnlock()
+	}
+	p.mu.RUnlock()
+	return modelcatalog.Aggregate(descriptors)
+}
+
+// HasProvisionalModel reports whether an enabled account can route model only
+// from the legacy temporary string catalog. Callers use this to mirror the
+// same provisional backend choice that inference leasing will make before the
+// first structured catalog refresh.
+func (p *Pool) HasProvisionalModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, a := range p.accounts {
+		a.mu.RLock()
+		provisional := !a.disabled && a.credential != nil && len(a.descriptors) == 0 && a.hasModelLocked(model)
+		a.mu.RUnlock()
+		if provisional {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneDescriptors(source map[string]modelcatalog.ModelDescriptor) map[string]modelcatalog.ModelDescriptor {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]modelcatalog.ModelDescriptor, len(source))
+	for id, descriptor := range source {
+		descriptor.ReasoningEfforts = append([]string(nil), descriptor.ReasoningEfforts...)
+		result[id] = descriptor
+	}
+	return result
+}
+
+func (p *Pool) replaceCachedCredentialLocked(accountID string, next *credential) {
+	cached, ok := p.files[next.Path]
+	if !ok {
+		return
+	}
+	if info, err := os.Stat(next.Path); err == nil {
+		cached.size, cached.modTime = info.Size(), info.ModTime()
+	}
+	if len(cached.creds) == 0 && cached.cred != nil {
+		cached.creds = []*credential{cached.cred}
+	}
+	for index, item := range cached.creds {
+		if item.accountID() == accountID {
+			cached.creds[index] = next
+		}
+	}
+	if len(cached.creds) > 0 {
+		cached.cred = cached.creds[0]
+	}
+	p.files[next.Path] = cached
 }
 
 // RebuildSchedulingSnapshot publishes a consistent account index after a
@@ -1426,7 +2265,15 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 		}
 		return err
 	}
+	p.mu.RLock()
+	catalog := p.catalogs[a.id]
+	p.mu.RUnlock()
+	next = credentialWithProvisionalModels(next, catalog)
 	a.mu.Lock()
+	if a.deleting {
+		a.mu.Unlock()
+		return ErrNoAuth
+	}
 	a.credential = next
 	a.generation.Add(1)
 	a.disabled = false
@@ -1461,7 +2308,18 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 	}
 	if cached, ok := p.files[next.Path]; ok {
 		if info, statErr := os.Stat(next.Path); statErr == nil {
-			cached.modTime, cached.size, cached.cred = info.ModTime(), info.Size(), next
+			cached.modTime, cached.size = info.ModTime(), info.Size()
+			if len(cached.creds) == 0 && cached.cred != nil {
+				cached.creds = []*credential{cached.cred}
+			}
+			for index, item := range cached.creds {
+				if item.accountID() == a.id {
+					cached.creds[index] = next
+				}
+			}
+			if len(cached.creds) > 0 {
+				cached.cred = cached.creds[0]
+			}
 			p.files[next.Path] = cached
 		}
 	}
@@ -1544,15 +2402,20 @@ func (p *Pool) refreshAllDue() {
 
 func (p *Pool) scan() error {
 	p.mutationMu.Lock()
-	defer p.mutationMu.Unlock()
-	return p.scanUnlocked()
+	stateChanged, err := p.scanUnlocked()
+	p.mutationMu.Unlock()
+	if err != nil || !stateChanged {
+		return err
+	}
+	return p.persistState()
 }
 
-func (p *Pool) scanUnlocked() error {
+func (p *Pool) scanUnlocked() (bool, error) {
 	entries, err := os.ReadDir(p.cfg.Dir)
 	if err != nil {
-		return fmt.Errorf("read auths directory: %w", err)
+		return false, fmt.Errorf("read auths directory: %w", err)
 	}
+	discoveredAt := time.Now().UTC()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	seen := map[string]struct{}{}
 	parsed := map[string]*credential{}
@@ -1570,27 +2433,37 @@ func (p *Pool) scanUnlocked() error {
 		p.mu.RLock()
 		cached, ok := p.files[path]
 		p.mu.RUnlock()
-		var cred *credential
+		var credentials []*credential
 		if ok && cached.size == info.Size() && cached.modTime.Equal(info.ModTime()) {
-			cred = cached.cred
+			credentials = cached.creds
+			if len(credentials) == 0 && cached.cred != nil {
+				credentials = []*credential{cached.cred}
+			}
 		} else {
-			cred, err = loadCredential(path, p.cfg.Surface)
+			credentials, err = loadCredentials(path, p.cfg.Surface)
 			if err != nil {
 				slog.Warn("credential file skipped", "reason", "invalid_format")
 				continue
 			}
 		}
-		id := accountID(cred.Subject)
-		if _, duplicate := seen[id]; duplicate {
-			slog.Warn("duplicate credential skipped", "account", id)
-			continue
+		for _, cred := range credentials {
+			id := cred.accountID()
+			if _, duplicate := seen[id]; duplicate {
+				slog.Warn("duplicate credential skipped", "account", id)
+				continue
+			}
+			seen[id] = struct{}{}
+			parsed[id] = cred
 		}
-		seen[id] = struct{}{}
-		parsed[id] = cred
-		newFiles[path] = fileEntry{size: info.Size(), modTime: info.ModTime(), cred: cred}
+		var first *credential
+		if len(credentials) > 0 {
+			first = credentials[0]
+		}
+		newFiles[path] = fileEntry{size: info.Size(), modTime: info.ModTime(), cred: first, creds: credentials}
 	}
 	if len(parsed) == 0 {
 		p.mu.Lock()
+		stateChanged := len(p.accounts) > 0 || len(p.files) > 0 || len(p.catalogs) > 0
 		hadAccounts := len(p.accounts) > 0
 		for _, a := range p.accounts {
 			a.mu.Lock()
@@ -1599,19 +2472,21 @@ func (p *Pool) scanUnlocked() error {
 		}
 		p.accounts = map[string]*account{}
 		p.files = map[string]fileEntry{}
+		p.catalogs = map[string]catalogState{}
 		p.mu.Unlock()
 		p.rebuildActive()
 		if hadAccounts {
 			slog.Warn("credential pool is empty")
-			return nil
+			return stateChanged, nil
 		}
 		if p.cfg.AllowEmpty {
-			return nil
+			return stateChanged, nil
 		}
-		return ErrNoAuth
+		return false, ErrNoAuth
 	}
 	p.mu.Lock()
 	poolChanged := len(p.files) != len(newFiles) || len(p.accounts) != len(parsed)
+	stateChanged := poolChanged
 	if !poolChanged {
 		for path, next := range newFiles {
 			current, ok := p.files[path]
@@ -1624,35 +2499,77 @@ func (p *Pool) scanUnlocked() error {
 	var cooldownDeadlines []time.Time
 	billingRefreshNeeded := false
 	for id, cred := range parsed {
+		catalog := p.catalogs[id]
+		if len(catalog.Models) == 0 {
+			catalogChanged := false
+			node := credentialNodeFor(cred.Raw, cred)
+			_, hasLegacyModels := node["models"]
+			if hasLegacyModels {
+				normalized := stringSlice(cred.Models)
+				if !equalStrings(catalog.Provisional, normalized) {
+					catalog.Provisional = normalized
+					catalogChanged = true
+				}
+			}
+			firstSeenAt := discoveredAt
+			if !catalog.UpdatedAt.IsZero() {
+				firstSeenAt = catalog.UpdatedAt
+			}
+			if seedModelFirstSeen(&catalog, catalog.Provisional, firstSeenAt) {
+				catalogChanged = true
+			}
+			if catalogChanged {
+				p.catalogs[id] = catalog
+				stateChanged = true
+			}
+		}
+		cred = credentialWithProvisionalModels(cred, catalog)
 		if existing := p.accounts[id]; existing != nil {
 			existing.mu.Lock()
-			credentialChanged := existing.credential == nil || existing.credential.Path != cred.Path || existing.credential.AccessToken != cred.AccessToken || existing.credential.RefreshToken != cred.RefreshToken
+			credentialChanged := existing.credential == nil ||
+				existing.credential.Path != cred.Path || existing.credential.Scope != cred.Scope ||
+				existing.credential.AccessToken != cred.AccessToken || existing.credential.RefreshToken != cred.RefreshToken ||
+				existing.credential.AuthMode != cred.AuthMode || existing.credential.Subject != cred.Subject ||
+				existing.credential.PrincipalType != cred.PrincipalType || existing.credential.PrincipalID != cred.PrincipalID ||
+				existing.credential.ClientID != cred.ClientID || existing.credential.TokenURL != cred.TokenURL ||
+				existing.credential.OIDCIssuer != cred.OIDCIssuer || !existing.credential.ExpiresAt.Equal(cred.ExpiresAt)
 			existing.credential = cred
+			if catalog, ok := p.catalogs[id]; ok {
+				existing.descriptors = cloneDescriptors(catalog.Models)
+				existing.catalogETag = catalog.ETag
+				existing.catalogUpdated = catalog.UpdatedAt
+			}
 			if credentialChanged {
 				existing.generation.Add(1)
 				poolChanged = true
-				existing.disabled = false
-				existing.disableReason = ""
-				existing.cooldowns = nil
-				existing.billing = nil
-				existing.billingPending = p.billingGate.Load() && cred.Tier.Billing
-				state := p.states[id]
-				state.Disabled = false
-				state.CredentialFingerprint = ""
-				state.CooldownUntil = time.Time{}
-				state.Reason = ""
-				state.Cooldowns = nil
-				if accountStateEmpty(state) {
-					delete(p.states, id)
-				} else {
-					p.states[id] = state
+				if !existing.deleting {
+					existing.disabled = false
+					existing.disableReason = ""
+					existing.cooldowns = nil
+					existing.billing = nil
+					existing.billingPending = p.billingGate.Load() && cred.Tier.Billing
+					state := p.states[id]
+					state.Disabled = false
+					state.CredentialFingerprint = ""
+					state.CooldownUntil = time.Time{}
+					state.Reason = ""
+					state.Cooldowns = nil
+					if accountStateEmpty(state) {
+						delete(p.states, id)
+					} else {
+						p.states[id] = state
+					}
 				}
 				billingRefreshNeeded = billingRefreshNeeded || existing.billingPending
 			}
 			existing.mu.Unlock()
 			continue
 		}
-		a := &account{id: id, credential: cred, agentID: randomHex(16), sessionID: randomUUID(), billingPending: p.billingGate.Load() && cred.Tier.Billing}
+		a := &account{
+			id: id, credential: cred, agentID: p.globalAgentID, sessionID: randomUUID(),
+			descriptors: cloneDescriptors(catalog.Models), catalogETag: catalog.ETag, catalogUpdated: catalog.UpdatedAt,
+			billingPending: p.billingGate.Load() && cred.Tier.Billing,
+		}
 		a.generation.Store(1)
 		if state, ok := p.states[id]; ok {
 			if state.Disabled {
@@ -1697,7 +2614,9 @@ func (p *Pool) scanUnlocked() error {
 			a.disabled, a.disableReason = true, "removed"
 			a.mu.Unlock()
 			delete(p.accounts, id)
+			delete(p.catalogs, id)
 			poolChanged = true
+			stateChanged = true
 		}
 	}
 	p.files = newFiles
@@ -1714,7 +2633,50 @@ func (p *Pool) scanUnlocked() error {
 	if billingRefreshNeeded {
 		p.requestBillingRefresh()
 	}
-	return nil
+	return stateChanged, nil
+}
+
+func seedModelFirstSeen(catalog *catalogState, models []string, discoveredAt time.Time) bool {
+	if catalog == nil || len(models) == 0 {
+		return false
+	}
+	created := discoveredAt.Unix()
+	if created <= 0 {
+		created = time.Now().Unix()
+	}
+	changed := false
+	if catalog.FirstSeen == nil {
+		catalog.FirstSeen = make(map[string]int64, len(models))
+	}
+	for _, model := range models {
+		if catalog.FirstSeen[model] <= 0 {
+			catalog.FirstSeen[model] = created
+			changed = true
+		}
+	}
+	return changed
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func credentialWithProvisionalModels(credential *credential, catalog catalogState) *credential {
+	if credential == nil || len(catalog.Models) > 0 || len(credential.Models) > 0 || len(catalog.Provisional) == 0 {
+		return credential
+	}
+	next := *credential
+	next.Models = append([]string(nil), catalog.Provisional...)
+	next.ModelsUpdatedAt = catalog.UpdatedAt
+	return &next
 }
 
 func cloneBillingInfo(source *BillingInfo) *BillingInfo {
@@ -1757,7 +2719,7 @@ func (p *Pool) rebuildActive() {
 		var models []string
 		if available {
 			a.paidTier.Store(a.credential.Tier.Paid)
-			for _, model := range a.credential.Models {
+			for _, model := range a.modelIDsLocked() {
 				cooldown, cooling := a.modelCooldowns[model]
 				if !cooling || !now.Before(cooldown.Until) {
 					models = append(models, model)
@@ -1837,8 +2799,7 @@ func (p *Pool) unavailable(model string) error {
 		until, _ := cooldownDeadline(a.cooldowns, now)
 		disabled := a.disabled
 		if model != "" && !disabled && a.credential != nil {
-			index := sort.SearchStrings(a.credential.Models, model)
-			if index < len(a.credential.Models) && a.credential.Models[index] == model {
+			if a.hasModelLocked(model) {
 				if cooldown, ok := a.modelCooldowns[model]; ok && now.Before(cooldown.Until) && cooldown.Until.After(until) {
 					until = cooldown.Until
 				}
@@ -1870,6 +2831,13 @@ func (p *Pool) loadState() error {
 	if err := json.Unmarshal(b, &state); err != nil {
 		return err
 	}
+	if state.Version < 0 || state.Version > 2 {
+		return fmt.Errorf("unsupported credential state version %d", state.Version)
+	}
+	if state.Version == 2 {
+		p.globalAgentID = strings.TrimSpace(state.GlobalAgentID)
+		p.namespaceKey = strings.TrimSpace(state.NamespaceKey)
+	}
 	now := time.Now()
 	for id, item := range state.Accounts {
 		cooldowns := activeAccountCooldowns(item.Cooldowns, now)
@@ -1894,6 +2862,42 @@ func (p *Pool) loadState() error {
 			p.states[id] = item
 		}
 	}
+	if state.Version < 2 {
+		return nil
+	}
+	for id, catalog := range state.Catalogs {
+		if catalog.FirstSeen == nil {
+			catalog.FirstSeen = make(map[string]int64)
+		}
+		models := make(map[string]modelcatalog.ModelDescriptor, len(catalog.Models))
+		for model, descriptor := range catalog.Models {
+			descriptor = descriptor.Normalize()
+			if descriptor.ID == "" {
+				descriptor.ID = model
+			}
+			if descriptor.WireModel == "" {
+				descriptor.WireModel = descriptor.ID
+			}
+			if descriptor.Created <= 0 {
+				descriptor.Created = catalog.FirstSeen[model]
+			}
+			if descriptor.Created <= 0 && !catalog.UpdatedAt.IsZero() {
+				descriptor.Created = catalog.UpdatedAt.Unix()
+			}
+			if descriptor.Created > 0 && catalog.FirstSeen[descriptor.ID] <= 0 {
+				catalog.FirstSeen[descriptor.ID] = descriptor.Created
+			}
+			models[descriptor.ID] = descriptor
+		}
+		catalog.Models = models
+		catalog.Provisional = stringSlice(catalog.Provisional)
+		for model, created := range catalog.FirstSeen {
+			if created <= 0 {
+				delete(catalog.FirstSeen, model)
+			}
+		}
+		p.catalogs[id] = catalog
+	}
 	return nil
 }
 
@@ -1901,7 +2905,10 @@ func (p *Pool) persistState() error {
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	p.mu.RLock()
-	state := persistedState{Version: 2, Accounts: map[string]accountState{}}
+	state := persistedState{
+		Version: 2, GlobalAgentID: p.globalAgentID, NamespaceKey: p.namespaceKey,
+		Accounts: map[string]accountState{}, Catalogs: map[string]catalogState{},
+	}
 	now := time.Now()
 	for id, item := range p.states {
 		item.Cooldowns = activeAccountCooldowns(item.Cooldowns, now)
@@ -1915,6 +2922,14 @@ func (p *Pool) persistState() error {
 		syncLegacyCooldownState(&item, now)
 		if !accountStateEmpty(item) {
 			state.Accounts[id] = item
+		}
+	}
+	for id, catalog := range p.catalogs {
+		catalog.Models = cloneDescriptors(catalog.Models)
+		catalog.Provisional = append([]string(nil), catalog.Provisional...)
+		catalog.FirstSeen = cloneFirstSeen(catalog.FirstSeen)
+		if len(catalog.Models) > 0 || len(catalog.Provisional) > 0 || len(catalog.FirstSeen) > 0 || catalog.ETag != "" || !catalog.UpdatedAt.IsZero() {
+			state.Catalogs[id] = catalog
 		}
 	}
 	p.mu.RUnlock()
@@ -1938,10 +2953,25 @@ func (p *Pool) persistState() error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func cloneFirstSeen(source map[string]int64) map[string]int64 {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]int64, len(source))
+	for model, created := range source {
+		result[model] = created
+	}
+	return result
 }
 
 type affinityEntry struct {
@@ -1977,6 +3007,27 @@ func modelAffinityKey(affinity, model string) string {
 		return ""
 	}
 	return affinity + "\x00" + model
+}
+
+func affinityModelKey(affinity Affinity, model string) string {
+	if affinity.Key == "" {
+		return ""
+	}
+	tenant := affinity.Tenant
+	if tenant == "" {
+		tenant = "public"
+	}
+	return tenant + "\x00" + modelAffinityKey(affinity.Key, model)
+}
+
+func validNamespaceKey(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32
+}
+
+func validGlobalAgentID(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 16
 }
 
 func (c *affinityCache) Get(key string) (string, bool) {

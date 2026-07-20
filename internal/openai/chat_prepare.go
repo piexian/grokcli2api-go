@@ -72,6 +72,16 @@ func (p *chatPreparer) prepare() error {
 	}
 	p.out["stream"] = stream
 	p.handled["stream"] = true
+	p.handled["stream_options"] = true
+	if _, exists := p.body["stream_options"]; exists {
+		p.change("stream_options", "removed", "stream usage options are fixed by the Grok CLI protocol")
+	}
+	if stream {
+		// Grok CLI 0.2.102 always requests the terminal usage chunk. Ignore a
+		// caller's partial/legacy stream_options object and emit the one field
+		// accepted by the chat proxy.
+		p.out["stream_options"] = map[string]any{"include_usage": true}
+	}
 
 	if err := p.copyNumber("temperature", 0, 2); err != nil {
 		return err
@@ -258,17 +268,17 @@ func (p *chatPreparer) prepareReasoningEffort() error {
 		return fmt.Errorf("reasoning_effort must be a string")
 	}
 	effort = strings.ToLower(strings.TrimSpace(effort))
-	if effort == "adaptive" {
-		effort = "medium"
-		p.change("reasoning_effort", "rewritten", "adaptive is normalized to medium")
-	}
 	switch effort {
-	case "none", "minimal", "low", "medium", "high", "xhigh":
+	case "minimal", "low", "medium", "high", "xhigh":
 		p.out["reasoning_effort"] = effort
-		return nil
+	case "none":
+		p.out["reasoning_effort"] = "low"
+		p.change("reasoning_effort", "rewritten", "none is normalized to low")
 	default:
-		return fmt.Errorf("reasoning_effort must be one of none, minimal, low, medium, high, xhigh")
+		p.out["reasoning_effort"] = "low"
+		p.change("reasoning_effort", "rewritten", "unknown reasoning effort is normalized to low")
 	}
+	return nil
 }
 
 func (p *chatPreparer) prepareUserID() error {
@@ -292,23 +302,23 @@ func (p *chatPreparer) prepareUserID() error {
 	var raw any
 	var source string
 	found := false
-	if value, ok := p.body["user_id"]; ok {
-		raw, source, found = value, "user_id", true
-		if _, exists := p.body["user"]; exists {
-			p.change("user", "removed", "canonical user_id takes precedence")
-		}
-		if metadataHasUser {
-			p.change("metadata.user_id", "removed", "canonical user_id takes precedence")
-		}
-	} else if value, ok := p.body["user"]; ok {
+	if value, ok := p.body["user"]; ok {
 		raw, source, found = value, "user", true
-		p.change("user", "rewritten", "mapped to user_id")
+		if _, exists := p.body["user_id"]; exists {
+			p.change("user_id", "removed", "canonical user takes precedence")
+		}
 		if metadataHasUser {
-			p.change("metadata.user_id", "removed", "user takes precedence")
+			p.change("metadata.user_id", "removed", "canonical user takes precedence")
+		}
+	} else if value, ok := p.body["user_id"]; ok {
+		raw, source, found = value, "user_id", true
+		p.change("user_id", "rewritten", "mapped to user")
+		if metadataHasUser {
+			p.change("metadata.user_id", "removed", "user_id takes precedence")
 		}
 	} else if metadataHasUser {
 		raw, source, found = metadataUser, "metadata.user_id", true
-		p.change(source, "rewritten", "mapped to user_id")
+		p.change(source, "rewritten", "mapped to user")
 	}
 	if !found {
 		return nil
@@ -317,7 +327,7 @@ func (p *chatPreparer) prepareUserID() error {
 	if !ok || strings.TrimSpace(value) == "" {
 		return fmt.Errorf("%s must be a non-empty string", source)
 	}
-	p.out["user_id"] = strings.TrimSpace(value)
+	p.out["user"] = strings.TrimSpace(value)
 	return nil
 }
 

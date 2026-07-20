@@ -23,16 +23,16 @@ jobs:
           cache: false
       - name: Check formatting
         shell: bash
-        run: test -z "$(gofmt -l .)"
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
       - name: Race detector
         if: runner.os == 'Linux'
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
       - name: Vet
         run: go vet ./...
       - name: Build
-        run: go build ./cmd/grok2api
+        run: go build -trimpath ./cmd/grok2api
 
   docker:
     needs: test
