@@ -1,0 +1,12 @@
+{
+  "id": "sync-upstream-resolve-conflicts",
+  "title": "同步上游代码并解决冲突",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "repository",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-20T11:18:24Z",
+  "branch": "feature/paid-tier-scheduler-upstream"
+}
