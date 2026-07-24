@@ -18,6 +18,7 @@ type Config struct {
 	LogLevel               string
 	ChatProxyBaseURL       string
 	ChatProxyVersion       string
+	XAIAPIBaseURL          string
 	AuthsDir               string
 	AuthsReloadInterval    time.Duration
 	AuthRefreshConcurrency int
@@ -33,8 +34,10 @@ type Config struct {
 	ClientName             string
 	ClientVersion          string
 	ClientSurface          string
+	ClientMode             string
 	ClientIdentifier       string
 	TokenAuth              string
+	DeploymentID           string
 	TLSInsecureSkipVerify  bool
 	StreamCompression      string
 	ProxyURL               string
@@ -99,12 +102,17 @@ func Load() (Config, error) {
 	if streamCompression != "identity" && streamCompression != "gzip" {
 		return Config{}, fmt.Errorf("GROK_STREAM_COMPRESSION must be identity or gzip")
 	}
+	clientMode := strings.ToLower(strings.TrimSpace(env("GROK_CLIENT_MODE", "headless")))
+	if clientMode != "headless" && clientMode != "interactive" {
+		return Config{}, fmt.Errorf("GROK_CLIENT_MODE must be headless or interactive")
+	}
 	cfg := Config{
 		Host:                   env("GROK2API_HOST", "0.0.0.0"),
 		Port:                   port,
 		LogLevel:               strings.ToUpper(env("GROK2API_LOG_LEVEL", "INFO")),
 		ChatProxyBaseURL:       strings.TrimRight(env("GROK_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com"), "/"),
 		ChatProxyVersion:       strings.Trim(env("GROK_CHAT_PROXY_VERSION", "v1"), "/"),
+		XAIAPIBaseURL:          strings.TrimRight(env("GROK_XAI_API_BASE_URL", "https://api.x.ai"), "/"),
 		AuthsDir:               expandHome(env("GROK_AUTHS_DIR", "./auths")),
 		AuthsReloadInterval:    reloadInterval,
 		AuthRefreshConcurrency: refreshConcurrency,
@@ -118,10 +126,12 @@ func Load() (Config, error) {
 		AffinityTTL:            affinityTTL,
 		AffinityMaxEntries:     affinityMax,
 		ClientName:             env("GROK_CLIENT_NAME", "grok-shell"),
-		ClientVersion:          env("GROK_CLIENT_VERSION", "0.2.93"),
+		ClientVersion:          env("GROK_CLIENT_VERSION", "0.2.102"),
 		ClientSurface:          env("GROK_CLIENT_SURFACE", "tui"),
+		ClientMode:             clientMode,
 		ClientIdentifier:       env("GROK_CLIENT_IDENTIFIER", "grok-shell"),
 		TokenAuth:              env("GROK_TOKEN_AUTH", "xai-grok-cli"),
+		DeploymentID:           strings.TrimSpace(os.Getenv("GROK_DEPLOYMENT_ID")),
 		TLSInsecureSkipVerify:  envBool("GROK_TLS_INSECURE_SKIP_VERIFY", false),
 		StreamCompression:      streamCompression,
 		ProxyURL:               strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),

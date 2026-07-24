@@ -66,7 +66,7 @@ func TestPrepareChatNormalizesStrictComposerParameters(t *testing.T) {
 			t.Fatalf("%s was forwarded: %#v", key, out)
 		}
 	}
-	if out["reasoning_effort"] != "medium" {
+	if out["reasoning_effort"] != "low" {
 		t.Fatalf("reasoning_effort = %#v", out["reasoning_effort"])
 	}
 }
@@ -144,7 +144,7 @@ func TestPrepareResponsesCanonicalizesReasoningEffort(t *testing.T) {
 		t.Fatalf("legacy reasoning_effort leaked: %#v", out)
 	}
 	reasoning, ok := out["reasoning"].(map[string]any)
-	if !ok || reasoning["effort"] != "high" {
+	if !ok || reasoning["effort"] != "xhigh" {
 		t.Fatalf("reasoning = %#v", out["reasoning"])
 	}
 }
@@ -154,7 +154,7 @@ func TestPrepareResponsesFallsBackUnknownReasoningEffort(t *testing.T) {
 		"model": "grok-4.5", "input": "hello", "reasoning_effort": "vendor-adaptive",
 	})
 	reasoning, ok := out["reasoning"].(map[string]any)
-	if !ok || reasoning["effort"] != "medium" {
+	if !ok || reasoning["effort"] != "low" {
 		t.Fatalf("reasoning = %#v", out["reasoning"])
 	}
 }

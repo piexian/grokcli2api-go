@@ -24,7 +24,7 @@ func TestPrepareChatRebuildsWhitelistAndMapsAliases(t *testing.T) {
 	want := map[string]any{
 		"model": "grok-4", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "stream": false,
 		"max_tokens": float64(64), "presence_penalty": float64(0.25), "frequency_penalty": float64(-0.5),
-		"stop": []any{"done"}, "reasoning_effort": "medium", "user_id": "session-a",
+		"stop": []any{"done"}, "reasoning_effort": "low", "user": "session-a",
 	}
 	if !reflect.DeepEqual(prepared.Body, want) {
 		t.Fatalf("body = %#v, want %#v", prepared.Body, want)
@@ -133,7 +133,6 @@ func TestPrepareChatRejectsInvalidSemanticStructures(t *testing.T) {
 	}{
 		{name: "temperature", edit: func(body map[string]any) { body["temperature"] = 3 }, want: "temperature"},
 		{name: "max tokens", edit: func(body map[string]any) { body["max_tokens"] = 1.5 }, want: "positive integer"},
-		{name: "reasoning", edit: func(body map[string]any) { body["reasoning_effort"] = "impossible" }, want: "reasoning_effort"},
 		{name: "null user", edit: func(body map[string]any) { body["user_id"] = nil }, want: "user_id"},
 		{name: "null user content", edit: func(body map[string]any) { body["messages"] = []any{map[string]any{"role": "user", "content": nil}} }, want: "messages[0].content"},
 		{name: "image in system message", edit: func(body map[string]any) {

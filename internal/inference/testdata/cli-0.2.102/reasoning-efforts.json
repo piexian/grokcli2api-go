@@ -1,0 +1,10 @@
+[
+  {"input":"none","supported":["none","low"],"capable":true,"normalized":"low"},
+  {"input":"minimal","supported":["minimal"],"capable":true,"normalized":"minimal"},
+  {"input":"medium","supported":["medium"],"capable":true,"normalized":"medium"},
+  {"input":"high","supported":["high"],"capable":true,"normalized":"high"},
+  {"input":"xhigh","supported":["xhigh"],"capable":true,"normalized":"xhigh"},
+  {"input":"future","supported":["high"],"capable":true,"normalized":"low"},
+  {"input":"high","supported":["medium"],"capable":true,"normalized":"low"},
+  {"input":"high","supported":[],"capable":false,"normalized":"low"}
+]

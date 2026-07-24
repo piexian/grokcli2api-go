@@ -19,14 +19,17 @@ import (
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 	"github.com/Futureppo/grokcli2api-go/internal/grok"
+	"github.com/Futureppo/grokcli2api-go/internal/inference"
+	"github.com/Futureppo/grokcli2api-go/internal/modelcatalog"
 	"github.com/Futureppo/grokcli2api-go/internal/openai"
 )
 
 type Server struct {
-	cfg    config.Config
-	pool   *auth.Pool
-	client *grok.Client
-	mux    *http.ServeMux
+	cfg        config.Config
+	pool       *auth.Pool
+	client     *grok.Client
+	continuity *continuityStore
+	mux        *http.ServeMux
 }
 
 func New(cfg config.Config) (*Server, error) {
@@ -63,12 +66,20 @@ func New(cfg config.Config) (*Server, error) {
 		}
 	}
 	client.StartModelRefresh()
-	s := &Server{cfg: cfg, pool: pool, client: client, mux: http.NewServeMux()}
+	s := &Server{
+		cfg: cfg, pool: pool, client: client,
+		continuity: newContinuityStore(cfg.AuthsDir, cfg.AffinityTTL, cfg.AffinityMaxEntries),
+		mux:        http.NewServeMux(),
+	}
 	s.routes()
 	return s, nil
 }
 
-func (s *Server) Close() { s.client.Close(); s.pool.Close() }
+func (s *Server) Close() {
+	s.client.Close()
+	s.continuity.Close()
+	s.pool.Close()
+}
 
 func (s *Server) Handler() http.Handler {
 	return recoverer(requestLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,9 +134,18 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
 	ids := s.pool.Models()
+	firstSeen := s.pool.ModelFirstSeen()
+	aggregated := make(map[string]modelcatalog.AggregatedModel)
+	for _, model := range s.pool.AggregatedModels() {
+		aggregated[model.ID] = model
+	}
 	data := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
-		data = append(data, grok.Model(id))
+		metadata := aggregated[id]
+		if metadata.Created <= 0 {
+			metadata.Created = firstSeen[id]
+		}
+		data = append(data, publicModelObject(id, metadata))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
@@ -136,7 +156,41 @@ func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown model: "+id, "invalid_request_error", "404")
 		return
 	}
-	writeJSON(w, http.StatusOK, grok.Model(id))
+	var aggregated modelcatalog.AggregatedModel
+	for _, candidate := range s.pool.AggregatedModels() {
+		if candidate.ID == id {
+			aggregated = candidate
+			break
+		}
+	}
+	if aggregated.Created <= 0 {
+		aggregated.Created = s.pool.ModelFirstSeen()[id]
+	}
+	writeJSON(w, http.StatusOK, publicModelObject(id, aggregated))
+}
+
+func publicModelObject(id string, metadata modelcatalog.AggregatedModel) map[string]any {
+	model := grok.Model(id)
+	if metadata.Created > 0 {
+		model["created"] = metadata.Created
+	}
+	if metadata.ID == "" {
+		return model
+	}
+	backends := make([]string, 0, len(metadata.APIBackends))
+	for _, backend := range metadata.APIBackends {
+		backends = append(backends, string(backend))
+	}
+	model["x_grok"] = map[string]any{
+		"api_backends":              backends,
+		"context_window":            metadata.ContextWindow,
+		"max_completion_tokens":     metadata.MaxCompletionTokens,
+		"reasoning_efforts":         metadata.ReasoningEfforts,
+		"supports_reasoning_effort": metadata.SupportsReasoningEffort,
+		"supports_backend_search":   metadata.SupportsBackendSearch,
+		"stream_tool_calls":         metadata.StreamToolCalls,
+	}
+	return model
 }
 
 func (s *Server) apiKeyStatus(w http.ResponseWriter, _ *http.Request) {
@@ -158,7 +212,7 @@ func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error(), "invalid_request_error", http.StatusText(status))
 		return
 	}
-	info, created, err := s.pool.ImportCredential(r.Context(), raw)
+	imports, err := s.pool.ImportCredentials(r.Context(), raw)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrInvalidCredentialJSON):
@@ -171,24 +225,44 @@ func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	discovery := "succeeded"
-	response := map[string]any{"credential": info, "created": created}
-	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	probeErr := s.client.RefreshAccountModels(probeCtx, info.ID)
-	cancel()
-	if current, ok := s.pool.Credential(info.ID); ok {
-		response["credential"] = current
+	response := map[string]any{}
+	credentials := make([]map[string]any, 0, len(imports))
+	createdCount := 0
+	for _, imported := range imports {
+		discovery := "succeeded"
+		probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		probeErr := s.client.RefreshAccountModels(probeCtx, imported.Credential.ID)
+		cancel()
+		credential := imported.Credential
+		if current, ok := s.pool.Credential(imported.Credential.ID); ok {
+			credential = current
+		}
+		if probeErr != nil {
+			discovery = "failed"
+		}
+		credentials = append(credentials, map[string]any{
+			"credential": credential, "created": imported.Created, "model_discovery": discovery,
+		})
+		if imported.Created {
+			createdCount++
+		}
+		slog.Info("credential uploaded", "account", credential.ID, "created", imported.Created, "model_discovery", discovery)
 	}
-	if probeErr != nil {
-		discovery = "failed"
-		response["warning"] = "model discovery failed; credential remains saved"
+	response["credentials"] = credentials
+	response["created_count"] = createdCount
+	response["updated_count"] = len(imports) - createdCount
+	if len(credentials) == 1 {
+		response["credential"] = credentials[0]["credential"]
+		response["created"] = credentials[0]["created"]
+		response["model_discovery"] = credentials[0]["model_discovery"]
+		if credentials[0]["model_discovery"] == "failed" {
+			response["warning"] = "model discovery failed; credential remains saved"
+		}
 	}
-	response["model_discovery"] = discovery
 	status = http.StatusOK
-	if created {
+	if createdCount > 0 {
 		status = http.StatusCreated
 	}
-	slog.Info("credential uploaded", "account", info.ID, "created", created, "model_discovery", discovery)
 	writeJSON(w, status, response)
 }
 
@@ -206,6 +280,7 @@ func (s *Server) adminCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "credential could not be deleted", "server_error", "credential_delete_failed")
 		return
 	}
+	s.continuity.DeleteAccount(id)
 	slog.Info("credential deleted", "account", id)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -281,30 +356,18 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prepareStarted := time.Now()
-	prepared, err := openai.PrepareChat(body)
+	plan, err := inference.NewRequestPlan(inference.ProtocolChatCompletions, body, inference.PlanOptions{Tenant: tenantFromContext(r.Context())})
 	if err != nil {
 		timing.MarkPrepare(time.Since(prepareStarted))
-		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
+		s.writePlanError(w, inference.ProtocolChatCompletions, err)
 		return
 	}
-	for _, change := range prepared.Changes {
-		slog.Debug("chat compatibility field sanitized", "path", change.Path, "action", change.Action, "reason", change.Reason)
-	}
-	wire := prepared.Body
 	timing.MarkPrepare(time.Since(prepareStarted))
-	model := openai.String(body, "model", "")
-	affinity := requestAffinity(r, body)
-	convID := conversationID(affinity)
-	if !openai.IsStreaming(body) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "chat/completions", wire, affinity, convID, model, false)
-		if err != nil {
-			s.writeClientError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, openai.Normalize(payload, model, false))
+	if !plan.Streaming() {
+		s.executeNonStreaming(w, r, body, plan, nil)
 		return
 	}
-	s.streamChat(w, r, wire, affinity, convID, model)
+	s.executeStreaming(w, r, body, plan, nil)
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
@@ -319,48 +382,31 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	prepareStarted := time.Now()
 	native := isGrokCLIClient(r)
-	if err := openai.ValidateResponsesRequest(body, native); err != nil {
+	options := inference.PlanOptions{NativeCLI: native, Tenant: tenantFromContext(r.Context())}
+	// Validate the public request before consulting any local continuation
+	// state. Unsupported content remains in the immutable plan for the
+	// account-specific renderer to remove silently.
+	if _, err := inference.NewRequestPlan(inference.ProtocolResponses, body, options); err != nil {
 		timing.MarkPrepare(time.Since(prepareStarted))
-		writeResponsesRequestError(w, err)
+		s.writePlanError(w, inference.ProtocolResponses, err)
 		return
 	}
-	var compat *openai.ResponsesCompatibility
-	var wire map[string]any
-	if native {
-		wire = openai.PrepareNativeResponses(body)
-	} else {
-		var err error
-		wire, compat, err = openai.PrepareCompatibleResponses(body)
-		if err != nil {
-			timing.MarkPrepare(time.Since(prepareStarted))
-			writeResponsesRequestError(w, err)
-			return
-		}
+	planBody := body
+	if !native {
+		planBody = openai.PrepareResponsesReplayWithTenant(body, openai.DefaultToolReplay, tenantFromContext(r.Context()))
+	}
+	plan, err := inference.NewRequestPlan(inference.ProtocolResponses, planBody, options)
+	if err != nil {
+		timing.MarkPrepare(time.Since(prepareStarted))
+		s.writePlanError(w, inference.ProtocolResponses, err)
+		return
 	}
 	timing.MarkPrepare(time.Since(prepareStarted))
-	model := openai.String(body, "model", "")
-	affinity := requestAffinity(r, body)
-	convID := conversationID(affinity)
-	promptCacheKey := openai.String(body, "prompt_cache_key", "")
-	store, _ := wire["store"].(bool)
-	if !openai.IsStreaming(body) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
-		if err != nil {
-			s.writeClientError(w, err)
-			return
-		}
-		if native {
-			writeJSON(w, http.StatusOK, payload)
-		} else {
-			normalized := compat.NormalizeResponse(payload, model)
-			// Index tool calls so Alma can continue with previous_response_id
-			// / item_reference without re-sending the matching function_call.
-			openai.RememberCompletedResponseWithStore(openai.DefaultToolReplay, model, normalized, promptCacheKey, store)
-			writeJSON(w, http.StatusOK, normalized)
-		}
+	if !plan.Streaming() {
+		s.executeNonStreaming(w, r, body, plan, nil)
 		return
 	}
-	s.streamResponses(w, r, wire, affinity, convID, model, native, compat, promptCacheKey, store)
+	s.executeStreaming(w, r, body, plan, nil)
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
@@ -379,29 +425,18 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prepareStarted := time.Now()
-	prepared, err := anthropic.Prepare(body)
+	plan, err := inference.NewRequestPlan(inference.ProtocolMessages, body, inference.PlanOptions{Tenant: tenantFromContext(r.Context())})
 	if err != nil {
 		timing.MarkPrepare(time.Since(prepareStarted))
-		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		s.writePlanError(w, inference.ProtocolMessages, err)
 		return
 	}
 	timing.MarkPrepare(time.Since(prepareStarted))
-	for _, field := range prepared.Warnings {
-		slog.Warn("anthropic compatibility field stripped", "field", field, "path", r.URL.Path)
-	}
-	model := openai.String(body, "model", "")
-	affinity := requestAffinity(r, body)
-	convID := conversationID(affinity)
-	if !openai.IsStreaming(body) {
-		payload, err := s.client.DoJSON(r.Context(), http.MethodPost, "responses", prepared.Body, affinity, convID, fmt.Sprint(prepared.Body["model"]), true)
-		if err != nil {
-			s.writeAnthropicClientError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, anthropic.NormalizeResponseWithOptions(payload, model, prepared.Options))
+	if !plan.Streaming() {
+		s.executeNonStreaming(w, r, body, plan, nil)
 		return
 	}
-	s.streamAnthropic(w, r, prepared.Body, affinity, convID, model, prepared.Options)
+	s.executeStreaming(w, r, body, plan, nil)
 }
 
 func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string) {
@@ -532,6 +567,7 @@ type streamToolReplayState struct {
 	promptCacheKey string
 	responseID     string
 	store          bool
+	tenant         string
 	// items holds function/custom tool calls from output_item.done, ordered.
 	items []map[string]any
 }
@@ -570,7 +606,7 @@ func (s *streamToolReplayState) handle(event string, data []byte) {
 			// Do NOT write prev-resp here: done events often omit response_id
 			// and the session key is only committed on completed.
 			if id := openai.String(item, "id", ""); id != "" {
-				openai.RememberStreamToolCallWithStore(openai.DefaultToolReplay, s.model, item, "", "", s.store)
+				openai.RememberStreamToolCallWithStoreForTenant(openai.DefaultToolReplay, s.tenant, s.model, item, "", "", s.store)
 			}
 		}
 	case "response.completed":
@@ -594,7 +630,7 @@ func (s *streamToolReplayState) handle(event string, data []byte) {
 				response["output"] = patched
 			}
 		}
-		openai.RememberCompletedResponseWithStore(openai.DefaultToolReplay, s.model, response, s.promptCacheKey, s.store)
+		openai.RememberCompletedResponseWithStoreForTenant(openai.DefaultToolReplay, s.tenant, s.model, response, s.promptCacheKey, s.store)
 	}
 }
 
@@ -657,7 +693,7 @@ func (s *Server) proxyGET(path string, trace bool) http.HandlerFunc {
 func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(s.cfg.APIKeys) == 0 {
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(withTenant(r.Context(), s.pool.TenantID(""))))
 			return
 		}
 		candidate := strings.TrimSpace(r.Header.Get("api-key"))
@@ -680,7 +716,7 @@ func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 			}
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(withTenant(r.Context(), s.pool.TenantID(candidate))))
 	})
 }
 
@@ -1052,24 +1088,62 @@ func isGrokCLIClient(r *http.Request) bool {
 }
 
 func requestAffinity(r *http.Request, body map[string]any) auth.Affinity {
+	tenant := tenantFromContext(r.Context())
 	if value := openai.String(body, "previous_response_id", ""); value != "" {
-		return auth.Affinity{Key: "previous:" + value, Mode: auth.AffinityHard}
+		return auth.Affinity{Tenant: tenant, Key: "previous:" + value, Mode: auth.AffinityHard}
 	}
 	if value := strings.TrimSpace(r.Header.Get("X-Grok-Session-ID")); value != "" {
-		return auth.Affinity{Key: "session:" + value, Mode: auth.AffinityHard}
+		return auth.Affinity{Tenant: tenant, Key: "session:" + value, Mode: auth.AffinityHard}
 	}
+	if value := thinkingSignature(body); value != "" {
+		return auth.Affinity{Tenant: tenant, Key: "signature:" + value, Mode: auth.AffinityHard}
+	}
+	return requestSoftAffinity(r, body)
+}
+
+func requestSoftAffinity(r *http.Request, body map[string]any) auth.Affinity {
+	tenant := tenantFromContext(r.Context())
 	if value := openai.String(body, "prompt_cache_key", ""); value != "" {
-		return auth.Affinity{Key: "cache:" + value, Mode: auth.AffinitySoft}
+		return auth.Affinity{Tenant: tenant, Key: "cache:" + value, Mode: auth.AffinitySoft}
 	}
 	if value := openai.String(body, "user", ""); value != "" {
-		return auth.Affinity{Key: "user:" + value, Mode: auth.AffinitySoft}
+		return auth.Affinity{Tenant: tenant, Key: "user:" + value, Mode: auth.AffinitySoft}
 	}
 	if metadata, ok := body["metadata"].(map[string]any); ok {
 		if value := openai.String(metadata, "user_id", ""); value != "" {
-			return auth.Affinity{Key: "user:" + value, Mode: auth.AffinitySoft}
+			return auth.Affinity{Tenant: tenant, Key: "user:" + value, Mode: auth.AffinitySoft}
 		}
 	}
-	return auth.Affinity{}
+	return auth.Affinity{Tenant: tenant}
+}
+
+func thinkingSignature(body map[string]any) string {
+	messages, _ := body["messages"].([]any)
+	for _, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		content, _ := message["content"].([]any)
+		for _, rawBlock := range content {
+			block, _ := rawBlock.(map[string]any)
+			kind := openai.String(block, "type", "")
+			if kind != "thinking" && kind != "redacted_thinking" {
+				continue
+			}
+			if signature := openai.String(block, "signature", ""); signature != "" {
+				return signature
+			}
+		}
+	}
+	input, _ := body["input"].([]any)
+	for _, rawItem := range input {
+		item, _ := rawItem.(map[string]any)
+		if !strings.EqualFold(openai.String(item, "type", ""), "reasoning") {
+			continue
+		}
+		if encrypted := openai.String(item, "encrypted_content", ""); encrypted != "" {
+			return encrypted
+		}
+	}
+	return ""
 }
 
 func conversationID(affinity auth.Affinity) string {

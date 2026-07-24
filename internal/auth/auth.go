@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,12 +30,18 @@ var (
 )
 
 type Session struct {
-	Token      string   `json:"-"`
-	Surface    string   `json:"surface"`
-	UserID     string   `json:"user_id,omitempty"`
-	ObtainedAt float64  `json:"obtained_at"`
-	ExpiresAt  *float64 `json:"expires_at"`
+	Token         string   `json:"-"`
+	Surface       string   `json:"surface"`
+	UserID        string   `json:"user_id,omitempty"`
+	AuthMode      AuthMode `json:"auth_mode,omitempty"`
+	PrincipalType string   `json:"principal_type,omitempty"`
+	PrincipalID   string   `json:"principal_id,omitempty"`
+	OIDCIssuer    string   `json:"oidc_issuer,omitempty"`
+	ObtainedAt    float64  `json:"obtained_at"`
+	ExpiresAt     *float64 `json:"expires_at"`
 }
+
+func (s Session) IsAPIKey() bool { return s.AuthMode == AuthModeAPIKey }
 
 func (s Session) Expired() bool {
 	return s.ExpiresAt != nil && float64(time.Now().Unix()) >= *s.ExpiresAt-60
@@ -45,6 +52,17 @@ type RefreshError struct {
 	Status    int
 	Code      string
 }
+
+// AuthMode mirrors the provenance values persisted by Grok CLI. External and
+// Web Login credentials are intentionally consumption-only in this proxy.
+type AuthMode string
+
+const (
+	AuthModeOIDC     AuthMode = "oidc"
+	AuthModeAPIKey   AuthMode = "api_key"
+	AuthModeExternal AuthMode = "external"
+	AuthModeWebLogin AuthMode = "web_login"
+)
 
 type subscriptionTier struct {
 	Key     string
@@ -63,11 +81,19 @@ func (e *RefreshError) Error() string {
 type credential struct {
 	Path            string
 	Raw             map[string]any
+	Scope           string
+	ScopeKey        string
+	Scoped          bool
+	TokensWrapper   bool
 	AccessToken     string
 	RefreshToken    string
 	TokenURL        string
 	ClientID        string
 	Subject         string
+	AuthMode        AuthMode
+	PrincipalType   string
+	PrincipalID     string
+	OIDCIssuer      string
 	Surface         string
 	ExpiresAt       time.Time
 	ExpiresIn       time.Duration
@@ -77,14 +103,43 @@ type credential struct {
 }
 
 func loadCredential(path, surface string) (*credential, error) {
+	credentials, err := loadCredentials(path, surface)
+	if err != nil {
+		return nil, err
+	}
+	if len(credentials) == 0 {
+		return nil, fmt.Errorf("%w: no logical credentials", ErrInvalidCredential)
+	}
+	return credentials[0], nil
+}
+
+func loadCredentials(path, surface string) ([]*credential, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return parseCredential(b, path, surface)
+	return parseCredentials(b, path, surface)
 }
 
 func parseCredential(b []byte, path, surface string) (*credential, error) {
+	credentials, err := parseCredentials(b, path, surface)
+	if err != nil {
+		return nil, err
+	}
+	if len(credentials) == 0 {
+		return nil, fmt.Errorf("%w: no logical credentials", ErrInvalidCredential)
+	}
+	return credentials[0], nil
+}
+
+type credentialCandidate struct {
+	scope         string
+	node          map[string]any
+	scoped        bool
+	tokensWrapper bool
+}
+
+func parseCredentials(b []byte, path, surface string) ([]*credential, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidCredentialJSON, err)
@@ -92,25 +147,69 @@ func parseCredential(b []byte, path, surface string) (*credential, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("%w: credential must be a JSON object", ErrInvalidCredential)
 	}
-	node := credentialNode(raw)
+	candidates := credentialCandidates(raw)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("%w: credential has neither key nor refresh_token", ErrInvalidCredential)
+	}
+	result := make([]*credential, 0, len(candidates))
+	for _, candidate := range candidates {
+		cred, err := parseCredentialNode(raw, candidate, path, surface)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, cred)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("%w: no usable logical credentials", ErrInvalidCredential)
+	}
+	return result, nil
+}
+
+func parseCredentialNode(raw map[string]any, candidate credentialCandidate, path, surface string) (*credential, error) {
+	node := candidate.node
 	access := firstString(node, "access_token", "AccessToken", "key", "session_token", "SessionToken")
 	refresh := firstString(node, "refresh_token", "RefreshToken")
 	if access == "" && refresh == "" {
 		return nil, fmt.Errorf("%w: credential has neither access_token nor refresh_token", ErrInvalidCredential)
 	}
+	mode := parseAuthMode(firstString(node, "auth_mode", "authMode"))
+	if mode == "" {
+		switch {
+		case normalizeScope(candidate.scope) == "xai::api_key":
+			mode = AuthModeAPIKey
+		case refresh != "" || firstString(node, "oidc_issuer", "issuer") != "":
+			mode = AuthModeOIDC
+		default:
+			mode = AuthModeWebLogin
+		}
+	}
 	accessClaims := jwtClaims(access)
 	idClaims := jwtClaims(firstString(node, "id_token", "IDToken"))
-	subject := firstString(node, "sub", "user_id", "userId", "UserId")
+	subject := firstString(node, "user_id", "userId", "UserId", "sub")
 	if subject == "" {
 		subject = claimString(accessClaims, "sub")
 	}
 	if subject == "" {
 		subject = claimString(idClaims, "sub")
 	}
+	principalType := firstString(node, "principal_type", "principalType")
+	principalID := firstString(node, "principal_id", "principalId", "team_id", "teamId")
+	if principalID == "" {
+		principalID = claimString(accessClaims, "principal_id")
+	}
 	if subject == "" {
-		return nil, fmt.Errorf("%w: credential has no stable subject", ErrInvalidCredential)
+		subject = principalID
+	}
+	if subject == "" && mode == AuthModeAPIKey {
+		subject = "api-key:" + tokenIdentity(access)
+	}
+	if subject == "" {
+		return nil, fmt.Errorf("%w: credential has no stable principal", ErrInvalidCredential)
 	}
 	clientID := firstString(node, "client_id", "clientId")
+	if oidcClientID := firstString(node, "oidc_client_id", "oidcClientId"); oidcClientID != "" {
+		clientID = oidcClientID
+	}
 	if clientID == "" {
 		clientID = claimString(accessClaims, "client_id")
 	}
@@ -127,31 +226,103 @@ func parseCredential(b []byte, path, surface string) (*credential, error) {
 			expiresAt = refreshed.Add(expiresIn)
 		}
 	}
+	if expiresAt.IsZero() && mode != AuthModeAPIKey {
+		if created := firstTime(node, "create_time", "createTime"); !created.IsZero() {
+			expiresAt = created.Add(30 * 24 * time.Hour)
+		}
+	}
 	return &credential{
-		Path: path, Raw: raw, AccessToken: access, RefreshToken: refresh,
-		TokenURL: firstNonEmpty(firstString(node, "token_endpoint"), "https://auth.x.ai/oauth2/token"),
-		ClientID: clientID, Subject: subject, Surface: defaultSurface(surface),
-		ExpiresAt: expiresAt, ExpiresIn: expiresIn,
+		Path: path, Raw: cloneMap(raw), Scope: normalizeScope(candidate.scope), ScopeKey: candidate.scope, Scoped: candidate.scoped,
+		TokensWrapper: candidate.tokensWrapper, AccessToken: access, RefreshToken: refresh,
+		TokenURL: firstString(node, "token_endpoint", "tokenEndpoint"),
+		ClientID: clientID, Subject: subject, AuthMode: mode,
+		PrincipalType: principalType, PrincipalID: principalID,
+		OIDCIssuer: strings.TrimRight(firstString(node, "oidc_issuer", "oidcIssuer", "issuer"), "/"),
+		Surface:    defaultSurface(surface),
+		ExpiresAt:  expiresAt, ExpiresIn: expiresIn,
 		Models: stringSlice(node["models"]), ModelsUpdatedAt: firstTime(node, "models_updated_at"),
 		Tier: subscriptionTierFromClaims(accessClaims),
 	}, nil
 }
 
 func credentialNode(raw map[string]any) map[string]any {
-	if firstString(raw, "access_token", "refresh_token", "key") != "" {
-		return raw
-	}
-	if node, ok := raw["tokens"].(map[string]any); ok {
-		return node
-	}
-	for _, value := range raw {
-		if node, ok := value.(map[string]any); ok {
-			if firstString(node, "access_token", "refresh_token", "key") != "" {
-				return node
-			}
-		}
+	candidates := credentialCandidates(raw)
+	if len(candidates) > 0 {
+		return candidates[0].node
 	}
 	return raw
+}
+
+func credentialCandidates(raw map[string]any) []credentialCandidate {
+	if isCredentialNode(raw) {
+		return []credentialCandidate{{node: raw}}
+	}
+	if tokens, ok := raw["tokens"].(map[string]any); ok {
+		if isCredentialNode(tokens) {
+			return []credentialCandidate{{node: tokens, tokensWrapper: true}}
+		}
+		if candidates := scopedCandidates(tokens, true); len(candidates) > 0 {
+			return candidates
+		}
+	}
+	return scopedCandidates(raw, false)
+}
+
+func scopedCandidates(container map[string]any, wrapper bool) []credentialCandidate {
+	keys := make([]string, 0, len(container))
+	for scope, value := range container {
+		if node, ok := value.(map[string]any); ok && isCredentialNode(node) {
+			keys = append(keys, scope)
+		}
+	}
+	sort.Strings(keys)
+	result := make([]credentialCandidate, 0, len(keys))
+	for _, scope := range keys {
+		result = append(result, credentialCandidate{
+			scope: scope, node: container[scope].(map[string]any), scoped: true, tokensWrapper: wrapper,
+		})
+	}
+	return result
+}
+
+func isCredentialNode(node map[string]any) bool {
+	return firstString(node, "access_token", "AccessToken", "refresh_token", "RefreshToken", "key", "session_token", "SessionToken") != ""
+}
+
+func parseAuthMode(value string) AuthMode {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "oidc":
+		return AuthModeOIDC
+	case "api_key", "apikey", "api-key":
+		return AuthModeAPIKey
+	case "external":
+		return AuthModeExternal
+	case "web_login", "weblogin", "grok":
+		return AuthModeWebLogin
+	default:
+		return ""
+	}
+}
+
+func normalizeScope(scope string) string {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(scope); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		parsed.Host = strings.ToLower(parsed.Host)
+		parsed.Fragment = ""
+		parsed.RawQuery = ""
+		parsed.Path = strings.TrimRight(parsed.Path, "/")
+		return parsed.String()
+	}
+	return strings.ToLower(strings.TrimRight(scope, "/"))
+}
+
+func tokenIdentity(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:12])
 }
 
 func (c *credential) session() Session {
@@ -160,10 +331,20 @@ func (c *credential) session() Session {
 		v := float64(c.ExpiresAt.UnixNano()) / 1e9
 		expires = &v
 	}
-	return Session{Token: c.AccessToken, Surface: c.Surface, UserID: c.Subject, ObtainedAt: float64(time.Now().UnixNano()) / 1e9, ExpiresAt: expires}
+	return Session{
+		Token: c.AccessToken, Surface: c.Surface, UserID: c.Subject, AuthMode: c.AuthMode,
+		PrincipalType: c.PrincipalType, PrincipalID: c.PrincipalID, OIDCIssuer: c.OIDCIssuer,
+		ObtainedAt: float64(time.Now().UnixNano()) / 1e9, ExpiresAt: expires,
+	}
 }
 
 func (c *credential) needsRefresh(now time.Time, jitter time.Duration) bool {
+	if c.AuthMode == AuthModeAPIKey {
+		return false
+	}
+	if (c.AuthMode == AuthModeExternal || c.AuthMode == AuthModeWebLogin) && c.ExpiresAt.IsZero() {
+		return true
+	}
 	if c.AccessToken == "" {
 		return true
 	}
@@ -177,6 +358,9 @@ func (c *credential) usable(now time.Time) bool {
 	if c.AccessToken == "" {
 		return false
 	}
+	if (c.AuthMode == AuthModeExternal || c.AuthMode == AuthModeWebLogin) && c.ExpiresAt.IsZero() {
+		return false
+	}
 	if c.ExpiresAt.IsZero() {
 		return true
 	}
@@ -184,81 +368,265 @@ func (c *credential) usable(now time.Time) bool {
 }
 
 func (c *credential) refresh(ctx context.Context, client *http.Client) (*credential, error) {
+	if c.AuthMode != AuthModeOIDC {
+		return nil, &RefreshError{Code: "credential_not_refreshable"}
+	}
 	if c.RefreshToken == "" || c.ClientID == "" {
-		return nil, &RefreshError{Permanent: true, Code: "missing_refresh_metadata"}
+		return nil, &RefreshError{Code: "missing_refresh_metadata"}
 	}
-	u, err := url.Parse(c.TokenURL)
-	if err != nil || !allowedTokenEndpoint(u) {
-		return nil, &RefreshError{Permanent: true, Code: "invalid_token_endpoint"}
-	}
-	form := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {c.RefreshToken},
-		"client_id":     {c.ClientID},
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(form.Encode()))
+	lock, err := acquireAuthFileLock(ctx, c.Path)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
+	defer lock.Close()
+
+	// Re-read while holding the cross-process lock. A sibling may already have
+	// rotated the token family; adopt its usable token rather than spending the
+	// newly written refresh token a second time.
+	source := c
+	if disk, diskErr := loadMatchingCredential(c.Path, c.Surface, c); diskErr == nil {
+		if disk.usable(time.Now()) && (disk.AccessToken != c.AccessToken || disk.RefreshToken != c.RefreshToken || disk.ExpiresAt.After(c.ExpiresAt)) {
+			return disk, nil
+		}
+		source = disk
+	}
+	if source.RefreshToken == "" || source.ClientID == "" {
+		return nil, &RefreshError{Code: "missing_refresh_metadata"}
+	}
+	endpoint, err := resolveTokenEndpoint(ctx, client, source)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	payload, status, err := exchangeRefreshToken(ctx, client, endpoint, source)
 	if err != nil {
 		return nil, err
-	}
-	var payload map[string]any
-	_ = json.Unmarshal(b, &payload)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		code := firstString(payload, "error", "code")
-		return nil, &RefreshError{Permanent: resp.StatusCode == 400 || resp.StatusCode == 401, Status: resp.StatusCode, Code: code}
 	}
 	access := firstString(payload, "access_token")
 	if access == "" {
-		return nil, &RefreshError{Permanent: true, Status: resp.StatusCode, Code: "missing_access_token"}
+		return nil, &RefreshError{Status: status, Code: "missing_access_token"}
 	}
-	next := *c
-	next.Raw = cloneMap(c.Raw)
-	node := credentialNode(next.Raw)
-	node["access_token"] = access
+
+	next := *source
+	next.Raw = cloneMap(source.Raw)
+	node := credentialNodeFor(next.Raw, source)
+	if node == nil {
+		return nil, fmt.Errorf("%w: target scope disappeared during refresh", ErrInvalidCredential)
+	}
+	// CLI 0.2.102 persists the access token as key. Keep an existing legacy
+	// access_token alias synchronized so old files remain readable by old builds.
+	node["key"] = access
+	if _, legacyAlias := node["access_token"]; legacyAlias || !source.Scoped {
+		node["access_token"] = access
+	}
 	next.AccessToken = access
 	next.Tier = subscriptionTierFromClaims(jwtClaims(access))
 	if refresh := firstString(payload, "refresh_token"); refresh != "" {
 		node["refresh_token"] = refresh
-		next.RefreshToken = refresh
 	}
 	if idToken := firstString(payload, "id_token"); idToken != "" {
 		node["id_token"] = idToken
 	}
 	expiresSeconds := number(payload["expires_in"])
 	if expiresSeconds <= 0 {
-		expiresSeconds = int64(c.ExpiresIn / time.Second)
+		expiresSeconds = int64(source.ExpiresIn / time.Second)
 	}
 	if expiresSeconds <= 0 {
 		expiresSeconds = 21600
 	}
 	now := time.Now().UTC()
-	next.ExpiresIn = time.Duration(expiresSeconds) * time.Second
-	next.ExpiresAt = now.Add(next.ExpiresIn)
+	expiresAt := now.Add(time.Duration(expiresSeconds) * time.Second)
 	node["expires_in"] = expiresSeconds
-	node["last_refresh"] = now.Format(time.RFC3339Nano)
-	node["expired"] = next.ExpiresAt.Format(time.RFC3339Nano)
-	if err := writeCredentialAtomic(c.Path, next.Raw); err != nil {
+	node["expires_at"] = expiresAt.Format(time.RFC3339Nano)
+	node["create_time"] = now.Format(time.RFC3339Nano)
+	if _, legacyExpiry := node["expired"]; legacyExpiry || !source.Scoped {
+		node["expired"] = expiresAt.Format(time.RFC3339Nano)
+		node["last_refresh"] = now.Format(time.RFC3339Nano)
+	}
+	if err := writeCredentialAtomicMode(c.Path, next.Raw, 0o600); err != nil {
 		return nil, err
 	}
-	return &next, nil
+	return loadMatchingCredential(c.Path, c.Surface, source)
+}
+
+func loadMatchingCredential(path, surface string, target *credential) (*credential, error) {
+	credentials, err := loadCredentials(path, surface)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range credentials {
+		if target.Scoped {
+			if candidate.Scoped && candidate.Scope == target.Scope && candidate.AuthMode == target.AuthMode && candidate.PrincipalID == target.PrincipalID {
+				return candidate, nil
+			}
+			continue
+		}
+		if !candidate.Scoped && candidate.Subject == target.Subject {
+			return candidate, nil
+		}
+	}
+	return nil, ErrCredentialNotFound
+}
+
+func credentialNodeFor(raw map[string]any, target *credential) map[string]any {
+	if !target.Scoped {
+		if target.TokensWrapper {
+			node, _ := raw["tokens"].(map[string]any)
+			return node
+		}
+		return raw
+	}
+	container := raw
+	if target.TokensWrapper {
+		container, _ = raw["tokens"].(map[string]any)
+	}
+	if container == nil {
+		return nil
+	}
+	if node, ok := container[target.ScopeKey].(map[string]any); ok {
+		return node
+	}
+	for scope, value := range container {
+		if normalizeScope(scope) == target.Scope {
+			node, _ := value.(map[string]any)
+			return node
+		}
+	}
+	return nil
+}
+
+type discoveryEntry struct {
+	endpoint string
+	at       time.Time
+}
+
+var discoveryCache = struct {
+	sync.RWMutex
+	entries map[string]discoveryEntry
+}{entries: make(map[string]discoveryEntry)}
+
+func resolveTokenEndpoint(ctx context.Context, client *http.Client, c *credential) (string, error) {
+	if c.TokenURL != "" {
+		parsed, err := url.Parse(c.TokenURL)
+		if err != nil || !allowedTokenEndpoint(parsed) {
+			return "", &RefreshError{Code: "invalid_token_endpoint"}
+		}
+		return parsed.String(), nil
+	}
+	issuer := strings.TrimRight(c.OIDCIssuer, "/")
+	if issuer == "" {
+		issuer = "https://auth.x.ai"
+	}
+	discoveryCache.RLock()
+	cached, ok := discoveryCache.entries[issuer]
+	discoveryCache.RUnlock()
+	if ok && time.Since(cached.at) < time.Hour {
+		return cached.endpoint, nil
+	}
+	discoveryURL := issuer + "/.well-known/openid-configuration"
+	parsed, err := url.Parse(discoveryURL)
+	if err != nil || !allowedTokenEndpoint(parsed) {
+		return "", &RefreshError{Code: "invalid_oidc_issuer"}
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+		if reqErr != nil {
+			return "", reqErr
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, requestErr := client.Do(req)
+		if requestErr == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				var document map[string]any
+				if json.Unmarshal(body, &document) == nil {
+					endpoint := firstString(document, "token_endpoint")
+					endpointURL, parseErr := url.Parse(endpoint)
+					if endpoint != "" && parseErr == nil && allowedTokenEndpoint(endpointURL) {
+						discoveryCache.Lock()
+						discoveryCache.entries[issuer] = discoveryEntry{endpoint: endpoint, at: time.Now()}
+						discoveryCache.Unlock()
+						return endpoint, nil
+					}
+				}
+			}
+			lastErr = &RefreshError{Status: resp.StatusCode, Code: "oidc_discovery_failed"}
+		} else {
+			lastErr = requestErr
+		}
+		if attempt == 0 && !waitRetry(ctx, 100*time.Millisecond) {
+			return "", ctx.Err()
+		}
+	}
+	return "", lastErr
+}
+
+func exchangeRefreshToken(ctx context.Context, client *http.Client, endpoint string, c *credential) (map[string]any, int, error) {
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {c.RefreshToken},
+		"client_id":     {c.ClientID},
+	}
+	if c.PrincipalType != "" {
+		form.Set("principal_type", c.PrincipalType)
+	}
+	if c.PrincipalID != "" {
+		form.Set("principal_id", c.PrincipalID)
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, 0, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		resp, requestErr := client.Do(req)
+		if requestErr == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if readErr != nil {
+				lastErr = readErr
+			} else {
+				payload := map[string]any{}
+				_ = json.Unmarshal(body, &payload)
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					return payload, resp.StatusCode, nil
+				}
+				code := strings.ToLower(firstString(payload, "error", "code"))
+				refreshErr := &RefreshError{
+					Permanent: code == "invalid_grant" || code == "invalid_client",
+					Status:    resp.StatusCode, Code: code,
+				}
+				if refreshErr.Permanent {
+					return nil, resp.StatusCode, refreshErr
+				}
+				lastErr = refreshErr
+			}
+		} else {
+			lastErr = requestErr
+		}
+		if attempt < 2 && !waitRetry(ctx, time.Duration(attempt+1)*100*time.Millisecond) {
+			return nil, 0, ctx.Err()
+		}
+	}
+	return nil, 0, lastErr
+}
+
+func waitRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func writeCredentialAtomic(path string, raw map[string]any) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	return writeCredentialAtomicMode(path, raw, info.Mode().Perm())
+	return writeCredentialAtomicMode(path, raw, 0o600)
 }
 
 func writeCredentialAtomicMode(path string, raw map[string]any, mode os.FileMode) error {
@@ -307,6 +675,19 @@ func allowedTokenEndpoint(u *url.URL) bool {
 
 func accountID(subject string) string {
 	sum := sha256.Sum256([]byte(subject))
+	return hex.EncodeToString(sum[:12])
+}
+
+func (c *credential) accountID() string {
+	if !c.Scoped {
+		return accountID(c.Subject)
+	}
+	principal := c.PrincipalID
+	if principal == "" {
+		principal = c.Subject
+	}
+	canonical := c.Scope + "\x00" + string(c.AuthMode) + "\x00" + strings.ToLower(c.PrincipalType) + "\x00" + principal
+	sum := sha256.Sum256([]byte(canonical))
 	return hex.EncodeToString(sum[:12])
 }
 
@@ -531,7 +912,7 @@ func cloneMap(raw map[string]any) map[string]any {
 
 func defaultSurface(v string) string {
 	if v == "" {
-		return "tui"
+		return "headless"
 	}
 	return v
 }

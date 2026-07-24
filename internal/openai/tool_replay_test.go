@@ -9,6 +9,77 @@ import (
 	"time"
 )
 
+func TestToolReplayCacheIsTenantIsolated(t *testing.T) {
+	cache := NewToolReplayCache(time.Hour, 16)
+	items := []map[string]any{{
+		"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": `{}`,
+	}}
+	cache.WithTenant("tenant-a").Put("grok", "item:fc_1", items)
+	if got := cache.WithTenant("tenant-a").Get("grok", "item:fc_1"); len(got) != 1 {
+		t.Fatalf("tenant-a got %#v", got)
+	}
+	if got := cache.WithTenant("tenant-b").Get("grok", "item:fc_1"); len(got) != 0 {
+		t.Fatalf("tenant-b crossed namespace: %#v", got)
+	}
+	if got := cache.Get("grok", "item:fc_1"); len(got) != 0 {
+		t.Fatalf("legacy public namespace crossed tenant: %#v", got)
+	}
+}
+
+func TestToolReplayCacheEnforcesTotalByteBudget(t *testing.T) {
+	cache := NewToolReplayCacheWithByteBudget(time.Hour, 16, 256)
+	large := []map[string]any{{
+		"type": "function_call", "call_id": "call-large", "name": "lookup",
+		"arguments": strings.Repeat("x", 512),
+	}}
+	cache.Put("grok", "large", large)
+	if got := cache.Get("grok", "large"); len(got) != 0 {
+		t.Fatalf("oversized replay entry was retained: %#v", got)
+	}
+}
+
+func TestPrepareResponsesReplayOnlyRestoresStatelessCalls(t *testing.T) {
+	cache := NewToolReplayCache(time.Hour, 16)
+	RememberCompletedResponseWithStoreForTenant(cache, "tenant-a", "grok", map[string]any{
+		"id": "resp_1", "output": []any{map[string]any{
+			"type": "function_call", "id": "fc_1", "call_id": "call_1",
+			"name": "lookup", "arguments": `{}`,
+		}},
+	}, "", false)
+	body := map[string]any{
+		"model": "grok", "previous_response_id": "resp_1", "store": false,
+		"input": []any{
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+			map[string]any{"type": "mcp_tool_call_output", "call_id": "mcp_1", "output": map[string]any{"secret": true}},
+		},
+	}
+	got := PrepareResponsesReplayWithTenant(body, cache, "tenant-a")
+	if _, exists := got["previous_response_id"]; exists {
+		t.Fatalf("stateless previous_response_id leaked: %#v", got)
+	}
+	input := got["input"].([]any)
+	if len(input) != 3 || String(input[0].(map[string]any), "type", "") != "function_call" {
+		t.Fatalf("tool call was not restored before its output: %#v", input)
+	}
+	if String(input[2].(map[string]any), "type", "") != "mcp_tool_call_output" {
+		t.Fatalf("replay layer rewrote unsupported content before rendering: %#v", input)
+	}
+}
+
+func TestPrepareResponsesReplayMissDropsStoreFalseStateHandle(t *testing.T) {
+	body := map[string]any{
+		"model": "grok", "previous_response_id": "resp_lost", "store": false,
+		"input": []any{map[string]any{"type": "function_call_output", "call_id": "lost", "output": "x"}},
+	}
+	got := PrepareResponsesReplayWithTenant(body, NewToolReplayCache(time.Hour, 16), "tenant-a")
+	if _, exists := got["previous_response_id"]; exists {
+		t.Fatalf("lost store:false state was forwarded: %#v", got)
+	}
+	if body["previous_response_id"] != "resp_lost" {
+		t.Fatalf("input body was mutated: %#v", body)
+	}
+}
+
 func TestToolReplayRestoresCallsFromPreviousResponseID(t *testing.T) {
 	cache := NewToolReplayCache(0, 0)
 	RememberCompletedResponse(cache, "grok-4.5", map[string]any{
