@@ -26,7 +26,7 @@ import {
   type CredentialDTO,
 } from "@/features/accounts/accounts-api";
 
-export const credentialsQueryKey = ["credentials"] as const;
+const credentialsQueryKey = ["credentials"] as const;
 
 // 预计算搜索索引：一次小写化，避免每次击键对 1 万项重复 toLowerCase。
 type IndexedCredential = CredentialDTO & { __search: string };
@@ -153,8 +153,8 @@ export function AccountsPage() {
 
   const usableCount = useMemo(() => (query.data ?? []).reduce((acc, item) => acc + (item.usable ? 1 : 0), 0), [query.data]);
 
-  // 行渲染用 now 快照，避免每行 new Date()。
-  const nowMs = useMemo(() => Date.now(), [query.dataUpdatedAt]);
+  // 行渲染用 now 快照，避免每行 new Date()；每次数据刷新后取一次即可。
+  const [nowMs] = useState(() => Date.now());
 
   function statusLabel(status: string): string {
     switch (status) {
