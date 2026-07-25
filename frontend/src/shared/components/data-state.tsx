@@ -15,11 +15,14 @@ export function LoadingState({ className }: { className?: string }) {
 }
 
 export function TableLoadingRow({ colSpan }: { colSpan: number }) {
+  // 骨架行：与真实行等高，避免 1 万账号首屏长时间空白感知。
   return (
     <TableRow className="hover:bg-transparent">
-      <TableCell colSpan={colSpan} className="p-0">
-        <LoadingState className="min-h-40" />
-      </TableCell>
+      {Array.from({ length: colSpan }).map((_, i) => (
+        <TableCell key={i}>
+          <div className="h-4 w-3/4 animate-pulse rounded bg-muted" />
+        </TableCell>
+      ))}
     </TableRow>
   );
 }

@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -25,7 +25,7 @@ export function ModelsPage() {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebouncedValue(search, 300);
 
-  const query = useQuery({ queryKey: ["credentials"], queryFn: listCredentials, refetchInterval: 60_000 });
+  const query = useQuery({ queryKey: ["credentials"], queryFn: listCredentials, refetchInterval: 60_000, placeholderData: keepPreviousData });
 
   const models = useMemo<ModelRow[]>(() => {
     const byModel = new Map<string, ModelRow>();

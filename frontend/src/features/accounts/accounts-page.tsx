@@ -1,5 +1,5 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FileUp, RefreshCw, Search, Trash2, Upload } from "lucide-react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FileUp, RefreshCw, Search, Trash2, Upload, X } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -26,7 +26,17 @@ import {
   type CredentialDTO,
 } from "@/features/accounts/accounts-api";
 
-const queryKey = ["credentials"] as const;
+export const credentialsQueryKey = ["credentials"] as const;
+
+// 预计算搜索索引：一次小写化，避免每次击键对 1 万项重复 toLowerCase。
+type IndexedCredential = CredentialDTO & { __search: string };
+
+function buildIndex(items: CredentialDTO[]): IndexedCredential[] {
+  return items.map((item) => ({
+    ...item,
+    __search: [item.id, item.scope ?? "", item.subscriptionTierDisplay ?? "", ...item.models].join("\n").toLowerCase(),
+  }));
+}
 
 function statusVariant(status: string): "default" | "secondary" | "destructive" | "outline" {
   switch (status) {
@@ -41,6 +51,16 @@ function statusVariant(status: string): "default" | "secondary" | "destructive" 
     default:
       return "outline";
   }
+}
+
+function StatusDot({ status }: { status: string }) {
+  const color =
+    status === "ready"
+      ? "bg-emerald-500"
+      : status === "cooling_down" || status === "pending_models"
+        ? "bg-amber-500"
+        : "bg-red-500";
+  return <span className={`inline-block size-1.5 rounded-full ${color}`} aria-hidden="true" />;
 }
 
 function BillingCell({ credential }: { credential: CredentialDTO }) {
@@ -77,10 +97,15 @@ export function AccountsPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const query = useQuery({
-    queryKey,
+    queryKey: credentialsQueryKey,
     queryFn: listCredentials,
     refetchInterval: 60_000,
+    // 关键：refetch 期间保留旧数据，避免 1 万行表格闪烁。
+    placeholderData: keepPreviousData,
   });
+
+  // 数据到达后构建一次搜索索引（仅当 data 引用变化时重算）。
+  const indexed = useMemo(() => buildIndex(query.data ?? []), [query.data]);
 
   const uploadMutation = useMutation({
     mutationFn: async (input: { json?: string; file?: File }) => {
@@ -91,7 +116,7 @@ export function AccountsPage() {
       toast.success(t("credentials.uploaded", { status: result.modelDiscovery }));
       setUploadOpen(false);
       setPasteValue("");
-      void queryClient.invalidateQueries({ queryKey });
+      void queryClient.invalidateQueries({ queryKey: credentialsQueryKey });
     },
     onError: (error) => {
       toast.error(error instanceof ApiError ? error.message : t("credentials.uploadFailed"));
@@ -100,29 +125,36 @@ export function AccountsPage() {
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteCredential(id),
+    // 乐观更新：先从缓存移除，失败时回滚，避免 3.5s 全量 refetch。
+    onMutate: async (id) => {
+      setDeleteTarget(null);
+      await queryClient.cancelQueries({ queryKey: credentialsQueryKey });
+      const previous = queryClient.getQueryData<CredentialDTO[]>(credentialsQueryKey);
+      queryClient.setQueryData<CredentialDTO[]>(credentialsQueryKey, (old) => old?.filter((item) => item.id !== id));
+      return { previous };
+    },
     onSuccess: () => {
       toast.success(t("credentials.deleted"));
-      setDeleteTarget(null);
-      void queryClient.invalidateQueries({ queryKey });
     },
-    onError: (error) => {
+    onError: (error, _id, context) => {
+      if (context?.previous) queryClient.setQueryData(credentialsQueryKey, context.previous);
       toast.error(error instanceof ApiError ? error.message : t("errors.generic"));
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: credentialsQueryKey });
     },
   });
 
   const filtered = useMemo(() => {
-    const items = query.data ?? [];
     const needle = debouncedSearch.trim().toLowerCase();
-    if (!needle) return items;
-    return items.filter((item) => {
-      if (item.id.toLowerCase().includes(needle)) return true;
-      if (item.scope?.toLowerCase().includes(needle)) return true;
-      if (item.subscriptionTierDisplay?.toLowerCase().includes(needle)) return true;
-      return item.models.some((model) => model.toLowerCase().includes(needle));
-    });
-  }, [query.data, debouncedSearch]);
+    if (!needle) return indexed;
+    return indexed.filter((item) => item.__search.includes(needle));
+  }, [indexed, debouncedSearch]);
 
-  const usableCount = useMemo(() => (query.data ?? []).filter((item) => item.usable).length, [query.data]);
+  const usableCount = useMemo(() => (query.data ?? []).reduce((acc, item) => acc + (item.usable ? 1 : 0), 0), [query.data]);
+
+  // 行渲染用 now 快照，避免每行 new Date()。
+  const nowMs = useMemo(() => Date.now(), [query.dataUpdatedAt]);
 
   function statusLabel(status: string): string {
     switch (status) {
@@ -141,6 +173,8 @@ export function AccountsPage() {
     }
   }
 
+  const isSearching = debouncedSearch.trim().length > 0;
+
   return (
     <>
       <DataTableShell
@@ -150,17 +184,28 @@ export function AccountsPage() {
               <div className="relative w-full max-w-sm">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
-                  className="h-9 pl-9"
+                  className="h-9 pl-9 pr-8"
                   placeholder={t("credentials.search")}
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
                 />
+                {search ? (
+                  <button
+                    type="button"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    onClick={() => setSearch("")}
+                    aria-label={t("common.clearFilters")}
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                ) : null}
               </div>
               {query.data ? (
                 <span className="shrink-0 text-xs text-muted-foreground">
                   {t("credentials.total", { count: formatNumber(query.data.length) })}
                   {" · "}
                   {t("credentials.usableCount", { count: formatNumber(usableCount) })}
+                  {isSearching ? ` · ${formatNumber(filtered.length)}` : ""}
                 </span>
               ) : null}
             </div>
@@ -194,13 +239,15 @@ export function AccountsPage() {
             </TableHeader>
             {query.isLoading ? (
               <TableBody>
-                <TableLoadingRow colSpan={7} />
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <TableLoadingRow key={i} colSpan={7} />
+                ))}
               </TableBody>
             ) : filtered.length === 0 ? (
               <TableBody>
                 <TableRow>
                   <TableCell colSpan={7}>
-                    <EmptyState />
+                    <EmptyState message={isSearching ? t("credentials.noSearchResult") : t("credentials.empty")} />
                   </TableCell>
                 </TableRow>
               </TableBody>
@@ -220,7 +267,10 @@ export function AccountsPage() {
                       </Tooltip>
                     </TableCell>
                     <TableCell>
-                      <Badge variant={statusVariant(item.status)}>{statusLabel(item.status)}</Badge>
+                      <div className="flex items-center gap-2">
+                        <StatusDot status={item.status} />
+                        <Badge variant={statusVariant(item.status)}>{statusLabel(item.status)}</Badge>
+                      </div>
                     </TableCell>
                     <TableCell>
                       {item.subscriptionTierDisplay ? (
@@ -237,7 +287,7 @@ export function AccountsPage() {
                     </TableCell>
                     <TableCell>
                       <span className="text-xs text-muted-foreground">
-                        {item.cooldownUntil && new Date(item.cooldownUntil) > new Date()
+                        {item.cooldownUntil && new Date(item.cooldownUntil).getTime() > nowMs
                           ? formatDateTime(item.cooldownUntil)
                           : item.expiresAt
                             ? formatDateTime(item.expiresAt)
@@ -302,13 +352,13 @@ export function AccountsPage() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleteMutation.isPending}>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget.id)}
               disabled={deleteMutation.isPending}
             >
-              {t("common.confirm")}
+              {deleteMutation.isPending ? t("common.deleting") : t("common.confirm")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
