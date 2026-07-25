@@ -242,7 +242,13 @@ const (
 
 func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": s.pool.Credentials()})
+		filter, err := parseAdminCredentialListFilter(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_parameter")
+			return
+		}
+		page := listCredentials(s.pool.Credentials(), filter)
+		writeJSON(w, http.StatusOK, newAdminCredentialListResponse(page, filter.Limit > 0))
 		return
 	}
 	raw, status, err := readCredentialUpload(w, r)
