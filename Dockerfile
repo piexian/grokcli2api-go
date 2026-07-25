@@ -1,4 +1,4 @@
-FROM node:24-alpine AS web-build
+FROM node:24-slim AS web-build
 WORKDIR /src/frontend
 COPY frontend/ ./
 RUN corepack enable && \
