@@ -1057,6 +1057,56 @@ func remoteCredentialJSON(t *testing.T, subject, token string, models []string) 
 	return b
 }
 
+func TestCredentialSnapshotReusesAndInvalidatesGeneration(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModels(t, dir, "first.json", "snapshot-first", "token-first", time.Now().Add(time.Hour), "", []string{"grok-4"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+
+	initialGeneration, initial := pool.CredentialSnapshot()
+	reusedGeneration, reused := pool.CredentialSnapshot()
+	if initialGeneration == 0 || reusedGeneration != initialGeneration || len(initial) != 1 || len(reused) != 1 {
+		t.Fatalf("initial snapshots = generation %d/%d, lengths %d/%d", initialGeneration, reusedGeneration, len(initial), len(reused))
+	}
+	if &initial[0] != &reused[0] {
+		t.Fatal("unchanged generation did not reuse the immutable snapshot")
+	}
+
+	writeTestCredentialModels(t, dir, "first.json", "snapshot-first", "token-reloaded", time.Now().Add(time.Hour), "", []string{"grok-3-mini"})
+	if err := pool.scan(); err != nil {
+		t.Fatal(err)
+	}
+	reloadedGeneration, reloaded := pool.CredentialSnapshot()
+	if reloadedGeneration <= initialGeneration || len(reloaded) != 1 || !slices.Equal(reloaded[0].Models, []string{"grok-3-mini"}) {
+		t.Fatalf("reloaded snapshot = generation %d, value %#v", reloadedGeneration, reloaded)
+	}
+
+	if _, _, err := pool.ImportCredential(context.Background(), remoteCredentialJSON(t, "snapshot-first", "token-updated", []string{"grok-3"})); err != nil {
+		t.Fatal(err)
+	}
+	updatedGeneration, updated := pool.CredentialSnapshot()
+	if updatedGeneration <= reloadedGeneration || len(updated) != 1 || !slices.Equal(updated[0].Models, []string{"grok-3"}) {
+		t.Fatalf("updated snapshot = generation %d, value %#v", updatedGeneration, updated)
+	}
+
+	added, _, err := pool.ImportCredential(context.Background(), remoteCredentialJSON(t, "snapshot-second", "token-second", []string{"grok-4"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addedGeneration, afterAdd := pool.CredentialSnapshot()
+	if addedGeneration <= updatedGeneration || len(afterAdd) != 2 {
+		t.Fatalf("added snapshot = generation %d, length %d", addedGeneration, len(afterAdd))
+	}
+
+	if err := pool.DeleteCredential(context.Background(), added.ID); err != nil {
+		t.Fatal(err)
+	}
+	deletedGeneration, afterDelete := pool.CredentialSnapshot()
+	if deletedGeneration <= addedGeneration || len(afterDelete) != 1 {
+		t.Fatalf("deleted snapshot = generation %d, length %d", deletedGeneration, len(afterDelete))
+	}
+}
+
 func BenchmarkPoolAcquireTenThousandAccounts(b *testing.B) {
 	p := &Pool{
 		accounts: map[string]*account{}, states: map[string]accountState{},

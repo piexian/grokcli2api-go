@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -14,11 +15,16 @@ import (
 const maxAdminCredentialsPageSize = 1000
 
 type adminCredentialListFilter struct {
-	Limit    int
-	CursorID string
-	Query    string
-	Status   string
-	Usable   *bool
+	Limit  int
+	Cursor credentialCursor
+	Query  string
+	Status string
+	Usable *bool
+}
+
+type credentialCursor struct {
+	Generation uint64 `json:"generation"`
+	ID         string `json:"id"`
 }
 
 type credentialListPage struct {
@@ -52,11 +58,11 @@ func parseAdminCredentialListFilter(r *http.Request) (adminCredentialListFilter,
 		if filter.Limit == 0 {
 			return adminCredentialListFilter{}, errors.New("cursor requires a positive limit")
 		}
-		cursorID, err := decodeCredentialCursor(raw)
+		cursor, err := decodeCredentialCursor(raw)
 		if err != nil {
 			return adminCredentialListFilter{}, errors.New("invalid credential cursor")
 		}
-		filter.CursorID = cursorID
+		filter.Cursor = cursor
 	}
 
 	filter.Status = strings.ToLower(strings.TrimSpace(query.Get("status")))
@@ -82,10 +88,9 @@ func parseAdminCredentialListFilter(r *http.Request) (adminCredentialListFilter,
 	return filter, nil
 }
 
-func listCredentials(credentials []auth.CredentialInfo, filter adminCredentialListFilter) credentialListPage {
-	if !sort.SliceIsSorted(credentials, func(i, j int) bool { return credentials[i].ID < credentials[j].ID }) {
-		credentials = append([]auth.CredentialInfo(nil), credentials...)
-		sort.Slice(credentials, func(i, j int) bool { return credentials[i].ID < credentials[j].ID })
+func listCredentials(credentials []auth.CredentialInfo, generation uint64, filter adminCredentialListFilter) credentialListPage {
+	if filter.Query == "" && filter.Status == "" && filter.Usable == nil {
+		return unfilteredCredentialPage(credentials, generation, filter)
 	}
 
 	capacity := len(credentials)
@@ -99,7 +104,9 @@ func listCredentials(credentials []auth.CredentialInfo, filter adminCredentialLi
 			continue
 		}
 		page.Total++
-		if filter.CursorID != "" && credential.ID <= filter.CursorID {
+		// A cursor from an older generation intentionally degrades to applying its
+		// ID boundary to the current snapshot instead of failing the request.
+		if filter.Cursor.ID != "" && credential.ID <= filter.Cursor.ID {
 			continue
 		}
 		if filter.Limit == 0 || len(page.Data) < filter.Limit+1 {
@@ -110,7 +117,26 @@ func listCredentials(credentials []auth.CredentialInfo, filter adminCredentialLi
 	if filter.Limit > 0 && len(page.Data) > filter.Limit {
 		page.HasMore = true
 		page.Data = page.Data[:filter.Limit]
-		page.NextCursor = encodeCredentialCursor(page.Data[len(page.Data)-1].ID)
+		page.NextCursor = encodeCredentialCursor(credentialCursor{Generation: generation, ID: page.Data[len(page.Data)-1].ID})
+	}
+	return page
+}
+
+func unfilteredCredentialPage(credentials []auth.CredentialInfo, generation uint64, filter adminCredentialListFilter) credentialListPage {
+	page := credentialListPage{Total: len(credentials)}
+	start := 0
+	if filter.Cursor.ID != "" {
+		start = sort.Search(len(credentials), func(index int) bool { return credentials[index].ID > filter.Cursor.ID })
+	}
+	if filter.Limit == 0 {
+		page.Data = credentials[start:]
+		return page
+	}
+	end := min(start+filter.Limit, len(credentials))
+	page.Data = credentials[start:end]
+	if end < len(credentials) {
+		page.HasMore = true
+		page.NextCursor = encodeCredentialCursor(credentialCursor{Generation: generation, ID: page.Data[len(page.Data)-1].ID})
 	}
 	return page
 }
@@ -142,19 +168,24 @@ func normalizeCredentialQuery(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
-func encodeCredentialCursor(id string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(id))
+func encodeCredentialCursor(cursor credentialCursor) string {
+	payload, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(payload)
 }
 
-func decodeCredentialCursor(value string) (string, error) {
+func decodeCredentialCursor(value string) (credentialCursor, error) {
 	if value == "" {
-		return "", nil
+		return credentialCursor{}, nil
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil || len(payload) == 0 || base64.RawURLEncoding.EncodeToString(payload) != value {
-		return "", errors.New("invalid credential cursor")
+		return credentialCursor{}, errors.New("invalid credential cursor")
 	}
-	return string(payload), nil
+	var cursor credentialCursor
+	if json.Unmarshal(payload, &cursor) != nil || cursor.Generation == 0 || cursor.ID == "" {
+		return credentialCursor{}, errors.New("invalid credential cursor")
+	}
+	return cursor, nil
 }
 
 func newAdminCredentialListResponse(page credentialListPage, paginated bool) adminCredentialListResponse {

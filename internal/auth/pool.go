@@ -75,6 +75,12 @@ type CredentialInfo struct {
 	Billing                 *BillingInfo `json:"billing,omitempty"`
 }
 
+type credentialInfoSnapshot struct {
+	generation uint64
+	validUntil time.Time
+	infos      []CredentialInfo
+}
+
 // BillingInfo is a redacted, in-memory snapshot of the authoritative credits
 // endpoint. Monetary values are remaining cents and never include payment data.
 type BillingInfo struct {
@@ -260,28 +266,31 @@ type cooldownState struct {
 }
 
 type Pool struct {
-	cfg           PoolConfig
-	http          *http.Client
-	mu            sync.RWMutex
-	accounts      map[string]*account
-	files         map[string]fileEntry
-	states        map[string]accountState
-	catalogs      map[string]catalogState
-	globalAgentID string
-	namespaceKey  string
-	active        atomic.Value // []*account
-	activeByModel atomic.Value // map[string][]*account
-	cursor        atomic.Uint64
-	affinity      *affinityCache
-	refreshSem    chan struct{}
-	capacityCh    chan struct{}
-	capacityMu    sync.Mutex
-	rebuildCh     chan struct{}
-	closed        chan struct{}
-	closeOnce     sync.Once
-	wg            sync.WaitGroup
-	stateMu       sync.Mutex
-	mutationMu    sync.Mutex
+	cfg                          PoolConfig
+	http                         *http.Client
+	mu                           sync.RWMutex
+	accounts                     map[string]*account
+	files                        map[string]fileEntry
+	states                       map[string]accountState
+	catalogs                     map[string]catalogState
+	globalAgentID                string
+	namespaceKey                 string
+	active                       atomic.Value // []*account
+	activeByModel                atomic.Value // map[string][]*account
+	cursor                       atomic.Uint64
+	credentialSnapshotGeneration atomic.Uint64
+	credentialSnapshot           atomic.Pointer[credentialInfoSnapshot]
+	credentialSnapshotMu         sync.Mutex
+	affinity                     *affinityCache
+	refreshSem                   chan struct{}
+	capacityCh                   chan struct{}
+	capacityMu                   sync.Mutex
+	rebuildCh                    chan struct{}
+	closed                       chan struct{}
+	closeOnce                    sync.Once
+	wg                           sync.WaitGroup
+	stateMu                      sync.Mutex
+	mutationMu                   sync.Mutex
 }
 
 type Lease struct {
@@ -379,6 +388,7 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	}
 	p.active.Store([]*account{})
 	p.activeByModel.Store(map[string][]*account{})
+	p.credentialSnapshotGeneration.Store(1)
 	resetPersistedAffinity := false
 	if err := p.loadState(); err != nil {
 		// Corrupt/unreadable state is never guessed. Fresh identity material below
@@ -855,16 +865,64 @@ func (p *Pool) AccountIDs() []string {
 	return ids
 }
 
-// Credentials returns redacted credential metadata sorted by account ID.
+// Credentials returns an independent copy of redacted credential metadata
+// sorted by account ID.
 func (p *Pool) Credentials() []CredentialInfo {
-	p.mu.RLock()
-	items := make([]CredentialInfo, 0, len(p.accounts))
-	for id, a := range p.accounts {
-		items = append(items, credentialInfo(id, a, time.Now()))
+	_, snapshot := p.CredentialSnapshot()
+	items := make([]CredentialInfo, len(snapshot))
+	for index := range snapshot {
+		items[index] = cloneCredentialInfo(snapshot[index])
 	}
-	p.mu.RUnlock()
-	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return items
+}
+
+// CredentialSnapshot returns a generation-keyed immutable redacted snapshot
+// sorted by account ID. Callers must treat the returned slice and nested values
+// as read-only; a generation change publishes a newly built snapshot.
+func (p *Pool) CredentialSnapshot() (uint64, []CredentialInfo) {
+	for {
+		now := time.Now()
+		generation := p.credentialSnapshotGeneration.Load()
+		if cached := p.credentialSnapshot.Load(); credentialSnapshotCurrent(cached, generation, now) {
+			return cached.generation, cached.infos
+		}
+
+		p.credentialSnapshotMu.Lock()
+		generation = p.credentialSnapshotGeneration.Load()
+		now = time.Now()
+		if cached := p.credentialSnapshot.Load(); credentialSnapshotCurrent(cached, generation, now) {
+			p.credentialSnapshotMu.Unlock()
+			return cached.generation, cached.infos
+		}
+
+		p.mu.RLock()
+		infos := make([]CredentialInfo, 0, len(p.accounts))
+		var validUntil time.Time
+		for id, account := range p.accounts {
+			info, transition := credentialInfoAt(id, account, now)
+			infos = append(infos, info)
+			if !transition.IsZero() && (validUntil.IsZero() || transition.Before(validUntil)) {
+				validUntil = transition
+			}
+		}
+		p.mu.RUnlock()
+		sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+		if p.credentialSnapshotGeneration.Load() != generation {
+			p.credentialSnapshotMu.Unlock()
+			continue
+		}
+		next := &credentialInfoSnapshot{generation: generation, validUntil: validUntil, infos: infos}
+		p.credentialSnapshot.Store(next)
+		p.credentialSnapshotMu.Unlock()
+		if p.credentialSnapshotGeneration.Load() == generation {
+			return generation, infos
+		}
+	}
+}
+
+func credentialSnapshotCurrent(snapshot *credentialInfoSnapshot, generation uint64, now time.Time) bool {
+	return snapshot != nil && snapshot.generation == generation &&
+		(snapshot.validUntil.IsZero() || now.Before(snapshot.validUntil))
 }
 
 // Credential returns redacted metadata for one account.
@@ -881,12 +939,27 @@ func (p *Pool) Credential(id string) (CredentialInfo, bool) {
 }
 
 func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
+	info, _ := credentialInfoAt(id, a, now)
+	return info
+}
+
+func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, time.Time) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	info := CredentialInfo{ID: id, Disabled: a.disabled, Models: []string{}}
 	if a.credential == nil {
 		info.Status = "unavailable"
-		return info
+		return info, time.Time{}
+	}
+	var validUntil time.Time
+	if now.Before(a.cooldownUntil) {
+		validUntil = a.cooldownUntil
+	}
+	if !a.credential.ExpiresAt.IsZero() {
+		usableUntil := a.credential.ExpiresAt.Add(-time.Minute)
+		if now.Before(usableUntil) && (validUntil.IsZero() || usableUntil.Before(validUntil)) {
+			validUntil = usableUntil
+		}
 	}
 	info.Models = a.modelIDsLocked()
 	info.Scope = a.credential.Scope
@@ -930,7 +1003,7 @@ func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
 	default:
 		info.Status = "ready"
 	}
-	return info
+	return info, validUntil
 }
 
 // ImportCredential validates and atomically creates or replaces a credential.
@@ -1289,6 +1362,7 @@ func (p *Pool) markAccountDeleting(a *account, id string) {
 	state.CredentialFingerprint = fingerprint
 	p.states[id] = state
 	p.mu.Unlock()
+	p.invalidateCredentialSnapshot()
 	p.rebuildActive()
 	p.notifyCapacity()
 	if err := p.persistState(); err != nil {
@@ -1465,6 +1539,7 @@ func (p *Pool) UpdateBilling(accountID string, info BillingInfo) error {
 	a.mu.Lock()
 	a.billing = cloneBillingInfo(&info)
 	a.mu.Unlock()
+	p.invalidateCredentialSnapshot()
 	return nil
 }
 
@@ -1596,6 +1671,7 @@ func (p *Pool) TouchModelCatalog(accountID string, updatedAt time.Time) error {
 	catalog.UpdatedAt = updatedAt.UTC()
 	p.catalogs[accountID] = catalog
 	p.mu.Unlock()
+	p.invalidateCredentialSnapshot()
 	return p.persistState()
 }
 
@@ -2285,6 +2361,9 @@ func (p *Pool) scanUnlocked() (bool, error) {
 		p.files = map[string]fileEntry{}
 		p.catalogs = map[string]catalogState{}
 		p.mu.Unlock()
+		if stateChanged {
+			p.invalidateCredentialSnapshot()
+		}
 		p.rebuildActive()
 		if hadAccounts {
 			slog.Warn("credential pool is empty")
@@ -2425,6 +2504,9 @@ func (p *Pool) scanUnlocked() (bool, error) {
 	p.files = newFiles
 	count := len(p.accounts)
 	p.mu.Unlock()
+	if poolChanged || stateChanged {
+		p.invalidateCredentialSnapshot()
+	}
 	for _, until := range cooldowns {
 		p.rebuildWhenCooldownExpires(until)
 	}
@@ -2507,6 +2589,29 @@ func cloneBillingInfo(source *BillingInfo) *BillingInfo {
 	return &cloned
 }
 
+func cloneCredentialInfo(source CredentialInfo) CredentialInfo {
+	cloned := source
+	cloned.Models = append([]string(nil), source.Models...)
+	cloned.Billing = cloneBillingInfo(source.Billing)
+	if source.ExpiresAt != nil {
+		value := *source.ExpiresAt
+		cloned.ExpiresAt = &value
+	}
+	if source.CooldownUntil != nil {
+		value := *source.CooldownUntil
+		cloned.CooldownUntil = &value
+	}
+	if source.CatalogUpdated != nil {
+		value := *source.CatalogUpdated
+		cloned.CatalogUpdated = &value
+	}
+	return cloned
+}
+
+func (p *Pool) invalidateCredentialSnapshot() {
+	p.credentialSnapshotGeneration.Add(1)
+}
+
 func (p *Pool) rebuildActive() {
 	now := time.Now()
 	p.mu.RLock()
@@ -2557,6 +2662,7 @@ func (p *Pool) rebuildActive() {
 }
 
 func (p *Pool) requestRebuild() {
+	p.invalidateCredentialSnapshot()
 	select {
 	case p.rebuildCh <- struct{}{}:
 	default:

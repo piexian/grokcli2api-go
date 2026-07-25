@@ -1,12 +1,18 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 )
@@ -21,12 +27,13 @@ func TestListCredentialsPagination(t *testing.T) {
 		cursor string
 		gotIDs []string
 	)
+	const generation = 7
 	for {
-		cursorID, err := decodeCredentialCursor(cursor)
+		cursorValue, err := decodeCredentialCursor(cursor)
 		if err != nil {
 			t.Fatalf("decode cursor %q: %v", cursor, err)
 		}
-		page := listCredentials(credentials, adminCredentialListFilter{Limit: 100, CursorID: cursorID})
+		page := listCredentials(credentials, generation, adminCredentialListFilter{Limit: 100, Cursor: cursorValue})
 		if page.Total != len(credentials) {
 			t.Fatalf("total = %d, want %d", page.Total, len(credentials))
 		}
@@ -50,6 +57,10 @@ func TestListCredentialsPagination(t *testing.T) {
 		}
 		if page.NextCursor == "" {
 			t.Fatal("has_more response has an empty next_cursor")
+		}
+		decoded, err := decodeCredentialCursor(page.NextCursor)
+		if err != nil || decoded.Generation != generation {
+			t.Fatalf("next cursor = %#v, %v", decoded, err)
 		}
 		cursor = page.NextCursor
 	}
@@ -84,7 +95,7 @@ func TestListCredentialsQueryFiltersAllSearchFields(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page := listCredentials(credentials, adminCredentialListFilter{Query: normalizeCredentialQuery(tt.query)})
+			page := listCredentials(credentials, 1, adminCredentialListFilter{Query: normalizeCredentialQuery(tt.query)})
 			got := make([]string, len(page.Data))
 			for i, credential := range page.Data {
 				got[i] = credential.ID
@@ -117,7 +128,7 @@ func TestListCredentialsStatusAndUsableFilters(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page := listCredentials(credentials, tt.filter)
+			page := listCredentials(credentials, 1, tt.filter)
 			got := make([]string, len(page.Data))
 			for i, credential := range page.Data {
 				got[i] = credential.ID
@@ -185,13 +196,13 @@ func TestAdminCredentialsHandlerResponseShape(t *testing.T) {
 }
 
 func TestParseAdminCredentialListFilter(t *testing.T) {
-	cursor := encodeCredentialCursor("account-100")
+	cursor := encodeCredentialCursor(credentialCursor{Generation: 11, ID: "account-100"})
 	req := httptest.NewRequest("GET", "/v1/admin/credentials?limit=1000&cursor="+cursor+"&q=%20GROK-4%20&status=READY&usable=TRUE", nil)
 	filter, err := parseAdminCredentialListFilter(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filter.Limit != 1000 || filter.CursorID != "account-100" || filter.Query != "grok-4" || filter.Status != "ready" || filter.Usable == nil || !*filter.Usable {
+	if filter.Limit != 1000 || filter.Cursor.Generation != 11 || filter.Cursor.ID != "account-100" || filter.Query != "grok-4" || filter.Status != "ready" || filter.Usable == nil || !*filter.Usable {
 		t.Fatalf("filter = %#v", filter)
 	}
 
@@ -213,6 +224,17 @@ func TestParseAdminCredentialListFilter(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestListCredentialsAcceptsCursorFromOlderGeneration(t *testing.T) {
+	credentials := []auth.CredentialInfo{{ID: "01"}, {ID: "02"}, {ID: "03"}, {ID: "04"}}
+	page := listCredentials(credentials, 9, adminCredentialListFilter{
+		Limit:  2,
+		Cursor: credentialCursor{Generation: 3, ID: "02"},
+	})
+	if got := []string{page.Data[0].ID, page.Data[1].ID}; !reflect.DeepEqual(got, []string{"03", "04"}) || page.HasMore {
+		t.Fatalf("page from stale cursor = %#v", page)
 	}
 }
 
@@ -242,9 +264,110 @@ func BenchmarkListCredentials(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		page := listCredentials(credentials, filter)
+		page := listCredentials(credentials, 1, filter)
 		if len(page.Data) != 100 || page.Total != len(credentials) || !page.HasMore {
 			b.Fatalf("unexpected page: data=%d total=%d has_more=%v", len(page.Data), page.Total, page.HasMore)
 		}
 	}
+}
+
+// BenchmarkAdminCredentialsHandler_16k reports p95 page and full 32-page
+// latency. Baseline on linux/amd64 (i5-13420H): 0.89ms/page p95 and
+// 71.40ms/32 pages p95 with -benchtime=5x.
+func BenchmarkAdminCredentialsHandler_16k(b *testing.B) {
+	pool := benchmarkCredentialPool(b, 16_000)
+	handler := http.HandlerFunc((&Server{pool: pool}).adminCredentials)
+	pageDurations := make([]time.Duration, 0, b.N*32)
+	iterationDurations := make([]time.Duration, 0, b.N)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		started := time.Now()
+		cursor := ""
+		pages := 0
+		for {
+			path := "/v1/admin/credentials?limit=500"
+			if cursor != "" {
+				path += "&cursor=" + cursor
+			}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			pageStarted := time.Now()
+			handler.ServeHTTP(recorder, request)
+			pageDurations = append(pageDurations, time.Since(pageStarted))
+			if recorder.Code != http.StatusOK {
+				b.Fatalf("page %d status=%d body=%s", pages+1, recorder.Code, recorder.Body.String())
+			}
+			var response struct {
+				Data       []json.RawMessage `json:"data"`
+				HasMore    bool              `json:"has_more"`
+				NextCursor string            `json:"next_cursor"`
+				Total      int               `json:"total"`
+			}
+			if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+				b.Fatal(err)
+			}
+			pages++
+			if response.Total != 16_000 || len(response.Data) != 500 {
+				b.Fatalf("page %d data=%d total=%d", pages, len(response.Data), response.Total)
+			}
+			if !response.HasMore {
+				break
+			}
+			if response.NextCursor == "" {
+				b.Fatalf("page %d has_more with empty cursor", pages)
+			}
+			cursor = response.NextCursor
+		}
+		if pages != 32 {
+			b.Fatalf("pages = %d, want 32", pages)
+		}
+		iterationDurations = append(iterationDurations, time.Since(started))
+	}
+	b.StopTimer()
+
+	p95Page := percentileDuration(pageDurations, 0.95)
+	p95Total := percentileDuration(iterationDurations, 0.95)
+	b.ReportMetric(float64(p95Page)/float64(time.Millisecond), "p95-page-ms")
+	b.ReportMetric(float64(p95Total)/float64(time.Millisecond), "p95-32-pages-ms")
+	if p95Total >= 200*time.Millisecond {
+		b.Fatalf("p95 latency for 32 pages = %s, want < 200ms", p95Total)
+	}
+}
+
+func benchmarkCredentialPool(b *testing.B, count int) *auth.Pool {
+	b.Helper()
+	dir := b.TempDir()
+	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	for index := 0; index < count; index++ {
+		payload, err := json.Marshal(map[string]any{
+			"key": fmt.Sprintf("token-%05d", index), "auth_mode": "external",
+			"user_id": fmt.Sprintf("user-%05d", index), "expires_at": expires,
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("account-%05d.json", index)), payload, 0o600); err != nil {
+			b.Fatal(err)
+		}
+	}
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AccountMaxInflight: 16, AffinityTTL: time.Hour, AffinityMaxEntries: count,
+	}, http.DefaultClient)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(pool.Close)
+	return pool
+}
+
+func percentileDuration(values []time.Duration, percentile float64) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	index := int(math.Ceil(float64(len(values))*percentile)) - 1
+	return values[index]
 }
