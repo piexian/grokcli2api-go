@@ -1,21 +1,12 @@
 import * as React from "react"
 
-import { cn } from "@/shared/lib/cn"
+import { cn } from "@/lib/cn"
 
-type TableProps = React.HTMLAttributes<HTMLTableElement> & {
-  viewportRows?: number
-  rowHeight?: number
-}
-
-const Table = React.forwardRef<HTMLTableElement, TableProps>(({ className, viewportRows, rowHeight, ...props }, ref) => (
-  <div
-    data-slot="table-scroll-container"
-    className={cn(
-      "relative w-full overflow-auto",
-      viewportRows && "[&_thead]:sticky [&_thead]:top-0 [&_thead]:z-30 [&_thead]:bg-background"
-    )}
-    style={viewportRows && rowHeight ? { maxHeight: 36 + viewportRows * rowHeight } : undefined}
-  >
+const Table = React.forwardRef<
+  HTMLTableElement,
+  React.HTMLAttributes<HTMLTableElement>
+>(({ className, ...props }, ref) => (
+  <div className="relative w-full overflow-auto">
     <table
       ref={ref}
       className={cn("w-full caption-bottom text-sm", className)}
@@ -67,7 +58,7 @@ const TableRow = React.forwardRef<
   <tr
     ref={ref}
     className={cn(
-      "border-b transition-colors hover:bg-[color-mix(in_oklab,var(--secondary)_45%,var(--background))] data-[state=selected]:bg-secondary",
+      "border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted",
       className
     )}
     {...props}
@@ -82,7 +73,7 @@ const TableHead = React.forwardRef<
   <th
     ref={ref}
     className={cn(
-      "h-9 px-2 text-left align-middle text-xs font-normal text-muted-foreground [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[1px]",
+      "h-10 px-2 text-left align-middle font-medium text-muted-foreground [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
       className
     )}
     {...props}
@@ -97,40 +88,13 @@ const TableCell = React.forwardRef<
   <td
     ref={ref}
     className={cn(
-      "px-2 py-2 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[1px]",
+      "p-2 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
       className
     )}
     {...props}
   />
 ))
 TableCell.displayName = "TableCell"
-
-const TableActionHead = React.forwardRef<
-  HTMLTableCellElement,
-  React.ThHTMLAttributes<HTMLTableCellElement>
->(({ className, ...props }, ref) => (
-  <TableHead
-    ref={ref}
-    className={cn("sticky right-0 z-20 w-12 min-w-12 bg-background px-2", className)}
-    {...props}
-  />
-))
-TableActionHead.displayName = "TableActionHead"
-
-const TableActionCell = React.forwardRef<
-  HTMLTableCellElement,
-  React.TdHTMLAttributes<HTMLTableCellElement>
->(({ className, ...props }, ref) => (
-  <TableCell
-    ref={ref}
-    className={cn(
-      "sticky right-0 z-10 w-12 min-w-12 bg-background px-2 transition-colors group-hover:bg-[color-mix(in_oklab,var(--secondary)_45%,var(--background))] group-data-[state=selected]:bg-secondary",
-      className
-    )}
-    {...props}
-  />
-))
-TableActionCell.displayName = "TableActionCell"
 
 const TableCaption = React.forwardRef<
   HTMLTableCaptionElement,
@@ -152,7 +116,5 @@ export {
   TableHead,
   TableRow,
   TableCell,
-  TableActionHead,
-  TableActionCell,
   TableCaption,
 }

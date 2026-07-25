@@ -1,7 +1,7 @@
 import * as React from "react"
 import * as RechartsPrimitive from "recharts"
 
-import { cn } from "@/shared/lib/cn"
+import { cn } from "@/lib/cn"
 
 // Format: { THEME_NAME: CSS_SELECTOR }
 const THEMES = { light: "", dark: ".dark" } as const
@@ -280,7 +280,7 @@ const ChartLegendContent = React.forwardRef<
       <div
         ref={ref}
         className={cn(
-          "flex flex-wrap items-center justify-center gap-x-4 gap-y-2",
+          "flex items-center justify-center gap-4",
           verticalAlign === "top" ? "pb-3" : "pt-3",
           className
         )}
@@ -302,9 +302,9 @@ const ChartLegendContent = React.forwardRef<
                   <itemConfig.icon />
                 ) : (
                   <div
-                    className="h-2 w-2 shrink-0 rounded-full"
+                    className="h-2 w-2 shrink-0 rounded-[2px]"
                     style={{
-                      backgroundColor: item.color || `var(--color-${key})`,
+                      backgroundColor: item.color,
                     }}
                   />
                 )}
