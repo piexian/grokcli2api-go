@@ -8,11 +8,42 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 )
 
 const maxAdminCredentialsPageSize = 1000
+
+type credentialSort string
+
+const (
+	credentialSortID          credentialSort = "id"
+	credentialSortTier        credentialSort = "tier"
+	credentialSortStatus      credentialSort = "status"
+	credentialSortExpiresAt   credentialSort = "expires_at"
+	credentialSortModelsCount credentialSort = "models_count"
+	credentialSortUsable      credentialSort = "usable"
+)
+
+var credentialSorts = []credentialSort{
+	credentialSortID,
+	credentialSortTier,
+	credentialSortStatus,
+	credentialSortExpiresAt,
+	credentialSortModelsCount,
+	credentialSortUsable,
+}
+
+type credentialOrder string
+
+const (
+	credentialOrderAsc  credentialOrder = "asc"
+	credentialOrderDesc credentialOrder = "desc"
+)
+
+var credentialOrders = []credentialOrder{credentialOrderAsc, credentialOrderDesc}
 
 type adminCredentialListFilter struct {
 	Limit  int
@@ -20,11 +51,39 @@ type adminCredentialListFilter struct {
 	Query  string
 	Status string
 	Usable *bool
+	Sort   credentialSort
+	Order  credentialOrder
 }
 
 type credentialCursor struct {
-	Generation uint64 `json:"generation"`
-	ID         string `json:"id"`
+	Generation uint64          `json:"generation"`
+	Sort       credentialSort  `json:"sort"`
+	Order      credentialOrder `json:"order"`
+	LastKey    string          `json:"last_key"`
+	LastID     string          `json:"last_id"`
+}
+
+type credentialSortOrder struct {
+	Sort  credentialSort
+	Order credentialOrder
+}
+
+type credentialSortValue struct {
+	Missing bool
+	Text    string
+	Number  int64
+	IsText  bool
+}
+
+type adminPoolSnapshot struct {
+	Generation  uint64
+	Credentials []auth.CredentialInfo
+	Orders      map[credentialSortOrder][]int
+}
+
+type adminPoolSnapshotCache struct {
+	mu      sync.Mutex
+	current atomic.Pointer[adminPoolSnapshot]
 }
 
 type credentialListPage struct {
@@ -44,7 +103,24 @@ type adminCredentialListResponse struct {
 
 func parseAdminCredentialListFilter(r *http.Request) (adminCredentialListFilter, error) {
 	query := r.URL.Query()
-	filter := adminCredentialListFilter{Query: normalizeCredentialQuery(query.Get("q"))}
+	filter := adminCredentialListFilter{
+		Query: normalizeCredentialQuery(query.Get("q")),
+		Sort:  credentialSortID,
+		Order: credentialOrderAsc,
+	}
+
+	if raw := credentialSort(strings.ToLower(strings.TrimSpace(query.Get("sort")))); raw != "" {
+		if !validCredentialSort(raw) {
+			return adminCredentialListFilter{}, errors.New("sort must be id, tier, status, expires_at, models_count, or usable")
+		}
+		filter.Sort = raw
+	}
+	if raw := credentialOrder(strings.ToLower(strings.TrimSpace(query.Get("order")))); raw != "" {
+		if !validCredentialOrder(raw) {
+			return adminCredentialListFilter{}, errors.New("order must be asc or desc")
+		}
+		filter.Order = raw
+	}
 
 	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
 		limit, err := strconv.Atoi(raw)
@@ -61,6 +137,9 @@ func parseAdminCredentialListFilter(r *http.Request) (adminCredentialListFilter,
 		cursor, err := decodeCredentialCursor(raw)
 		if err != nil {
 			return adminCredentialListFilter{}, errors.New("invalid credential cursor")
+		}
+		if cursor.Sort != filter.Sort || cursor.Order != filter.Order {
+			return adminCredentialListFilter{}, errors.New("credential cursor sort and order must match the request")
 		}
 		filter.Cursor = cursor
 	}
@@ -88,25 +167,97 @@ func parseAdminCredentialListFilter(r *http.Request) (adminCredentialListFilter,
 	return filter, nil
 }
 
-func listCredentials(credentials []auth.CredentialInfo, generation uint64, filter adminCredentialListFilter) credentialListPage {
+func (c *adminPoolSnapshotCache) get(generation uint64, credentials []auth.CredentialInfo) *adminPoolSnapshot {
+	if current := c.current.Load(); sameAdminPoolSnapshot(current, generation, credentials) {
+		return current
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if current := c.current.Load(); sameAdminPoolSnapshot(current, generation, credentials) {
+		return current
+	}
+	next := newAdminPoolSnapshot(generation, credentials)
+	c.current.Store(next)
+	return next
+}
+
+func sameAdminPoolSnapshot(snapshot *adminPoolSnapshot, generation uint64, credentials []auth.CredentialInfo) bool {
+	if snapshot == nil || snapshot.Generation != generation || len(snapshot.Credentials) != len(credentials) {
+		return false
+	}
+	if len(credentials) == 0 {
+		return true
+	}
+	// Pool may rebuild a time-sensitive snapshot without changing generation.
+	return &snapshot.Credentials[0] == &credentials[0]
+}
+
+func newAdminPoolSnapshot(generation uint64, credentials []auth.CredentialInfo) *adminPoolSnapshot {
+	snapshot := &adminPoolSnapshot{
+		Generation: generation, Credentials: credentials,
+		Orders: make(map[credentialSortOrder][]int, len(credentialSorts)*len(credentialOrders)),
+	}
+	for _, sortField := range credentialSorts {
+		ascending := make([]int, len(credentials))
+		for index := range ascending {
+			ascending[index] = index
+		}
+		sort.Slice(ascending, func(i, j int) bool {
+			return compareCredentialPositions(
+				credentialSortValueFor(credentials[ascending[i]], sortField), credentials[ascending[i]].ID,
+				credentialSortValueFor(credentials[ascending[j]], sortField), credentials[ascending[j]].ID,
+				credentialOrderAsc,
+			) < 0
+		})
+		snapshot.Orders[credentialSortOrder{Sort: sortField, Order: credentialOrderAsc}] = ascending
+		snapshot.Orders[credentialSortOrder{Sort: sortField, Order: credentialOrderDesc}] = descendingCredentialOrder(ascending, credentials, sortField)
+	}
+	return snapshot
+}
+
+func descendingCredentialOrder(ascending []int, credentials []auth.CredentialInfo, sortField credentialSort) []int {
+	missingStart := len(ascending)
+	for position, index := range ascending {
+		if credentialSortValueFor(credentials[index], sortField).Missing {
+			missingStart = position
+			break
+		}
+	}
+	descending := make([]int, 0, len(ascending))
+	for position := missingStart - 1; position >= 0; position-- {
+		descending = append(descending, ascending[position])
+	}
+	for position := len(ascending) - 1; position >= missingStart; position-- {
+		descending = append(descending, ascending[position])
+	}
+	return descending
+}
+
+func listCredentials(snapshot *adminPoolSnapshot, filter adminCredentialListFilter) credentialListPage {
+	filter.Sort, filter.Order = normalizedCredentialSortOrder(filter.Sort, filter.Order)
 	if filter.Query == "" && filter.Status == "" && filter.Usable == nil {
-		return unfilteredCredentialPage(credentials, generation, filter)
+		return unfilteredCredentialPage(snapshot, filter)
 	}
 
-	capacity := len(credentials)
+	capacity := len(snapshot.Credentials)
 	if filter.Limit > 0 && capacity > filter.Limit+1 {
 		capacity = filter.Limit + 1
 	}
 	page := credentialListPage{Data: make([]auth.CredentialInfo, 0, capacity)}
 	query := normalizeCredentialQuery(filter.Query)
-	for _, credential := range credentials {
+	cursorValue, _ := decodeCredentialSortKey(filter.Sort, filter.Cursor.LastKey)
+	for _, index := range snapshot.Orders[credentialSortOrder{Sort: filter.Sort, Order: filter.Order}] {
+		credential := snapshot.Credentials[index]
 		if !credentialMatchesListFilter(credential, query, filter) {
 			continue
 		}
 		page.Total++
 		// A cursor from an older generation intentionally degrades to applying its
-		// ID boundary to the current snapshot instead of failing the request.
-		if filter.Cursor.ID != "" && credential.ID <= filter.Cursor.ID {
+		// composite boundary to the current snapshot instead of failing the request.
+		if filter.Cursor.LastID != "" && compareCredentialPositions(
+			credentialSortValueFor(credential, filter.Sort), credential.ID,
+			cursorValue, filter.Cursor.LastID, filter.Order,
+		) <= 0 {
 			continue
 		}
 		if filter.Limit == 0 || len(page.Data) < filter.Limit+1 {
@@ -117,28 +268,44 @@ func listCredentials(credentials []auth.CredentialInfo, generation uint64, filte
 	if filter.Limit > 0 && len(page.Data) > filter.Limit {
 		page.HasMore = true
 		page.Data = page.Data[:filter.Limit]
-		page.NextCursor = encodeCredentialCursor(credentialCursor{Generation: generation, ID: page.Data[len(page.Data)-1].ID})
+		page.NextCursor = nextCredentialCursor(snapshot.Generation, page.Data[len(page.Data)-1], filter.Sort, filter.Order)
 	}
 	return page
 }
 
-func unfilteredCredentialPage(credentials []auth.CredentialInfo, generation uint64, filter adminCredentialListFilter) credentialListPage {
-	page := credentialListPage{Total: len(credentials)}
+func unfilteredCredentialPage(snapshot *adminPoolSnapshot, filter adminCredentialListFilter) credentialListPage {
+	order := snapshot.Orders[credentialSortOrder{Sort: filter.Sort, Order: filter.Order}]
+	page := credentialListPage{Total: len(snapshot.Credentials)}
 	start := 0
-	if filter.Cursor.ID != "" {
-		start = sort.Search(len(credentials), func(index int) bool { return credentials[index].ID > filter.Cursor.ID })
+	if filter.Cursor.LastID != "" {
+		cursorValue, _ := decodeCredentialSortKey(filter.Sort, filter.Cursor.LastKey)
+		start = sort.Search(len(order), func(position int) bool {
+			credential := snapshot.Credentials[order[position]]
+			return compareCredentialPositions(
+				credentialSortValueFor(credential, filter.Sort), credential.ID,
+				cursorValue, filter.Cursor.LastID, filter.Order,
+			) > 0
+		})
 	}
 	if filter.Limit == 0 {
-		page.Data = credentials[start:]
+		page.Data = credentialsForOrder(snapshot.Credentials, order[start:])
 		return page
 	}
-	end := min(start+filter.Limit, len(credentials))
-	page.Data = credentials[start:end]
-	if end < len(credentials) {
+	end := min(start+filter.Limit, len(order))
+	page.Data = credentialsForOrder(snapshot.Credentials, order[start:end])
+	if end < len(order) {
 		page.HasMore = true
-		page.NextCursor = encodeCredentialCursor(credentialCursor{Generation: generation, ID: page.Data[len(page.Data)-1].ID})
+		page.NextCursor = nextCredentialCursor(snapshot.Generation, page.Data[len(page.Data)-1], filter.Sort, filter.Order)
 	}
 	return page
+}
+
+func credentialsForOrder(credentials []auth.CredentialInfo, order []int) []auth.CredentialInfo {
+	items := make([]auth.CredentialInfo, len(order))
+	for position, index := range order {
+		items[position] = credentials[index]
+	}
+	return items
 }
 
 func credentialMatchesListFilter(credential auth.CredentialInfo, query string, filter adminCredentialListFilter) bool {
@@ -182,10 +349,205 @@ func decodeCredentialCursor(value string) (credentialCursor, error) {
 		return credentialCursor{}, errors.New("invalid credential cursor")
 	}
 	var cursor credentialCursor
-	if json.Unmarshal(payload, &cursor) != nil || cursor.Generation == 0 || cursor.ID == "" {
+	if json.Unmarshal(payload, &cursor) != nil || cursor.Generation == 0 || cursor.LastID == "" ||
+		!validCredentialSort(cursor.Sort) || !validCredentialOrder(cursor.Order) {
+		return credentialCursor{}, errors.New("invalid credential cursor")
+	}
+	if _, err := decodeCredentialSortKey(cursor.Sort, cursor.LastKey); err != nil {
 		return credentialCursor{}, errors.New("invalid credential cursor")
 	}
 	return cursor, nil
+}
+
+func nextCredentialCursor(generation uint64, credential auth.CredentialInfo, sortField credentialSort, order credentialOrder) string {
+	return encodeCredentialCursor(credentialCursor{
+		Generation: generation,
+		Sort:       sortField,
+		Order:      order,
+		LastKey:    encodeCredentialSortKey(credentialSortValueFor(credential, sortField)),
+		LastID:     credential.ID,
+	})
+}
+
+func normalizedCredentialSortOrder(sortField credentialSort, order credentialOrder) (credentialSort, credentialOrder) {
+	if !validCredentialSort(sortField) {
+		sortField = credentialSortID
+	}
+	if !validCredentialOrder(order) {
+		order = credentialOrderAsc
+	}
+	return sortField, order
+}
+
+func validCredentialSort(value credentialSort) bool {
+	switch value {
+	case credentialSortID, credentialSortTier, credentialSortStatus, credentialSortExpiresAt, credentialSortModelsCount, credentialSortUsable:
+		return true
+	default:
+		return false
+	}
+}
+
+func validCredentialOrder(value credentialOrder) bool {
+	return value == credentialOrderAsc || value == credentialOrderDesc
+}
+
+func credentialSortValueFor(credential auth.CredentialInfo, sortField credentialSort) credentialSortValue {
+	switch sortField {
+	case credentialSortTier:
+		if rank, ok := credentialTierRank(credential.SubscriptionTier); ok {
+			return credentialSortValue{Number: int64(rank)}
+		}
+		return credentialSortValue{Missing: true}
+	case credentialSortStatus:
+		if rank, ok := credentialStatusRank(credential.Status); ok {
+			return credentialSortValue{Number: int64(rank)}
+		}
+		return credentialSortValue{Missing: true}
+	case credentialSortExpiresAt:
+		if credential.ExpiresAt == nil {
+			return credentialSortValue{Missing: true}
+		}
+		return credentialSortValue{Number: credential.ExpiresAt.UnixNano()}
+	case credentialSortModelsCount:
+		return credentialSortValue{Number: int64(len(credential.Models))}
+	case credentialSortUsable:
+		if credential.Usable {
+			return credentialSortValue{Number: 0}
+		}
+		return credentialSortValue{Number: 1}
+	default:
+		return credentialSortValue{Text: credential.ID, IsText: true}
+	}
+}
+
+func credentialTierRank(tier string) (int, bool) {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "free":
+		return 0, true
+	case "x_basic":
+		return 1, true
+	case "x_premium":
+		return 2, true
+	case "x_premium_plus":
+		return 3, true
+	case "supergrok":
+		return 4, true
+	case "supergrok_heavy":
+		return 5, true
+	case "supergrok_lite":
+		return 6, true
+	default:
+		return 0, false
+	}
+}
+
+func credentialStatusRank(status string) (int, bool) {
+	switch status {
+	case "ready":
+		return 0, true
+	case "cooling_down":
+		return 1, true
+	case "pending_models":
+		return 2, true
+	case "needs_refresh":
+		return 3, true
+	case "disabled":
+		return 4, true
+	default:
+		return 0, false
+	}
+}
+
+func compareCredentialPositions(aValue credentialSortValue, aID string, bValue credentialSortValue, bID string, order credentialOrder) int {
+	comparison := compareCredentialSortValues(aValue, bValue)
+	if !aValue.Missing && !bValue.Missing && order == credentialOrderDesc {
+		comparison = -comparison
+	}
+	if comparison != 0 {
+		return comparison
+	}
+	comparison = strings.Compare(aID, bID)
+	if order == credentialOrderDesc {
+		comparison = -comparison
+	}
+	return comparison
+}
+
+func compareCredentialSortValues(a, b credentialSortValue) int {
+	if a.Missing != b.Missing {
+		if a.Missing {
+			return 1
+		}
+		return -1
+	}
+	if a.Missing {
+		return 0
+	}
+	if a.IsText || b.IsText {
+		return strings.Compare(a.Text, b.Text)
+	}
+	if a.Number < b.Number {
+		return -1
+	}
+	if a.Number > b.Number {
+		return 1
+	}
+	return 0
+}
+
+func encodeCredentialSortKey(value credentialSortValue) string {
+	if value.Missing {
+		return "m"
+	}
+	if value.IsText {
+		return "s:" + value.Text
+	}
+	return "n:" + strconv.FormatInt(value.Number, 10)
+}
+
+func decodeCredentialSortKey(sortField credentialSort, raw string) (credentialSortValue, error) {
+	if raw == "m" {
+		if sortField == credentialSortTier || sortField == credentialSortStatus || sortField == credentialSortExpiresAt {
+			return credentialSortValue{Missing: true}, nil
+		}
+		return credentialSortValue{}, errors.New("invalid credential sort key")
+	}
+	if sortField == credentialSortID {
+		if !strings.HasPrefix(raw, "s:") || len(raw) == len("s:") {
+			return credentialSortValue{}, errors.New("invalid credential sort key")
+		}
+		return credentialSortValue{Text: strings.TrimPrefix(raw, "s:"), IsText: true}, nil
+	}
+	if !strings.HasPrefix(raw, "n:") {
+		return credentialSortValue{}, errors.New("invalid credential sort key")
+	}
+	number, err := strconv.ParseInt(strings.TrimPrefix(raw, "n:"), 10, 64)
+	if err != nil {
+		return credentialSortValue{}, errors.New("invalid credential sort key")
+	}
+	switch sortField {
+	case credentialSortTier:
+		if number < 0 || number > 6 {
+			return credentialSortValue{}, errors.New("invalid credential sort key")
+		}
+	case credentialSortStatus:
+		if number < 0 || number > 4 {
+			return credentialSortValue{}, errors.New("invalid credential sort key")
+		}
+	case credentialSortModelsCount:
+		if number < 0 {
+			return credentialSortValue{}, errors.New("invalid credential sort key")
+		}
+	case credentialSortUsable:
+		if number < 0 || number > 1 {
+			return credentialSortValue{}, errors.New("invalid credential sort key")
+		}
+	case credentialSortExpiresAt:
+	default:
+		return credentialSortValue{}, errors.New("invalid credential sort key")
+	}
+	return credentialSortValue{Number: number}, nil
 }
 
 func newAdminCredentialListResponse(page credentialListPage, paginated bool) adminCredentialListResponse {

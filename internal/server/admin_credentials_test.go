@@ -28,12 +28,13 @@ func TestListCredentialsPagination(t *testing.T) {
 		gotIDs []string
 	)
 	const generation = 7
+	snapshot := newAdminPoolSnapshot(generation, credentials)
 	for {
 		cursorValue, err := decodeCredentialCursor(cursor)
 		if err != nil {
 			t.Fatalf("decode cursor %q: %v", cursor, err)
 		}
-		page := listCredentials(credentials, generation, adminCredentialListFilter{Limit: 100, Cursor: cursorValue})
+		page := listCredentials(snapshot, adminCredentialListFilter{Limit: 100, Cursor: cursorValue})
 		if page.Total != len(credentials) {
 			t.Fatalf("total = %d, want %d", page.Total, len(credentials))
 		}
@@ -95,7 +96,7 @@ func TestListCredentialsQueryFiltersAllSearchFields(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page := listCredentials(credentials, 1, adminCredentialListFilter{Query: normalizeCredentialQuery(tt.query)})
+			page := listCredentials(newAdminPoolSnapshot(1, credentials), adminCredentialListFilter{Query: normalizeCredentialQuery(tt.query)})
 			got := make([]string, len(page.Data))
 			for i, credential := range page.Data {
 				got[i] = credential.ID
@@ -128,7 +129,7 @@ func TestListCredentialsStatusAndUsableFilters(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			page := listCredentials(credentials, 1, tt.filter)
+			page := listCredentials(newAdminPoolSnapshot(1, credentials), tt.filter)
 			got := make([]string, len(page.Data))
 			for i, credential := range page.Data {
 				got[i] = credential.ID
@@ -196,14 +197,23 @@ func TestAdminCredentialsHandlerResponseShape(t *testing.T) {
 }
 
 func TestParseAdminCredentialListFilter(t *testing.T) {
-	cursor := encodeCredentialCursor(credentialCursor{Generation: 11, ID: "account-100"})
-	req := httptest.NewRequest("GET", "/v1/admin/credentials?limit=1000&cursor="+cursor+"&q=%20GROK-4%20&status=READY&usable=TRUE", nil)
+	cursor := encodeCredentialCursor(credentialCursor{
+		Generation: 11, Sort: credentialSortTier, Order: credentialOrderDesc,
+		LastKey: "n:4", LastID: "account-100",
+	})
+	req := httptest.NewRequest("GET", "/v1/admin/credentials?limit=1000&sort=tier&order=desc&cursor="+cursor+"&q=%20GROK-4%20&status=READY&usable=TRUE", nil)
 	filter, err := parseAdminCredentialListFilter(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filter.Limit != 1000 || filter.Cursor.Generation != 11 || filter.Cursor.ID != "account-100" || filter.Query != "grok-4" || filter.Status != "ready" || filter.Usable == nil || !*filter.Usable {
+	if filter.Limit != 1000 || filter.Sort != credentialSortTier || filter.Order != credentialOrderDesc ||
+		filter.Cursor.Generation != 11 || filter.Cursor.LastKey != "n:4" || filter.Cursor.LastID != "account-100" ||
+		filter.Query != "grok-4" || filter.Status != "ready" || filter.Usable == nil || !*filter.Usable {
 		t.Fatalf("filter = %#v", filter)
+	}
+	defaults, err := parseAdminCredentialListFilter(httptest.NewRequest("GET", "/v1/admin/credentials", nil))
+	if err != nil || defaults.Sort != credentialSortID || defaults.Order != credentialOrderAsc {
+		t.Fatalf("default filter = %#v, %v", defaults, err)
 	}
 
 	tests := []struct {
@@ -217,6 +227,9 @@ func TestParseAdminCredentialListFilter(t *testing.T) {
 		{name: "invalid cursor", url: "/v1/admin/credentials?limit=10&cursor=not!base64"},
 		{name: "invalid status", url: "/v1/admin/credentials?status=unknown"},
 		{name: "invalid usable", url: "/v1/admin/credentials?usable=1"},
+		{name: "invalid sort", url: "/v1/admin/credentials?sort=created_at"},
+		{name: "invalid order", url: "/v1/admin/credentials?order=sideways"},
+		{name: "cursor sort mismatch", url: "/v1/admin/credentials?limit=10&sort=id&order=desc&cursor=" + cursor},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -229,13 +242,165 @@ func TestParseAdminCredentialListFilter(t *testing.T) {
 
 func TestListCredentialsAcceptsCursorFromOlderGeneration(t *testing.T) {
 	credentials := []auth.CredentialInfo{{ID: "01"}, {ID: "02"}, {ID: "03"}, {ID: "04"}}
-	page := listCredentials(credentials, 9, adminCredentialListFilter{
-		Limit:  2,
-		Cursor: credentialCursor{Generation: 3, ID: "02"},
+	page := listCredentials(newAdminPoolSnapshot(9, credentials), adminCredentialListFilter{
+		Limit: 2,
+		Cursor: credentialCursor{
+			Generation: 3, Sort: credentialSortID, Order: credentialOrderAsc,
+			LastKey: "s:02", LastID: "02",
+		},
 	})
 	if got := []string{page.Data[0].ID, page.Data[1].ID}; !reflect.DeepEqual(got, []string{"03", "04"}) || page.HasMore {
 		t.Fatalf("page from stale cursor = %#v", page)
 	}
+}
+
+func TestListCredentialsSortFields(t *testing.T) {
+	early := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	late := early.Add(time.Hour)
+	tests := []struct {
+		name        string
+		sort        credentialSort
+		credentials []auth.CredentialInfo
+		wantAsc     []string
+		wantDesc    []string
+	}{
+		{
+			name: "id", sort: credentialSortID,
+			credentials: []auth.CredentialInfo{{ID: "c"}, {ID: "a"}, {ID: "b"}},
+			wantAsc:     []string{"a", "b", "c"}, wantDesc: []string{"c", "b", "a"},
+		},
+		{
+			name: "tier", sort: credentialSortTier,
+			credentials: []auth.CredentialInfo{
+				{ID: "unknown", SubscriptionTier: "future"}, {ID: "lite", SubscriptionTier: "supergrok_lite"},
+				{ID: "free", SubscriptionTier: "free"}, {ID: "heavy", SubscriptionTier: "supergrok_heavy"},
+				{ID: "premium", SubscriptionTier: "x_premium"}, {ID: "super", SubscriptionTier: "supergrok"},
+				{ID: "basic", SubscriptionTier: "x_basic"}, {ID: "plus", SubscriptionTier: "x_premium_plus"},
+			},
+			wantAsc:  []string{"free", "basic", "premium", "plus", "super", "heavy", "lite", "unknown"},
+			wantDesc: []string{"lite", "heavy", "super", "plus", "premium", "basic", "free", "unknown"},
+		},
+		{
+			name: "status", sort: credentialSortStatus,
+			credentials: []auth.CredentialInfo{
+				{ID: "disabled", Status: "disabled"}, {ID: "ready", Status: "ready"},
+				{ID: "refresh", Status: "needs_refresh"}, {ID: "pending", Status: "pending_models"},
+				{ID: "cooling", Status: "cooling_down"}, {ID: "unknown", Status: "unavailable"},
+			},
+			wantAsc:  []string{"ready", "cooling", "pending", "refresh", "disabled", "unknown"},
+			wantDesc: []string{"disabled", "refresh", "pending", "cooling", "ready", "unknown"},
+		},
+		{
+			name: "expires_at", sort: credentialSortExpiresAt,
+			credentials: []auth.CredentialInfo{
+				{ID: "none"}, {ID: "late", ExpiresAt: &late}, {ID: "early-b", ExpiresAt: &early}, {ID: "early-a", ExpiresAt: &early},
+			},
+			wantAsc: []string{"early-a", "early-b", "late", "none"}, wantDesc: []string{"late", "early-b", "early-a", "none"},
+		},
+		{
+			name: "models_count", sort: credentialSortModelsCount,
+			credentials: []auth.CredentialInfo{
+				{ID: "two", Models: []string{"a", "b"}}, {ID: "zero"}, {ID: "one-b", Models: []string{"a"}}, {ID: "one-a", Models: []string{"a"}},
+			},
+			wantAsc: []string{"zero", "one-a", "one-b", "two"}, wantDesc: []string{"two", "one-b", "one-a", "zero"},
+		},
+		{
+			name: "usable", sort: credentialSortUsable,
+			credentials: []auth.CredentialInfo{{ID: "false-b"}, {ID: "true-b", Usable: true}, {ID: "false-a"}, {ID: "true-a", Usable: true}},
+			wantAsc:     []string{"true-a", "true-b", "false-a", "false-b"}, wantDesc: []string{"false-b", "false-a", "true-b", "true-a"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot := newAdminPoolSnapshot(1, tt.credentials)
+			for _, direction := range []struct {
+				order credentialOrder
+				want  []string
+			}{{credentialOrderAsc, tt.wantAsc}, {credentialOrderDesc, tt.wantDesc}} {
+				page := listCredentials(snapshot, adminCredentialListFilter{Sort: tt.sort, Order: direction.order})
+				if got := credentialIDs(page.Data); !reflect.DeepEqual(got, direction.want) {
+					t.Fatalf("%s IDs = %v, want %v", direction.order, got, direction.want)
+				}
+			}
+		})
+	}
+}
+
+func TestListCredentialsCompositeCursorIsStableAcrossSorts(t *testing.T) {
+	early := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	late := early.Add(time.Hour)
+	credentials := []auth.CredentialInfo{
+		{ID: "a", SubscriptionTier: "free", Status: "ready", ExpiresAt: &early, Models: []string{"m1"}, Usable: true},
+		{ID: "b", SubscriptionTier: "free", Status: "ready", ExpiresAt: &early, Models: []string{"m1"}, Usable: true},
+		{ID: "c", SubscriptionTier: "x_basic", Status: "cooling_down", ExpiresAt: &late, Models: []string{"m1", "m2"}},
+		{ID: "d", SubscriptionTier: "x_basic", Status: "cooling_down", ExpiresAt: &late, Models: []string{"m1", "m2"}},
+		{ID: "e", SubscriptionTier: "future", Status: "unavailable"},
+	}
+	snapshot := newAdminPoolSnapshot(19, credentials)
+	for _, sortField := range credentialSorts {
+		for _, order := range credentialOrders {
+			t.Run(string(sortField)+"_"+string(order), func(t *testing.T) {
+				want := credentialIDs(listCredentials(snapshot, adminCredentialListFilter{Sort: sortField, Order: order}).Data)
+				var cursor credentialCursor
+				var got []string
+				for {
+					page := listCredentials(snapshot, adminCredentialListFilter{Limit: 2, Sort: sortField, Order: order, Cursor: cursor})
+					got = append(got, credentialIDs(page.Data)...)
+					if !page.HasMore {
+						break
+					}
+					var err error
+					cursor, err = decodeCredentialCursor(page.NextCursor)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if cursor.Generation != 19 || cursor.Sort != sortField || cursor.Order != order || cursor.LastKey == "" || cursor.LastID == "" {
+						t.Fatalf("cursor = %#v", cursor)
+					}
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("paged IDs = %v, want %v", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestAdminCredentialsRejectsCursorSortMismatch(t *testing.T) {
+	s := newAdminTestServer(t, "http://127.0.0.1:1")
+	defer s.Close()
+	cursor := encodeCredentialCursor(credentialCursor{
+		Generation: 1, Sort: credentialSortID, Order: credentialOrderAsc, LastKey: "s:a", LastID: "a",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/credentials?limit=10&sort=tier&cursor="+cursor, nil)
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminPoolSnapshotCacheTracksSnapshotIdentity(t *testing.T) {
+	cache := &adminPoolSnapshotCache{}
+	firstCredentials := []auth.CredentialInfo{{ID: "a", Status: "ready"}}
+	first := cache.get(7, firstCredentials)
+	if reused := cache.get(7, firstCredentials); reused != first {
+		t.Fatal("unchanged Pool snapshot was not reused")
+	}
+	refreshedCredentials := []auth.CredentialInfo{{ID: "a", Status: "cooling_down"}}
+	refreshed := cache.get(7, refreshedCredentials)
+	if refreshed == first || refreshed.Credentials[0].Status != "cooling_down" {
+		t.Fatalf("same-generation replacement snapshot = %#v", refreshed)
+	}
+}
+
+func credentialIDs(credentials []auth.CredentialInfo) []string {
+	ids := make([]string, len(credentials))
+	for index := range credentials {
+		ids[index] = credentials[index].ID
+	}
+	return ids
 }
 
 func marshalCredentialListResponse(t *testing.T, response adminCredentialListResponse) map[string]any {
@@ -260,11 +425,12 @@ func BenchmarkListCredentials(b *testing.B) {
 		}
 	}
 	usable := true
-	filter := adminCredentialListFilter{Limit: 100, Query: "grok-4", Status: "ready", Usable: &usable}
+	snapshot := newAdminPoolSnapshot(1, credentials)
+	filter := adminCredentialListFilter{Limit: 100, Query: "grok-4", Status: "ready", Usable: &usable, Sort: credentialSortTier, Order: credentialOrderDesc}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		page := listCredentials(credentials, 1, filter)
+		page := listCredentials(snapshot, filter)
 		if len(page.Data) != 100 || page.Total != len(credentials) || !page.HasMore {
 			b.Fatalf("unexpected page: data=%d total=%d has_more=%v", len(page.Data), page.Total, page.HasMore)
 		}
@@ -272,8 +438,8 @@ func BenchmarkListCredentials(b *testing.B) {
 }
 
 // BenchmarkAdminCredentialsHandler_16k reports p95 page and full 32-page
-// latency. Baseline on linux/amd64 (i5-13420H): 0.89ms/page p95 and
-// 71.40ms/32 pages p95 with -benchtime=5x.
+// latency. Baseline on linux/amd64 (i5-13420H): 0.82ms/page p95 and
+// 85.48ms/32 pages p95 with -benchtime=5x.
 func BenchmarkAdminCredentialsHandler_16k(b *testing.B) {
 	pool := benchmarkCredentialPool(b, 16_000)
 	handler := http.HandlerFunc((&Server{pool: pool}).adminCredentials)
@@ -287,7 +453,7 @@ func BenchmarkAdminCredentialsHandler_16k(b *testing.B) {
 		cursor := ""
 		pages := 0
 		for {
-			path := "/v1/admin/credentials?limit=500"
+			path := "/v1/admin/credentials?limit=500&sort=tier&order=desc"
 			if cursor != "" {
 				path += "&cursor=" + cursor
 			}
@@ -331,6 +497,9 @@ func BenchmarkAdminCredentialsHandler_16k(b *testing.B) {
 	p95Total := percentileDuration(iterationDurations, 0.95)
 	b.ReportMetric(float64(p95Page)/float64(time.Millisecond), "p95-page-ms")
 	b.ReportMetric(float64(p95Total)/float64(time.Millisecond), "p95-32-pages-ms")
+	if p95Page >= 50*time.Millisecond {
+		b.Fatalf("p95 latency for one page = %s, want < 50ms", p95Page)
+	}
 	if p95Total >= 200*time.Millisecond {
 		b.Fatalf("p95 latency for 32 pages = %s, want < 200ms", p95Total)
 	}
