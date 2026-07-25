@@ -29,7 +29,7 @@ export function setAdminKey(key: string | null): void {
 
 type ErrorPayload = { error?: { message?: string } | string };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const key = getAdminKey();
   if (key) headers.set("Authorization", `Bearer ${key}`);
@@ -135,7 +135,7 @@ export async function fetchCredentialPage(query: CredentialQuery): Promise<Crede
   if (query.sort) params.set("sort", query.sort);
   if (query.order) params.set("order", query.order);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const page = await request<any>(`/v1/admin/credentials?${params}`);
+  const page = await apiRequest<any>(`/v1/admin/credentials?${params}`);
   return {
     items: (page.data ?? []).map(toCredential),
     hasMore: page.has_more === true,
@@ -154,12 +154,12 @@ export async function uploadCredential(content: string | File): Promise<{ modelD
     init = { method: "POST", body: form };
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await request<any>("/v1/admin/credentials", init);
+  const result = await apiRequest<any>("/v1/admin/credentials", init);
   return { modelDiscovery: result.model_discovery ?? "unknown" };
 }
 
 export async function deleteCredential(id: string): Promise<void> {
-  await request(`/v1/admin/credentials/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await apiRequest(`/v1/admin/credentials/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 /* ---------- 审计 ---------- */
@@ -176,7 +176,7 @@ export async function fetchAudits(params: {
   if (params.model) search.set("model", params.model);
   if (params.protocol) search.set("protocol", params.protocol);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const page = await request<any>(`/v1/admin/audits?${search}`);
+  const page = await apiRequest<any>(`/v1/admin/audits?${search}`);
   return {
     items: (page.items ?? []).map(toAudit),
     pageSize: page.page_size ?? 0,
@@ -187,7 +187,7 @@ export async function fetchAudits(params: {
 
 export async function fetchAuditHealth(): Promise<AuditHealth> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const raw = await request<any>("/v1/admin/audits/health");
+  const raw = await apiRequest<any>("/v1/admin/audits/health");
   return {
     queueSize: raw.queue_size ?? 0,
     queueCap: raw.queue_cap ?? 0,
@@ -216,7 +216,7 @@ function toUsage(raw: any) {
 
 export async function fetchDashboard(period: string): Promise<Dashboard> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const raw = await request<any>(`/v1/admin/dashboard?period=${encodeURIComponent(period)}`);
+  const raw = await apiRequest<any>(`/v1/admin/dashboard?period=${encodeURIComponent(period)}`);
   const resources = raw.resources ?? {};
   return {
     period: raw.period ?? period,

@@ -1,57 +1,59 @@
 import { Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useQuery } from "@tanstack/react-query";
 
 import { Input } from "@/components/ui/input";
 import { Table, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { EmptyHint, ErrorHint, SkeletonRows, VirtualRows } from "@/components/data";
 import { PageHeader } from "@/components/layout";
+import { apiRequest } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
-import { useQuery } from "@tanstack/react-query";
 
-// 模型目录从凭证页服务端数据聚合。后端 models/summary API（task-05）就绪后切换。
-type ModelRow = { id: string; accounts: number; usable: number };
+type ModelSummary = {
+  model: string;
+  accounts: number;
+  usableAccounts: number;
+  statusCounts: Record<string, number>;
+};
+
+async function fetchModelsSummary(q?: string): Promise<ModelSummary[]> {
+  const params = q ? `?q=${encodeURIComponent(q)}` : "";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw = await apiRequest<any>(`/v1/admin/models/summary${params}`);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (raw.data ?? []).map((item: any) => ({
+    model: item.model ?? "",
+    accounts: item.accounts ?? 0,
+    usableAccounts: item.usable_accounts ?? 0,
+    statusCounts: item.status_counts ?? {},
+  }));
+}
+
+function useDebounced<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useMemo(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+}
 
 export function ModelsPage() {
   const { t } = useTranslation();
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebounced(search, 300);
 
-  const query = useQuery<{ data: ModelRow[] }>({
-    queryKey: ["models-summary"],
-    queryFn: async () => {
-      const { fetchCredentialPage } = await import("@/lib/api");
-      const byModel = new Map<string, ModelRow>();
-      let cursor = "";
-      // 模型数通常很少（个位数），但需要遍历全量凭证聚合；
-      // 等后端 /v1/admin/models/summary 就绪后替换为单次调用。
-      for (;;) {
-        const page = await fetchCredentialPage({ cursor, limit: 500 });
-        for (const credential of page.items) {
-          for (const model of credential.models) {
-            const row = byModel.get(model) ?? { id: model, accounts: 0, usable: 0 };
-            row.accounts += 1;
-            if (credential.usable) row.usable += 1;
-            byModel.set(model, row);
-          }
-        }
-        if (!page.hasMore) break;
-        cursor = page.nextCursor;
-      }
-      return { data: [...byModel.values()].sort((a, b) => b.usable - a.usable || a.id.localeCompare(b.id)) };
-    },
+  const query = useQuery({
+    queryKey: ["models-summary", debouncedSearch],
+    queryFn: () => fetchModelsSummary(debouncedSearch.trim() || undefined),
     refetchInterval: 60_000,
     placeholderData: (previous) => previous,
   });
 
-  const models = useMemo(() => query.data?.data ?? [], [query.data]);
+  const models = useMemo(() => query.data ?? [], [query.data]);
 
-  const filtered = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    if (!needle) return models;
-    return models.filter((model) => model.id.toLowerCase().includes(needle));
-  }, [models, search]);
-
-  const colSpan = 3;
+  const colSpan = 4;
 
   return (
     <>
@@ -92,11 +94,12 @@ export function ModelsPage() {
                 <TableHead>{t("models.colModel")}</TableHead>
                 <TableHead>{t("models.colAccounts")}</TableHead>
                 <TableHead>{t("models.colUsable")}</TableHead>
+                <TableHead>{t("models.colStatus")}</TableHead>
               </TableRow>
             </TableHeader>
             {query.isLoading ? (
               <SkeletonRows colSpan={colSpan} />
-            ) : filtered.length === 0 ? (
+            ) : models.length === 0 ? (
               <tbody>
                 <TableRow>
                   <TableCell colSpan={colSpan}>
@@ -106,19 +109,26 @@ export function ModelsPage() {
               </tbody>
             ) : (
               <VirtualRows
-                items={filtered}
+                items={models}
                 colSpan={colSpan}
                 rowHeight={45}
                 renderRow={(model) => (
-                  <TableRow key={model.id}>
+                  <TableRow key={model.model}>
                     <TableCell>
-                      <span className="font-mono text-[13px]">{model.id}</span>
+                      <span className="font-mono text-[13px]">{model.model}</span>
                     </TableCell>
                     <TableCell>
                       <span className="text-[13px] tabular-nums">{formatNumber(model.accounts)}</span>
                     </TableCell>
                     <TableCell>
-                      <span className="text-[13px] tabular-nums">{formatNumber(model.usable)}</span>
+                      <span className="text-[13px] tabular-nums">{formatNumber(model.usableAccounts)}</span>
+                    </TableCell>
+                    <TableCell>
+                      <span className="text-xs text-muted-foreground">
+                        {Object.entries(model.statusCounts)
+                          .map(([status, count]) => `${t(`accounts.status.${status}`, { defaultValue: status })} ${formatNumber(count)}`)
+                          .join(" · ") || "—"}
+                      </span>
                     </TableCell>
                   </TableRow>
                 )}
