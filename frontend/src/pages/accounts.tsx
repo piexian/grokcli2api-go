@@ -37,7 +37,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmptyHint, ErrorHint, SkeletonRows } from "@/components/data";
 import { PageHeader } from "@/components/layout";
-import { deleteCredential, fetchCredentialPage, uploadCredential, type CredentialQuery } from "@/lib/api";
+import { deleteCredential, fetchCredentialPage, splitCredentialPayloads, uploadCredentialsBatch, type CredentialQuery, type UploadItemResult } from "@/lib/api";
 import { formatDateTime, formatNumber } from "@/lib/format";
 import type { Credential } from "@/lib/types";
 
@@ -143,6 +143,8 @@ export function AccountsPage() {
   const [uploadOpen, setUploadOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Credential | null>(null);
   const [paste, setPaste] = useState("");
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
+  const [uploadResults, setUploadResults] = useState<UploadItemResult[] | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const sentinelRef = useRef<HTMLTableRowElement>(null);
 
@@ -174,15 +176,48 @@ export function AccountsPage() {
   useLoadMore(sentinelRef, Boolean(query.hasNextPage), loadMore);
 
   const uploadMutation = useMutation({
-    mutationFn: (content: string | File) => uploadCredential(content),
-    onSuccess: (result) => {
-      toast.success(t("accounts.uploaded", { status: result.modelDiscovery }));
-      setUploadOpen(false);
-      setPaste("");
+    mutationFn: (items: Array<{ name: string; content: string | File }>) =>
+      uploadCredentialsBatch(items, (done, total) => setUploadProgress({ done, total })),
+    onSuccess: (results) => {
+      const succeeded = results.filter((r) => r.ok).length;
+      const failed = results.length - succeeded;
+      if (failed === 0) {
+        toast.success(t("accounts.batchUploaded", { count: succeeded }));
+        setUploadOpen(false);
+        setPaste("");
+        setUploadResults(null);
+      } else {
+        toast.warning(t("accounts.batchPartial", { succeeded, failed }));
+        setUploadResults(results);
+      }
+      setUploadProgress(null);
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
     },
-    onError: (error) => toast.error(error instanceof Error ? error.message : t("accounts.uploadFailed")),
+    onError: (error) => {
+      setUploadProgress(null);
+      toast.error(error instanceof Error ? error.message : t("accounts.uploadFailed"));
+    },
   });
+
+  function submitUpload() {
+    const items: Array<{ name: string; content: string }> = splitCredentialPayloads(paste).map((content, i) => ({
+      name: t("accounts.pasteItem", { index: i + 1 }),
+      content,
+    }));
+    if (items.length === 0) {
+      toast.error(t("accounts.uploadParseFailed"));
+      return;
+    }
+    setUploadResults(null);
+    uploadMutation.mutate(items);
+  }
+
+  function submitFiles(files: FileList) {
+    const items = [...files].map((file) => ({ name: file.name, content: file }));
+    if (items.length === 0) return;
+    setUploadResults(null);
+    uploadMutation.mutate(items);
+  }
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteCredential(id),
@@ -374,35 +409,70 @@ export function AccountsPage() {
         </div>
       )}
 
-      <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
-        <DialogContent>
+      <Dialog
+        open={uploadOpen}
+        onOpenChange={(open) => {
+          if (uploadMutation.isPending) return;
+          setUploadOpen(open);
+          if (!open) {
+            setPaste("");
+            setUploadResults(null);
+            setUploadProgress(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg">
           <DialogHeader>
             <DialogTitle>{t("accounts.uploadTitle")}</DialogTitle>
             <DialogDescription>{t("accounts.uploadHint")}</DialogDescription>
           </DialogHeader>
           <Textarea
             className="min-h-36 font-mono text-xs"
-            placeholder='{"access_token":"…","refresh_token":"…"}'
+            placeholder={t("accounts.uploadPlaceholder")}
             value={paste}
             onChange={(event) => setPaste(event.target.value)}
+            disabled={uploadMutation.isPending}
           />
           <input
             ref={fileRef}
             type="file"
             accept="application/json,.json"
+            multiple
             className="hidden"
             onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (file) uploadMutation.mutate(file);
+              const files = event.target.files;
+              if (files && files.length > 0) submitFiles(files);
               event.target.value = "";
             }}
           />
+          {uploadProgress ? (
+            <p className="text-[13px] text-muted-foreground">
+              {t("accounts.uploadProgress", { done: uploadProgress.done, total: uploadProgress.total })}
+            </p>
+          ) : null}
+          {uploadResults ? (
+            <div className="max-h-40 overflow-y-auto rounded-md border p-2 text-xs">
+              {uploadResults.map((result, index) => (
+                <div key={`${result.name}-${index}`} className={result.ok ? "text-emerald-600" : "text-destructive"}>
+                  {result.ok
+                    ? t("accounts.uploadItemOk", { name: result.name })
+                    : t("accounts.uploadItemFail", { name: result.name, error: result.error ?? "" })}
+                </div>
+              ))}
+            </div>
+          ) : null}
           <DialogFooter>
-            <Button variant="outline" onClick={() => fileRef.current?.click()} disabled={uploadMutation.isPending}>
-              {t("accounts.uploadFile")}
+            <Button
+              variant="outline"
+              onClick={() => fileRef.current?.click()}
+              disabled={uploadMutation.isPending}
+            >
+              {t("accounts.uploadFiles")}
             </Button>
-            <Button onClick={() => uploadMutation.mutate(paste)} disabled={uploadMutation.isPending || !paste.trim()}>
-              {uploadMutation.isPending ? t("accounts.uploading") : t("accounts.upload")}
+            <Button onClick={submitUpload} disabled={uploadMutation.isPending || !paste.trim()}>
+              {uploadMutation.isPending
+                ? t("accounts.uploading")
+                : t("accounts.upload")}
             </Button>
           </DialogFooter>
         </DialogContent>

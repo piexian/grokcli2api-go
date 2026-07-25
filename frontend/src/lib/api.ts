@@ -158,6 +158,79 @@ export async function uploadCredential(content: string | File): Promise<{ modelD
   return { modelDiscovery: result.model_discovery ?? "unknown" };
 }
 
+export type UploadItemResult = {
+  name: string;
+  ok: boolean;
+  error?: string;
+};
+
+/** 把粘贴文本拆成凭证对象：支持 JSON 数组、单个对象和 NDJSON。 */
+export function splitCredentialPayloads(text: string): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      const objects = parsed.filter(
+        (item): item is Record<string, unknown> =>
+          typeof item === "object" && item !== null && !Array.isArray(item),
+      );
+      return objects.length === parsed.length ? objects.map((item) => JSON.stringify(item)) : [];
+    }
+    if (typeof parsed === "object" && parsed !== null) return [JSON.stringify(parsed)];
+    return [];
+  } catch {
+    // 顶层不是完整 JSON 时，按 NDJSON 逐行严格解析。
+  }
+
+  const payloads: string[] = [];
+  for (const line of trimmed.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      payloads.push(JSON.stringify(parsed));
+    } catch {
+      return [];
+    }
+  }
+  return payloads;
+}
+
+/** 批量上传：最多 4 路并发，单项失败不影响其余项。 */
+export async function uploadCredentialsBatch(
+  items: Array<{ name: string; content: string | File }>,
+  onProgress?: (done: number, total: number) => void,
+): Promise<UploadItemResult[]> {
+  const results = new Array<UploadItemResult>(items.length);
+  let nextIndex = 0;
+  let completed = 0;
+  const workerCount = Math.min(4, items.length);
+
+  async function worker(): Promise<void> {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      const item = items[index];
+      try {
+        await uploadCredential(item.content);
+        results[index] = { name: item.name, ok: true };
+      } catch (error) {
+        results[index] = {
+          name: item.name,
+          ok: false,
+          error: error instanceof Error ? error.message : "upload failed",
+        };
+      }
+      completed += 1;
+      onProgress?.(completed, items.length);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 export async function deleteCredential(id: string): Promise<void> {
   await apiRequest(`/v1/admin/credentials/${encodeURIComponent(id)}`, { method: "DELETE" });
 }

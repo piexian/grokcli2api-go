@@ -1,5 +1,5 @@
 {
-  "name": "grok2api-frontend",
+  "name": "grokcli2api-frontend",
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@11.5.2",
