@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Futureppo/grokcli2api-go/internal/audit"
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 	"github.com/Futureppo/grokcli2api-go/internal/modelcatalog"
@@ -1046,6 +1047,8 @@ func (c *Client) doWithIdentity(ctx context.Context, lease *auth.Lease, method, 
 	var wrote atomic.Bool
 	timing := RequestTimingFromContext(ctx)
 	timing.MarkAttempt()
+	audit.SetAccount(ctx, lease.AccountID())
+	audit.MarkAttempt(ctx)
 	requestCtx := httptrace.WithClientTrace(ctx, timing.ClientTrace(func() {
 		// A request without a body remains safe to replay after a transport
 		// failure. For inference POSTs, WroteRequest means the body was handed

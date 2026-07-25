@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Futureppo/grokcli2api-go/internal/audit"
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/grok"
 	"github.com/Futureppo/grokcli2api-go/internal/inference"
@@ -53,7 +54,11 @@ type continuityLookup struct {
 func (s *Server) prepareInferenceExecution(r *http.Request, body map[string]any, plan *inference.RequestPlan) (inferenceExecution, error) {
 	tenant := tenantFromContext(r.Context())
 	execution := inferenceExecution{tenant: tenant, model: plan.Model(), plan: plan, affinity: requestSoftAffinity(r, body)}
-	execution.identity = grok.RequestIdentity{RequestID: grok.NewID(), SessionID: newLogicalSession()}
+	requestID := audit.CaptureFromContext(r.Context()).RequestID()
+	if requestID == "" {
+		requestID = grok.NewID()
+	}
+	execution.identity = grok.RequestIdentity{RequestID: requestID, SessionID: newLogicalSession()}
 	execution.identity.ConversationID = execution.identity.SessionID
 	turn := uint64(0)
 	execution.identity.TurnIndex = &turn
@@ -356,6 +361,10 @@ func (s *Server) executeNonStreaming(w http.ResponseWriter, r *http.Request, bod
 		return
 	}
 	copyModelHeaders(w.Header(), result.Headers)
+	setAuditUsage(r.Context(), decodeCanonicalResponse(result.Attempt.Backend, result.Payload).Usage)
+	if responsesPayloadFailed(result.Payload) {
+		audit.CaptureFromContext(r.Context()).SetError("upstream_response_failed")
+	}
 	anthropicOptions := responseOptionsFromMessages(body)
 	payload := adaptBackendResponse(result.Attempt.Adapter, result.Payload, plan.Model(), anthropicOptions)
 	if plan.Protocol() == inference.ProtocolResponses {
@@ -400,6 +409,7 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 	prepareSSE(w)
 	flush := flusher(w)
 	adapter := newBackendStreamAdapter(stream.Attempt.Adapter, plan.Model(), responseOptionsFromMessages(body))
+	defer func() { setAuditUsage(r.Context(), adapter.Usage()) }()
 	store, _ := stream.Attempt.Body["store"].(bool)
 	replay := &streamToolReplayState{
 		model: plan.Model(), promptCacheKey: openai.String(body, "prompt_cache_key", ""),
@@ -412,6 +422,7 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 			if compat != nil {
 				compatEvents, translateErr := compat.TranslateStream(translated.Event, translated.Data)
 				if translateErr != nil {
+					audit.CaptureFromContext(r.Context()).SetError("compatibility_error")
 					for _, failure := range adapter.encodeError(translateErr.Error(), "compatibility_error") {
 						_ = writeRawSSE(w, failure)
 					}
@@ -427,6 +438,7 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 				state.Observe(finalEvent)
 				replay.handle(finalEvent.Event, finalEvent.Data)
 				if err := writeRawSSE(w, finalEvent); err != nil {
+					audit.CaptureFromContext(r.Context()).SetError("client_write_error")
 					return false
 				}
 			}
@@ -437,8 +449,10 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 		event, ok, nextErr := stream.Next()
 		if nextErr != nil {
 			if errors.Is(nextErr, context.Canceled) {
+				audit.CaptureFromContext(r.Context()).SetError("request_canceled")
 				return
 			}
+			audit.CaptureFromContext(r.Context()).SetError("upstream_error")
 			for _, outgoing := range adapter.encodeError(nextErr.Error(), "upstream_error") {
 				_ = writeRawSSE(w, outgoing)
 			}
@@ -449,6 +463,9 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 			if !emit(adapter.Finish()) {
 				return
 			}
+			if !adapter.Success() {
+				audit.CaptureFromContext(r.Context()).SetError("upstream_stream_incomplete")
+			}
 			flush()
 			if adapter.Success() {
 				s.commitStreamContinuity(execution, stream, adapter, plan.Protocol(), state.Tokens())
@@ -457,6 +474,7 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 		}
 		outgoing, adaptErr := adapter.Handle(event)
 		if adaptErr != nil {
+			audit.CaptureFromContext(r.Context()).SetError("upstream_stream_error")
 			for _, failure := range adapter.encodeError(adaptErr.Error(), "upstream_stream_error") {
 				_ = writeRawSSE(w, failure)
 			}
@@ -468,6 +486,9 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 		}
 		flush()
 		if adapter.Terminal() {
+			if !adapter.Success() {
+				audit.CaptureFromContext(r.Context()).SetError("upstream_stream_error")
+			}
 			if adapter.Success() {
 				s.commitStreamContinuity(execution, stream, adapter, plan.Protocol(), state.Tokens())
 				if plan.Protocol() == inference.ProtocolChatCompletions {
@@ -478,6 +499,13 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 			return
 		}
 	}
+}
+
+func setAuditUsage(ctx context.Context, usage canonicalUsage) {
+	audit.CaptureFromContext(ctx).SetUsage(audit.Usage{
+		Input: usage.Input, CachedInput: usage.Cached, Output: usage.Output,
+		Reasoning: usage.Reasoning, Total: usage.total(),
+	})
 }
 
 func (s *Server) commitContinuity(execution inferenceExecution, accountID string, attempt inference.RenderedAttempt, identity grok.RequestIdentity, payload map[string]any, protocol inference.Protocol) {

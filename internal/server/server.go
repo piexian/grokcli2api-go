@@ -12,10 +12,12 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Futureppo/grokcli2api-go/internal/anthropic"
+	"github.com/Futureppo/grokcli2api-go/internal/audit"
 	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 	"github.com/Futureppo/grokcli2api-go/internal/grok"
@@ -29,6 +31,7 @@ type Server struct {
 	pool       *auth.Pool
 	client     *grok.Client
 	continuity *continuityStore
+	audits     *audit.Store
 	mux        *http.ServeMux
 }
 
@@ -52,11 +55,29 @@ func New(cfg config.Config) (*Server, error) {
 		pool.Close()
 		return nil, err
 	}
+	auditPath := strings.TrimSpace(cfg.AuditDB)
+	if auditPath == "" {
+		auditPath = filepath.Join(cfg.AuthsDir, "audit.db")
+	}
+	retentionDays := cfg.AuditRetentionDays
+	if retentionDays < 1 {
+		retentionDays = 30
+	}
+	var auditStore *audit.Store
+	if !strings.EqualFold(auditPath, "off") {
+		auditStore, err = audit.Open(auditPath, retentionDays)
+		if err != nil {
+			client.Close()
+			pool.Close()
+			return nil, fmt.Errorf("initialize request audit storage: %w", err)
+		}
+	}
 	if len(pool.AccountIDs()) > 0 {
 		modelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		err = client.InitializeModels(modelCtx)
 		cancel()
 		if err != nil && cfg.AdminKey == "" {
+			_ = auditStore.Close()
 			client.Close()
 			pool.Close()
 			return nil, fmt.Errorf("initialize model catalog: %w", err)
@@ -69,6 +90,7 @@ func New(cfg config.Config) (*Server, error) {
 	s := &Server{
 		cfg: cfg, pool: pool, client: client,
 		continuity: newContinuityStore(cfg.AuthsDir, cfg.AffinityTTL, cfg.AffinityMaxEntries),
+		audits:     auditStore,
 		mux:        http.NewServeMux(),
 	}
 	s.routes()
@@ -79,12 +101,16 @@ func (s *Server) Close() {
 	s.client.Close()
 	s.continuity.Close()
 	s.pool.Close()
+	if err := s.audits.Close(); err != nil {
+		slog.Error("close request audit storage", "error", err)
+	}
 }
 
 func (s *Server) Handler() http.Handler {
-	return recoverer(requestLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := recoverer(requestLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mux.ServeHTTP(w, r)
 	})))
+	return s.auditRequests(base)
 }
 
 func (s *Server) routes() {
@@ -106,6 +132,9 @@ func (s *Server) routes() {
 		s.mux.Handle("GET /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("POST /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("DELETE /v1/admin/credentials/{id}", s.adminKeyGate(http.HandlerFunc(s.adminCredential)))
+		s.mux.Handle("GET /v1/admin/audits", s.adminKeyGate(http.HandlerFunc(s.adminAudits)))
+		s.mux.Handle("GET /v1/admin/audits/summary", s.adminKeyGate(http.HandlerFunc(s.adminAuditSummary)))
+		s.mux.Handle("GET /v1/admin/dashboard", s.adminKeyGate(http.HandlerFunc(s.adminDashboard)))
 	}
 }
 
@@ -355,6 +384,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	captureAuditRequest(r.Context(), body)
 	prepareStarted := time.Now()
 	plan, err := inference.NewRequestPlan(inference.ProtocolChatCompletions, body, inference.PlanOptions{Tenant: tenantFromContext(r.Context())})
 	if err != nil {
@@ -380,6 +410,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	captureAuditRequest(r.Context(), body)
 	prepareStarted := time.Now()
 	native := isGrokCLIClient(r)
 	options := inference.PlanOptions{NativeCLI: native, Tenant: tenantFromContext(r.Context())}
@@ -424,6 +455,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	captureAuditRequest(r.Context(), body)
 	prepareStarted := time.Now()
 	plan, err := inference.NewRequestPlan(inference.ProtocolMessages, body, inference.PlanOptions{Tenant: tenantFromContext(r.Context())})
 	if err != nil {
@@ -693,7 +725,9 @@ func (s *Server) proxyGET(path string, trace bool) http.HandlerFunc {
 func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(s.cfg.APIKeys) == 0 {
-			next.ServeHTTP(w, r.WithContext(withTenant(r.Context(), s.pool.TenantID(""))))
+			tenant := s.pool.TenantID("")
+			audit.CaptureFromContext(r.Context()).SetTenant(tenant)
+			next.ServeHTTP(w, r.WithContext(withTenant(r.Context(), tenant)))
 			return
 		}
 		candidate := strings.TrimSpace(r.Header.Get("api-key"))
@@ -716,7 +750,9 @@ func (s *Server) apiKeyGate(next http.Handler) http.Handler {
 			}
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(withTenant(r.Context(), s.pool.TenantID(candidate))))
+		tenant := s.pool.TenantID(candidate)
+		audit.CaptureFromContext(r.Context()).SetTenant(tenant)
+		next.ServeHTTP(w, r.WithContext(withTenant(r.Context(), tenant)))
 	})
 }
 

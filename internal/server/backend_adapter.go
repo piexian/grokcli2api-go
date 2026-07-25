@@ -23,7 +23,48 @@ type canonicalToolCall struct {
 }
 
 type canonicalUsage struct {
-	Input, Output, Cached, Reasoning int64
+	Input, Output, Cached, Reasoning, Total int64
+}
+
+func (u canonicalUsage) total() int64 {
+	if u.Total > 0 {
+		return u.Total
+	}
+	return u.Input + u.Output
+}
+
+func canonicalChatUsage(usage map[string]any) canonicalUsage {
+	result := canonicalUsage{
+		Input: intAt(usage, "prompt_tokens", "input_tokens"), Output: intAt(usage, "completion_tokens", "output_tokens"),
+		Total: intAt(usage, "total_tokens"),
+	}
+	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		result.Cached = intAt(details, "cached_tokens")
+	}
+	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
+		result.Reasoning = intAt(details, "reasoning_tokens")
+	}
+	return result
+}
+
+func canonicalResponsesUsage(usage map[string]any) canonicalUsage {
+	result := canonicalUsage{
+		Input: intAt(usage, "input_tokens"), Output: intAt(usage, "output_tokens"), Total: intAt(usage, "total_tokens"),
+	}
+	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+		result.Cached = intAt(details, "cached_tokens")
+	}
+	if details, ok := usage["output_tokens_details"].(map[string]any); ok {
+		result.Reasoning = intAt(details, "reasoning_tokens")
+	}
+	return result
+}
+
+func canonicalMessagesUsage(usage map[string]any) canonicalUsage {
+	return canonicalUsage{
+		Input: intAt(usage, "input_tokens"), Output: intAt(usage, "output_tokens"),
+		Cached: intAt(usage, "cache_read_input_tokens"), Total: intAt(usage, "total_tokens"),
+	}
 }
 
 type canonicalResult struct {
@@ -243,15 +284,7 @@ func decodeChatResult(payload map[string]any) canonicalResult {
 		}
 	}
 	usage, _ := payload["usage"].(map[string]any)
-	result.Usage = canonicalUsage{
-		Input: intAt(usage, "prompt_tokens", "input_tokens"), Output: intAt(usage, "completion_tokens", "output_tokens"),
-	}
-	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
-		result.Usage.Cached = intAt(details, "cached_tokens")
-	}
-	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
-		result.Usage.Reasoning = intAt(details, "reasoning_tokens")
-	}
+	result.Usage = canonicalChatUsage(usage)
 	return result
 }
 
@@ -284,13 +317,7 @@ func decodeResponsesResult(payload map[string]any) canonicalResult {
 		}
 	}
 	usage, _ := payload["usage"].(map[string]any)
-	result.Usage = canonicalUsage{Input: intAt(usage, "input_tokens"), Output: intAt(usage, "output_tokens")}
-	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-		result.Usage.Cached = intAt(details, "cached_tokens")
-	}
-	if details, ok := usage["output_tokens_details"].(map[string]any); ok {
-		result.Usage.Reasoning = intAt(details, "reasoning_tokens")
-	}
+	result.Usage = canonicalResponsesUsage(usage)
 	return result
 }
 
@@ -316,10 +343,7 @@ func decodeMessagesResult(payload map[string]any) canonicalResult {
 		}
 	}
 	usage, _ := payload["usage"].(map[string]any)
-	result.Usage = canonicalUsage{
-		Input: intAt(usage, "input_tokens"), Output: intAt(usage, "output_tokens"),
-		Cached: intAt(usage, "cache_read_input_tokens"),
-	}
+	result.Usage = canonicalMessagesUsage(usage)
 	return result
 }
 
@@ -508,7 +532,7 @@ func messagesStopReason(result canonicalResult) string {
 
 func chatUsage(usage canonicalUsage) map[string]any {
 	return map[string]any{
-		"prompt_tokens": usage.Input, "completion_tokens": usage.Output, "total_tokens": usage.Input + usage.Output,
+		"prompt_tokens": usage.Input, "completion_tokens": usage.Output, "total_tokens": usage.total(),
 		"prompt_tokens_details":     map[string]any{"cached_tokens": usage.Cached},
 		"completion_tokens_details": map[string]any{"reasoning_tokens": usage.Reasoning},
 	}
@@ -516,7 +540,7 @@ func chatUsage(usage canonicalUsage) map[string]any {
 
 func responsesUsage(usage canonicalUsage) map[string]any {
 	return map[string]any{
-		"input_tokens": usage.Input, "output_tokens": usage.Output, "total_tokens": usage.Input + usage.Output,
+		"input_tokens": usage.Input, "output_tokens": usage.Output, "total_tokens": usage.total(),
 		"input_tokens_details":  map[string]any{"cached_tokens": usage.Cached},
 		"output_tokens_details": map[string]any{"reasoning_tokens": usage.Reasoning},
 	}

@@ -123,6 +123,12 @@ func newBackendStreamAdapter(adapter inference.ResponseAdapter, model string, me
 
 func (s *backendStreamAdapter) Terminal() bool { return s != nil && s.terminal }
 func (s *backendStreamAdapter) Success() bool  { return s != nil && s.terminal && s.success }
+func (s *backendStreamAdapter) Usage() canonicalUsage {
+	if s == nil {
+		return canonicalUsage{}
+	}
+	return s.usage
+}
 func (s *backendStreamAdapter) ResponseID() string {
 	if s == nil || s.adapter.ClientProtocol != inference.ProtocolResponses || s.id == "" {
 		return ""
@@ -136,6 +142,9 @@ func (s *backendStreamAdapter) ResponseID() string {
 func (s *backendStreamAdapter) Handle(event grok.SSEEvent) ([]grok.SSEEvent, error) {
 	if s == nil || s.terminal {
 		return nil, nil
+	}
+	if usage, ok := streamEventUsage(s.adapter.UpstreamBackend, event); ok {
+		s.usage = mergeUsage(s.usage, usage)
 	}
 	if s.responsesToMessages != nil {
 		return s.handleResponsesToMessages(event)
@@ -286,7 +295,7 @@ func (s *backendStreamAdapter) handleNative(event grok.SSEEvent) ([]grok.SSEEven
 			return s.encodeError(errorMessage(rawError), "upstream_error"), nil
 		}
 		if usage, ok := chunk["usage"].(map[string]any); ok {
-			s.usage = canonicalUsage{Input: intAt(usage, "prompt_tokens"), Output: intAt(usage, "completion_tokens")}
+			s.usage = mergeUsage(s.usage, canonicalChatUsage(usage))
 		}
 		return []grok.SSEEvent{{Data: mustJSON(chunk)}}, nil
 	case inference.ProtocolResponses:
@@ -538,6 +547,32 @@ func decodeStreamAtoms(backend modelcatalog.Backend, event grok.SSEEvent, chatTo
 		return decodeMessagesAtoms(event, messageBlocks)
 	default:
 		return decodeChatAtoms(event, chatTools)
+	}
+}
+
+func streamEventUsage(backend modelcatalog.Backend, event grok.SSEEvent) (canonicalUsage, bool) {
+	if len(event.Data) == 0 || string(event.Data) == "[DONE]" {
+		return canonicalUsage{}, false
+	}
+	var payload map[string]any
+	if json.Unmarshal(event.Data, &payload) != nil {
+		return canonicalUsage{}, false
+	}
+	switch backend {
+	case modelcatalog.BackendResponses:
+		response, _ := payload["response"].(map[string]any)
+		usage, ok := response["usage"].(map[string]any)
+		return canonicalResponsesUsage(usage), ok
+	case modelcatalog.BackendMessages:
+		if message, ok := payload["message"].(map[string]any); ok {
+			usage, exists := message["usage"].(map[string]any)
+			return canonicalMessagesUsage(usage), exists
+		}
+		usage, ok := payload["usage"].(map[string]any)
+		return canonicalMessagesUsage(usage), ok
+	default:
+		usage, ok := payload["usage"].(map[string]any)
+		return canonicalChatUsage(usage), ok
 	}
 }
 
@@ -1326,6 +1361,9 @@ func mergeUsage(current, next canonicalUsage) canonicalUsage {
 	}
 	if next.Reasoning != 0 {
 		current.Reasoning = next.Reasoning
+	}
+	if next.Total != 0 {
+		current.Total = next.Total
 	}
 	return current
 }

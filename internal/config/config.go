@@ -44,6 +44,8 @@ type Config struct {
 	NoProxy                []string
 	APIKeys                []string
 	AdminKey               string
+	AuditDB                string
+	AuditRetentionDays     int
 }
 
 func Load() (Config, error) {
@@ -67,6 +69,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	affinityMax, err := envPositiveInt("GROK_AFFINITY_MAX_ENTRIES", 100000)
+	if err != nil {
+		return Config{}, err
+	}
+	auditRetentionDays, err := envPositiveInt("GROK_AUDIT_RETENTION_DAYS", 30)
 	if err != nil {
 		return Config{}, err
 	}
@@ -106,6 +112,13 @@ func Load() (Config, error) {
 	if clientMode != "headless" && clientMode != "interactive" {
 		return Config{}, fmt.Errorf("GROK_CLIENT_MODE must be headless or interactive")
 	}
+	authsDir := expandHome(env("GROK_AUTHS_DIR", "./auths"))
+	auditDB := strings.TrimSpace(env("GROK_AUDIT_DB", filepath.Join(authsDir, "audit.db")))
+	if strings.EqualFold(auditDB, "off") {
+		auditDB = "off"
+	} else {
+		auditDB = expandHome(auditDB)
+	}
 	cfg := Config{
 		Host:                   env("GROK2API_HOST", "0.0.0.0"),
 		Port:                   port,
@@ -113,7 +126,7 @@ func Load() (Config, error) {
 		ChatProxyBaseURL:       strings.TrimRight(env("GROK_CHAT_PROXY_BASE_URL", "https://cli-chat-proxy.grok.com"), "/"),
 		ChatProxyVersion:       strings.Trim(env("GROK_CHAT_PROXY_VERSION", "v1"), "/"),
 		XAIAPIBaseURL:          strings.TrimRight(env("GROK_XAI_API_BASE_URL", "https://api.x.ai"), "/"),
-		AuthsDir:               expandHome(env("GROK_AUTHS_DIR", "./auths")),
+		AuthsDir:               authsDir,
 		AuthsReloadInterval:    reloadInterval,
 		AuthRefreshConcurrency: refreshConcurrency,
 		AccountMaxInflight:     accountMaxInflight,
@@ -137,6 +150,8 @@ func Load() (Config, error) {
 		ProxyURL:               strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),
 		NoProxy:                splitCSV(os.Getenv("GROK_NO_PROXY")),
 		AdminKey:               strings.TrimSpace(os.Getenv("GROK_ADMIN_KEY")),
+		AuditDB:                auditDB,
+		AuditRetentionDays:     auditRetentionDays,
 	}
 	cfg.APIKeys = unique(append(splitCSV(os.Getenv("GROK_API_KEYS")), splitCSV(os.Getenv("GROK_API_KEY"))...))
 	return cfg, nil
