@@ -113,30 +113,27 @@ function toAudit(raw: any): AuditRecord {
 
 /* ---------- 凭证 ---------- */
 
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 100;
 
-/** 流式拉取全部凭证：每页 yield 累积快照，首屏无需等待全量。 */
-export async function* streamCredentials(signal?: AbortSignal): AsyncGenerator<Credential[]> {
-  const all: Credential[] = [];
-  let cursor = "";
-  for (;;) {
-    const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
-    if (cursor) params.set("cursor", cursor);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const page = await request<any>(`/v1/admin/credentials?${params}`, { signal });
-    all.push(...(page.data ?? []).map(toCredential));
-    yield [...all];
-    if (!page.has_more || !page.next_cursor) return all;
-    cursor = page.next_cursor;
-  }
-}
+export type CredentialQuery = {
+  cursor?: string;
+  limit?: number;
+  q?: string;
+  status?: string;
+  usable?: boolean;
+  sort?: "id" | "tier" | "status" | "expires_at" | "models_count" | "usable";
+  order?: "asc" | "desc";
+};
 
-export async function fetchCredentialPage(
-  cursor: string,
-  limit = PAGE_SIZE,
-): Promise<CredentialPage> {
-  const params = new URLSearchParams({ limit: String(limit) });
-  if (cursor) params.set("cursor", cursor);
+/** 服务端分页拉取一页凭证（懒加载：只取可视所需，不预拉全量）。 */
+export async function fetchCredentialPage(query: CredentialQuery): Promise<CredentialPage> {
+  const params = new URLSearchParams({ limit: String(query.limit ?? PAGE_SIZE) });
+  if (query.cursor) params.set("cursor", query.cursor);
+  if (query.q) params.set("q", query.q);
+  if (query.status) params.set("status", query.status);
+  if (query.usable !== undefined) params.set("usable", String(query.usable));
+  if (query.sort) params.set("sort", query.sort);
+  if (query.order) params.set("order", query.order);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const page = await request<any>(`/v1/admin/credentials?${params}`);
   return {

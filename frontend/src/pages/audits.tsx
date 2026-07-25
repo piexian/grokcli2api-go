@@ -53,7 +53,7 @@ export function AuditsPage() {
     setPage((current) => current + 1);
   }
 
-  const colSpan = 8;
+  const colSpan = 9;
 
   return (
     <>
@@ -119,6 +119,7 @@ export function AuditsPage() {
                   <TableHead>{t("audits.colProtocol")}</TableHead>
                   <TableHead>{t("audits.colModel")}</TableHead>
                   <TableHead>{t("audits.colStatus")}</TableHead>
+                  <TableHead>{t("audits.colError")}</TableHead>
                   <TableHead>{t("audits.colTokens")}</TableHead>
                   <TableHead>{t("audits.colDuration")}</TableHead>
                   <TableHead>{t("audits.colAttempts")}</TableHead>
@@ -153,6 +154,9 @@ export function AuditsPage() {
                       </TableCell>
                       <TableCell>
                         <Badge variant={statusVariant(audit.statusCode)}>{audit.statusCode || "—"}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        <span className="text-[13px] text-muted-foreground">{audit.errorCode ?? "—"}</span>
                       </TableCell>
                       <TableCell>
                         <span className="text-[13px] tabular-nums">

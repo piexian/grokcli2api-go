@@ -86,9 +86,10 @@ export function DashboardPage() {
         <ErrorHint message={t("dashboard.loadFailed")} onRetry={() => void query.refetch()} />
       ) : (
         <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
             <Stat label={t("dashboard.accounts")} value={formatNumber(data?.resources.totalAccounts ?? 0)} />
             <Stat label={t("dashboard.usableAccounts")} value={formatNumber(data?.resources.usableAccounts ?? 0)} />
+            <Stat label={t("dashboard.coolingAccounts")} value={formatNumber(data?.resources.coolingAccounts ?? 0)} />
             <Stat label={t("dashboard.disabledAccounts")} value={formatNumber(data?.resources.disabledAccounts ?? 0)} />
             <Stat label={t("dashboard.paidAccounts")} value={formatNumber(data?.resources.paidAccounts ?? 0)} />
             <Stat label={t("dashboard.models")} value={formatNumber(data?.resources.totalModels ?? 0)} />
