@@ -44,6 +44,8 @@ type Config struct {
 	NoProxy                []string
 	APIKeys                []string
 	AdminKey               string
+	WebDist                string
+	PublicBaseURL          string
 	AuditDB                string
 	AuditRetentionDays     int
 }
@@ -112,6 +114,15 @@ func Load() (Config, error) {
 	if clientMode != "headless" && clientMode != "interactive" {
 		return Config{}, fmt.Errorf("GROK_CLIENT_MODE must be headless or interactive")
 	}
+	webDist := strings.TrimSpace(env("GROK_WEB_DIST", "frontend/dist"))
+	if webDist == "" {
+		webDist = "frontend/dist"
+	}
+	if strings.EqualFold(webDist, "off") {
+		webDist = "off"
+	} else {
+		webDist = expandHome(webDist)
+	}
 	authsDir := expandHome(env("GROK_AUTHS_DIR", "./auths"))
 	auditDB := strings.TrimSpace(env("GROK_AUDIT_DB", filepath.Join(authsDir, "audit.db")))
 	if strings.EqualFold(auditDB, "off") {
@@ -150,6 +161,8 @@ func Load() (Config, error) {
 		ProxyURL:               strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),
 		NoProxy:                splitCSV(os.Getenv("GROK_NO_PROXY")),
 		AdminKey:               strings.TrimSpace(os.Getenv("GROK_ADMIN_KEY")),
+		WebDist:                webDist,
+		PublicBaseURL:          strings.TrimSpace(os.Getenv("GROK_PUBLIC_BASE_URL")),
 		AuditDB:                auditDB,
 		AuditRetentionDays:     auditRetentionDays,
 	}

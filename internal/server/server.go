@@ -33,6 +33,7 @@ type Server struct {
 	continuity *continuityStore
 	audits     *audit.Store
 	mux        *http.ServeMux
+	spa        http.Handler
 }
 
 func New(cfg config.Config) (*Server, error) {
@@ -114,6 +115,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
+	s.spa = newSPAHandler(s.cfg.WebDist)
+	s.mux.HandleFunc("GET /runtime-config.js", s.runtimeConfig)
 	s.mux.HandleFunc("/", s.root)
 	s.protected("GET /v1/models", s.models)
 	s.protected("GET /v1/models/{model_id}", s.model)
@@ -143,22 +146,28 @@ func (s *Server) protected(pattern string, handler http.HandlerFunc) {
 }
 
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
-	// A ServeMux pattern ending in "/" is a subtree match; keep the root
-	// endpoint exact so unknown paths still receive the expected 404.
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+	if r.URL.Path == "/" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.spa != nil && acceptsHTML(r) {
+			s.spa.ServeHTTP(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":    "grokcli2api-go",
+			"version": config.Version,
+			"project": "https://github.com/Futureppo/grokcli2api-go",
+		})
 		return
 	}
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if r.Method == http.MethodGet && s.spa != nil && !isAPIPath(r.URL.Path) {
+		s.spa.ServeHTTP(w, r)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name":    "grokcli2api-go",
-		"version": config.Version,
-		"project": "https://github.com/Futureppo/grokcli2api-go",
-	})
+	http.NotFound(w, r)
 }
 
 func (s *Server) models(w http.ResponseWriter, _ *http.Request) {

@@ -3,6 +3,7 @@
 .env
 auths
 dist
+node_modules
 tests
 coverage.out
 *.test

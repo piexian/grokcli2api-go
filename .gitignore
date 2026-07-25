@@ -19,3 +19,4 @@ coverage.html
 Thumbs.db
 LOAD_TEST_REPORT.md
 .alma-snapshots
+.ccg/

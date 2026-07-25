@@ -95,3 +95,25 @@ func TestLoadRejectsInvalidAuditRetention(t *testing.T) {
 		t.Fatalf("Load() error = %v, want retention validation error", err)
 	}
 }
+
+func TestLoadWebConfigDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("GROK_WEB_DIST", "")
+	t.Setenv("GROK_PUBLIC_BASE_URL", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebDist != "frontend/dist" || cfg.PublicBaseURL != "" {
+		t.Fatalf("web config defaults = %q/%q", cfg.WebDist, cfg.PublicBaseURL)
+	}
+
+	t.Setenv("GROK_WEB_DIST", "  /srv/grok/web  ")
+	t.Setenv("GROK_PUBLIC_BASE_URL", "  https://grok.example.test/api  ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebDist != "/srv/grok/web" || cfg.PublicBaseURL != "https://grok.example.test/api" {
+		t.Fatalf("web config overrides = %q/%q", cfg.WebDist, cfg.PublicBaseURL)
+	}
+}
