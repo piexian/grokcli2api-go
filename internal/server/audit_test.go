@@ -252,3 +252,34 @@ func TestAdminAuditPaginationSummaryAndDashboard(t *testing.T) {
 		t.Fatalf("unauthorized status=%d", unauthorized.Code)
 	}
 }
+
+func TestAdminDashboardCountsAccountAndModelCooldownsOnce(t *testing.T) {
+	pool := modelSummaryTestPool(t, map[string][]string{
+		"account-cooldown": {"grok-4.5"},
+		"model-cooldown":   {"grok-4.5"},
+		"both-cooldowns":   {"grok-4.5"},
+		"ready":            {"grok-4.5"},
+	})
+	ids := pool.AccountIDs()
+	if len(ids) != 4 {
+		t.Fatalf("account IDs = %v", ids)
+	}
+	pool.MarkCooldown(ids[0], "rate_limited", time.Hour)
+	pool.MarkModelCooldown(ids[1], "grok-4.5", "model_free_quota_exhausted", time.Hour)
+	pool.MarkCooldown(ids[2], "rate_limited", time.Hour)
+	pool.MarkModelCooldown(ids[2], "grok-4.5", "model_free_quota_exhausted", time.Hour)
+
+	s := &Server{pool: pool}
+	recorder := httptest.NewRecorder()
+	s.adminDashboard(recorder, httptest.NewRequest(http.MethodGet, "/v1/admin/dashboard", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response dashboardResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Resources.TotalAccounts != 4 || response.Resources.CoolingAccounts != 3 || response.Resources.UsableAccounts != 1 || response.Resources.DisabledAccounts != 0 {
+		t.Fatalf("resources = %#v", response.Resources)
+	}
+}

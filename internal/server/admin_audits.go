@@ -92,7 +92,7 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		if credential.Disabled {
 			resources.DisabledAccounts++
 		}
-		if credential.Status == "cooling_down" {
+		if credential.CooldownUntil != nil || len(credential.ModelCooldowns) > 0 {
 			resources.CoolingAccounts++
 		}
 		if credential.Paid {

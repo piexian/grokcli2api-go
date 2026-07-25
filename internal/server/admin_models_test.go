@@ -17,14 +17,18 @@ import (
 
 func TestSummarizeAdminModels(t *testing.T) {
 	credentials := []auth.CredentialInfo{
-		{ID: "a", Status: "ready", Usable: true, Models: []string{"grok-4.5", "grok-3-mini", "grok-4.5"}},
+		{ID: "a", Status: "ready", Usable: true, Models: []string{"grok-4.5", "grok-3-mini", "grok-4.5"}, ModelCooldowns: map[string]auth.ModelCooldownInfo{
+			"grok-4.5": {Until: time.Now().Add(time.Hour), Reason: "model_free_quota_exhausted"},
+		}},
 		{ID: "b", Status: "cooling_down", Models: []string{"grok-4.5"}},
-		{ID: "c", Status: "disabled", Models: []string{"grok-3-mini"}},
+		{ID: "c", Status: "disabled", Models: []string{"grok-3-mini"}, ModelCooldowns: map[string]auth.ModelCooldownInfo{
+			"grok-3-mini": {Until: time.Now().Add(time.Hour)},
+		}},
 	}
 	got := summarizeAdminModels(credentials)
 	want := []adminModelSummary{
 		{Model: "grok-3-mini", Accounts: 2, UsableAccounts: 1, StatusCounts: map[string]int{"disabled": 1, "ready": 1}},
-		{Model: "grok-4.5", Accounts: 2, UsableAccounts: 1, StatusCounts: map[string]int{"cooling_down": 1, "ready": 1}},
+		{Model: "grok-4.5", Accounts: 2, StatusCounts: map[string]int{"cooling_down": 2}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("summary = %#v, want %#v", got, want)

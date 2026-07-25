@@ -76,10 +76,18 @@ func summarizeAdminModels(credentials []auth.CredentialInfo) []adminModelSummary
 				byModel[model] = summary
 			}
 			summary.Accounts++
-			if credential.Usable {
+			status := credential.Status
+			usable := credential.Usable
+			if status == "ready" {
+				if _, cooling := credential.ModelCooldowns[model]; cooling {
+					status = "cooling_down"
+					usable = false
+				}
+			}
+			if usable {
 				summary.UsableAccounts++
 			}
-			summary.StatusCounts[credential.Status]++
+			summary.StatusCounts[status]++
 		}
 	}
 	data := make([]adminModelSummary, 0, len(byModel))

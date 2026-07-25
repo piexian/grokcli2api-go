@@ -56,23 +56,30 @@ type PoolConfig struct {
 // CredentialInfo is a redacted view of a credential account. It deliberately
 // excludes subjects, file paths, client IDs, and token values.
 type CredentialInfo struct {
-	ID                      string       `json:"id"`
-	Scope                   string       `json:"scope,omitempty"`
-	AuthMode                AuthMode     `json:"auth_mode,omitempty"`
-	Status                  string       `json:"status"`
-	Usable                  bool         `json:"usable"`
-	Disabled                bool         `json:"disabled"`
-	ExpiresAt               *time.Time   `json:"expires_at,omitempty"`
-	CooldownUntil           *time.Time   `json:"cooldown_until,omitempty"`
-	Models                  []string     `json:"models"`
-	DiscoveryStatus         string       `json:"discovery_status"`
-	CatalogETag             string       `json:"catalog_etag,omitempty"`
-	CatalogUpdated          *time.Time   `json:"catalog_updated_at,omitempty"`
-	HasRefreshToken         bool         `json:"has_refresh_token"`
-	SubscriptionTier        string       `json:"subscription_tier,omitempty"`
-	SubscriptionTierDisplay string       `json:"subscription_tier_display,omitempty"`
-	Paid                    bool         `json:"-"`
-	Billing                 *BillingInfo `json:"billing,omitempty"`
+	ID                      string                       `json:"id"`
+	Scope                   string                       `json:"scope,omitempty"`
+	AuthMode                AuthMode                     `json:"auth_mode,omitempty"`
+	Status                  string                       `json:"status"`
+	Usable                  bool                         `json:"usable"`
+	Disabled                bool                         `json:"disabled"`
+	ExpiresAt               *time.Time                   `json:"expires_at,omitempty"`
+	CooldownUntil           *time.Time                   `json:"cooldown_until,omitempty"`
+	ModelCooldowns          map[string]ModelCooldownInfo `json:"model_cooldowns,omitempty"`
+	Models                  []string                     `json:"models"`
+	DiscoveryStatus         string                       `json:"discovery_status"`
+	CatalogETag             string                       `json:"catalog_etag,omitempty"`
+	CatalogUpdated          *time.Time                   `json:"catalog_updated_at,omitempty"`
+	HasRefreshToken         bool                         `json:"has_refresh_token"`
+	SubscriptionTier        string                       `json:"subscription_tier,omitempty"`
+	SubscriptionTierDisplay string                       `json:"subscription_tier_display,omitempty"`
+	Paid                    bool                         `json:"-"`
+	Billing                 *BillingInfo                 `json:"billing,omitempty"`
+}
+
+// ModelCooldownInfo is redacted model-scoped cooldown metadata for administrators.
+type ModelCooldownInfo struct {
+	Until  time.Time `json:"until"`
+	Reason string    `json:"reason,omitempty"`
 }
 
 type credentialInfoSnapshot struct {
@@ -952,8 +959,21 @@ func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, tim
 		return info, time.Time{}
 	}
 	var validUntil time.Time
-	if now.Before(a.cooldownUntil) {
+	accountCooling := now.Before(a.cooldownUntil)
+	if accountCooling {
 		validUntil = a.cooldownUntil
+	}
+	for model, cooldown := range a.modelCooldowns {
+		if !now.Before(cooldown.Until) {
+			continue
+		}
+		if info.ModelCooldowns == nil {
+			info.ModelCooldowns = make(map[string]ModelCooldownInfo)
+		}
+		info.ModelCooldowns[model] = ModelCooldownInfo{Until: cooldown.Until.UTC(), Reason: cooldown.Reason}
+		if validUntil.IsZero() || cooldown.Until.Before(validUntil) {
+			validUntil = cooldown.Until
+		}
 	}
 	if !a.credential.ExpiresAt.IsZero() {
 		usableUntil := a.credential.ExpiresAt.Add(-time.Minute)
@@ -986,20 +1006,37 @@ func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, tim
 		expires := a.credential.ExpiresAt.UTC()
 		info.ExpiresAt = &expires
 	}
-	if now.Before(a.cooldownUntil) {
+	if accountCooling {
 		cooldown := a.cooldownUntil.UTC()
 		info.CooldownUntil = &cooldown
 	}
-	info.Usable = !a.disabled && !now.Before(a.cooldownUntil) && a.credential.usable(now)
+	allModelsCooling := len(info.Models) > 0
+	var earliestModelReady time.Time
+	for _, model := range info.Models {
+		cooldown, cooling := info.ModelCooldowns[model]
+		if !cooling {
+			allModelsCooling = false
+			continue
+		}
+		if earliestModelReady.IsZero() || cooldown.Until.Before(earliestModelReady) {
+			earliestModelReady = cooldown.Until
+		}
+	}
+	baseUsable := !a.disabled && !accountCooling && a.credential.usable(now)
+	info.Usable = baseUsable && len(info.Models) > 0 && !allModelsCooling
 	switch {
 	case a.disabled:
 		info.Status = "disabled"
-	case now.Before(a.cooldownUntil):
+	case accountCooling:
 		info.Status = "cooling_down"
 	case !a.credential.usable(now):
 		info.Status = "needs_refresh"
 	case len(info.Models) == 0:
 		info.Status = "pending_models"
+	case allModelsCooling:
+		info.Status = "cooling_down"
+		cooldown := earliestModelReady.UTC()
+		info.CooldownUntil = &cooldown
 	default:
 		info.Status = "ready"
 	}
@@ -2592,6 +2629,12 @@ func cloneBillingInfo(source *BillingInfo) *BillingInfo {
 func cloneCredentialInfo(source CredentialInfo) CredentialInfo {
 	cloned := source
 	cloned.Models = append([]string(nil), source.Models...)
+	if len(source.ModelCooldowns) > 0 {
+		cloned.ModelCooldowns = make(map[string]ModelCooldownInfo, len(source.ModelCooldowns))
+		for model, cooldown := range source.ModelCooldowns {
+			cloned.ModelCooldowns[model] = cooldown
+		}
+	}
 	cloned.Billing = cloneBillingInfo(source.Billing)
 	if source.ExpiresAt != nil {
 		value := *source.ExpiresAt

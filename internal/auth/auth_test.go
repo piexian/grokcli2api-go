@@ -1107,6 +1107,116 @@ func TestCredentialSnapshotReusesAndInvalidatesGeneration(t *testing.T) {
 	}
 }
 
+func TestCredentialInfoIncludesActiveModelCooldowns(t *testing.T) {
+	now := time.Now().UTC()
+	baseCredential := &credential{
+		AccessToken: "token", ExpiresAt: now.Add(time.Hour), Models: []string{"grok-alpha", "grok-beta"},
+	}
+	tests := []struct {
+		name           string
+		account        *account
+		wantStatus     string
+		wantUsable     bool
+		wantCooldown   time.Time
+		wantModels     []string
+		wantValidUntil time.Time
+	}{
+		{
+			name:       "account cooldown",
+			account:    &account{credential: baseCredential, cooldownUntil: now.Add(40 * time.Minute)},
+			wantStatus: "cooling_down", wantCooldown: now.Add(40 * time.Minute), wantValidUntil: now.Add(40 * time.Minute),
+		},
+		{
+			name: "one model cooldown",
+			account: &account{credential: &credential{AccessToken: "token", ExpiresAt: now.Add(time.Hour), Models: []string{"grok-alpha"}}, modelCooldowns: map[string]cooldownState{
+				"grok-alpha": {Until: now.Add(30 * time.Minute), Reason: "model_free_quota_exhausted"},
+			}},
+			wantStatus: "cooling_down", wantCooldown: now.Add(30 * time.Minute), wantModels: []string{"grok-alpha"}, wantValidUntil: now.Add(30 * time.Minute),
+		},
+		{
+			name: "one of two models cooling",
+			account: &account{credential: baseCredential, modelCooldowns: map[string]cooldownState{
+				"grok-alpha": {Until: now.Add(20 * time.Minute), Reason: "model_free_quota_exhausted"},
+				"expired":    {Until: now.Add(-time.Minute), Reason: "expired"},
+			}},
+			wantStatus: "ready", wantUsable: true, wantModels: []string{"grok-alpha"}, wantValidUntil: now.Add(20 * time.Minute),
+		},
+		{
+			name: "all models cooling",
+			account: &account{credential: baseCredential, modelCooldowns: map[string]cooldownState{
+				"grok-alpha": {Until: now.Add(10 * time.Minute), Reason: "alpha_exhausted"},
+				"grok-beta":  {Until: now.Add(25 * time.Minute), Reason: "beta_exhausted"},
+			}},
+			wantStatus: "cooling_down", wantCooldown: now.Add(10 * time.Minute), wantModels: []string{"grok-alpha", "grok-beta"}, wantValidUntil: now.Add(10 * time.Minute),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			info, validUntil := credentialInfoAt("account", test.account, now)
+			if info.Status != test.wantStatus || info.Usable != test.wantUsable {
+				t.Fatalf("credential status=%q usable=%v, want %q/%v", info.Status, info.Usable, test.wantStatus, test.wantUsable)
+			}
+			if !validUntil.Equal(test.wantValidUntil) {
+				t.Fatalf("valid until = %s, want %s", validUntil, test.wantValidUntil)
+			}
+			if test.wantCooldown.IsZero() {
+				if info.CooldownUntil != nil {
+					t.Fatalf("cooldown until = %s, want nil", *info.CooldownUntil)
+				}
+			} else if info.CooldownUntil == nil || !info.CooldownUntil.Equal(test.wantCooldown) {
+				t.Fatalf("cooldown until = %v, want %s", info.CooldownUntil, test.wantCooldown)
+			}
+			if len(info.ModelCooldowns) != len(test.wantModels) {
+				t.Fatalf("model cooldowns = %#v, want models %v", info.ModelCooldowns, test.wantModels)
+			}
+			for _, model := range test.wantModels {
+				if _, ok := info.ModelCooldowns[model]; !ok {
+					t.Fatalf("model cooldowns = %#v, missing %q", info.ModelCooldowns, model)
+				}
+			}
+		})
+	}
+}
+
+func TestCredentialModelCooldownSnapshotExpiresAndIsDeepCopied(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredentialModels(t, dir, "a.json", "snapshot-cooldown", "token", time.Now().Add(time.Hour), "", []string{"grok-4.5"})
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	id := accountID("snapshot-cooldown")
+	pool.MarkModelCooldown(id, "grok-4.5", "model_free_quota_exhausted", 40*time.Millisecond)
+
+	generation, initial := pool.CredentialSnapshot()
+	if len(initial) != 1 || initial[0].Status != "cooling_down" || initial[0].Usable || len(initial[0].ModelCooldowns) != 1 {
+		t.Fatalf("initial snapshot = %#v", initial)
+	}
+	copyForCaller := pool.Credentials()
+	copyForCaller[0].ModelCooldowns["grok-4.5"] = ModelCooldownInfo{Until: time.Now().Add(time.Hour), Reason: "mutated"}
+	copyForCaller[0].ModelCooldowns["injected"] = ModelCooldownInfo{Until: time.Now().Add(time.Hour)}
+	unchanged := pool.Credentials()[0].ModelCooldowns
+	if unchanged["grok-4.5"].Reason != "model_free_quota_exhausted" {
+		t.Fatalf("caller mutated pooled cooldown = %#v", unchanged)
+	}
+	if _, ok := unchanged["injected"]; ok {
+		t.Fatalf("caller injected pooled cooldown = %#v", unchanged)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		refreshedGeneration, refreshed := pool.CredentialSnapshot()
+		if refreshedGeneration != generation {
+			t.Fatalf("time-based refresh changed generation from %d to %d", generation, refreshedGeneration)
+		}
+		if len(refreshed) == 1 && refreshed[0].Status == "ready" && refreshed[0].Usable && len(refreshed[0].ModelCooldowns) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot did not refresh after cooldown expiry: %#v", refreshed)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func BenchmarkPoolAcquireTenThousandAccounts(b *testing.B) {
 	p := &Pool{
 		accounts: map[string]*account{}, states: map[string]accountState{},
