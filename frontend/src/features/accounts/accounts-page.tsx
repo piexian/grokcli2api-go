@@ -1,4 +1,4 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { experimental_streamedQuery, keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileUp, RefreshCw, Search, Trash2, Upload, X } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -20,7 +20,7 @@ import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { formatDateTime, formatNumber } from "@/shared/lib/format";
 import {
   deleteCredential,
-  listCredentials,
+  streamCredentials,
   uploadCredentialFile,
   uploadCredentialJson,
   type CredentialDTO,
@@ -98,7 +98,13 @@ export function AccountsPage() {
 
   const query = useQuery({
     queryKey: credentialsQueryKey,
-    queryFn: listCredentials,
+    // 流式查询：第一页（500 条）到达即渲染，后台逐页拉完。
+    // generator yield 的是累积快照，reducer 直接用最新快照替换。
+    queryFn: experimental_streamedQuery<CredentialDTO[], CredentialDTO[]>({
+      streamFn: ({ signal }) => streamCredentials(signal),
+      reducer: (_acc, chunk) => chunk,
+      initialValue: [],
+    }),
     refetchInterval: 60_000,
     // 关键：refetch 期间保留旧数据，避免 1 万行表格闪烁。
     placeholderData: keepPreviousData,

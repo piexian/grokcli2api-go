@@ -96,8 +96,47 @@ const decodeCredentialList: ApiDecoder<CredentialDTO[]> = (value: unknown) => {
   return ((value as Record<string, unknown>).data as unknown[]).map(normalizeCredential);
 };
 
+type CredentialPageDTO = {
+  data: CredentialDTO[];
+  hasMore: boolean;
+  nextCursor: string;
+  total: number;
+};
+
+const decodeCredentialPage: ApiDecoder<CredentialPageDTO> = (value: unknown) => {
+  if (!isObject(value) || !isArrayOf(credentialValidator)((value as Record<string, unknown>).data)) {
+    throw new Error("invalid credential list");
+  }
+  const v = value as Record<string, unknown>;
+  return {
+    data: (v.data as unknown[]).map(normalizeCredential),
+    hasMore: v.has_more === true,
+    nextCursor: typeof v.next_cursor === "string" ? v.next_cursor : "",
+    total: typeof v.total === "number" ? v.total : (v.data as unknown[]).length,
+  };
+};
+
 export function listCredentials(): Promise<CredentialDTO[]> {
   return apiRequest("/v1/admin/credentials", { method: "GET" }, decodeCredentialList);
+}
+
+const PAGE_SIZE = 500;
+
+// 流式拉取全部凭证：每拉一页 yield 一次累积快照，配合 react-query 的
+// experimental_streamedQuery 让首屏在第一页到达时即渲染（jp 实测全量 3.2MB/3.5s，
+// 第一页 500 条通常 <300ms），搜索/统计随页面拉取逐步变为全量。
+export async function* streamCredentials(signal?: AbortSignal): AsyncGenerator<CredentialDTO[]> {
+  const all: CredentialDTO[] = [];
+  let cursor = "";
+  for (;;) {
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+    if (cursor) params.set("cursor", cursor);
+    const page = await apiRequest(`/v1/admin/credentials?${params}`, { method: "GET", signal }, decodeCredentialPage);
+    all.push(...page.data);
+    yield [...all];
+    if (!page.hasMore || !page.nextCursor) return all;
+    cursor = page.nextCursor;
+  }
 }
 
 export type UploadCredentialResultDTO = {
