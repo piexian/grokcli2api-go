@@ -63,7 +63,7 @@ func TestAuditUsageExtractionFromUpstreamPayloadsAndStreams(t *testing.T) {
 }
 
 func TestAuditMiddlewareRecordsSuccessFailureAndStreamCompletion(t *testing.T) {
-	store, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"), 30)
+	store, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"), 30, audit.DefaultQueueSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestAuditMiddlewareRecordsSuccessFailureAndStreamCompletion(t *testing.T) {
 }
 
 func TestAdminAuditPaginationSummaryAndDashboard(t *testing.T) {
-	store, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"), 30)
+	store, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"), 30, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +221,25 @@ func TestAdminAuditPaginationSummaryAndDashboard(t *testing.T) {
 	}
 	if dashboard.Code != http.StatusOK || decoded.Usage.Requests != 3 || decoded.Resources.TotalAccounts != 0 || decoded.Resources.TotalModels != 0 {
 		t.Fatalf("dashboard status=%d value=%#v", dashboard.Code, decoded)
+	}
+
+	dropped := false
+	for index := 0; index < 10_000; index++ {
+		if !store.Enqueue(audit.Record{Protocol: "chat", StatusCode: 200}) {
+			dropped = true
+			break
+		}
+	}
+	if !dropped {
+		t.Fatal("audit queue did not report overload")
+	}
+	healthRecorder := request("/v1/admin/audits/health")
+	var health audit.QueueHealth
+	if err := json.Unmarshal(healthRecorder.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if healthRecorder.Code != http.StatusOK || health.QueueCap != 1 || health.DroppedTotal == 0 || health.DroppedTotal != store.Dropped() {
+		t.Fatalf("health status=%d value=%#v dropped=%d", healthRecorder.Code, health, store.Dropped())
 	}
 
 	invalid := request("/v1/admin/audits/summary?period=90d")

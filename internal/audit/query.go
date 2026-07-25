@@ -68,6 +68,13 @@ type Summary struct {
 	Series  []SeriesBucket `json:"series"`
 }
 
+const defaultSummaryTTL = 10 * time.Second
+
+type summaryCacheEntry struct {
+	summary   Summary
+	expiresAt time.Time
+}
+
 type cursorValue struct {
 	CreatedAt int64  `json:"created_at"`
 	ID        string `json:"id"`
@@ -168,10 +175,45 @@ func (s *Store) List(ctx context.Context, filter ListFilter) (ListPage, error) {
 }
 
 func (s *Store) Summary(ctx context.Context, period string, now time.Time) (Summary, error) {
+	if _, _, err := parsePeriod(period, now); err != nil {
+		return Summary{}, err
+	}
+	s.summaryMu.Lock()
+	defer s.summaryMu.Unlock()
+	cacheNow := s.summaryCacheTime()
+	if cached, ok := s.summaryCache[period]; ok && cacheNow.Before(cached.expiresAt) {
+		return cloneSummary(cached.summary), nil
+	}
 	if err := s.Flush(ctx); err != nil {
 		return Summary{}, err
 	}
-	return s.summary(ctx, period, now)
+	summary, err := s.summary(ctx, period, now)
+	if err != nil {
+		return Summary{}, err
+	}
+	ttl := s.summaryTTL
+	if ttl <= 0 {
+		ttl = defaultSummaryTTL
+	}
+	if s.summaryCache == nil {
+		s.summaryCache = make(map[string]summaryCacheEntry)
+	}
+	s.summaryCache[period] = summaryCacheEntry{summary: cloneSummary(summary), expiresAt: s.summaryCacheTime().Add(ttl)}
+	return summary, nil
+}
+
+func (s *Store) summaryCacheTime() time.Time {
+	if s.summaryNow != nil {
+		return s.summaryNow()
+	}
+	return time.Now()
+}
+
+func cloneSummary(source Summary) Summary {
+	cloned := source
+	cloned.ByModel = append([]ModelMetrics(nil), source.ByModel...)
+	cloned.Series = append([]SeriesBucket(nil), source.Series...)
+	return cloned
 }
 
 func EmptySummary(period string, now time.Time) (Summary, error) {

@@ -16,33 +16,60 @@ import (
 )
 
 const (
-	defaultQueueSize = 4096
-	defaultBatchSize = 100
-	flushInterval    = 250 * time.Millisecond
+	DefaultQueueSize    = 4096
+	defaultBatchSize    = 100
+	flushInterval       = 250 * time.Millisecond
+	retentionBatchSize  = 500
+	retentionBatchDelay = 10 * time.Millisecond
+	retentionTimeout    = 5 * time.Minute
 )
+
+var defaultBatchRetryDelays = []time.Duration{100 * time.Millisecond, 500 * time.Millisecond, 2 * time.Second}
 
 var ErrClosed = errors.New("audit store is closed")
 
 type Store struct {
-	db            *sql.DB
-	retentionDays int
-	queue         chan Record
-	flushRequests chan chan error
-	stop          chan struct{}
-	done          chan struct{}
-	closed        atomic.Bool
-	dropped       atomic.Uint64
-	closeOnce     sync.Once
-	enqueueMu     sync.RWMutex
-	closeErr      error
+	db               *sql.DB
+	retentionDays    int
+	queue            chan Record
+	flushRequests    chan chan error
+	stop             chan struct{}
+	done             chan struct{}
+	closed           atomic.Bool
+	dropped          atomic.Uint64
+	pendingMu        sync.Mutex
+	pendingTimes     []time.Time
+	pendingHead      int
+	closeOnce        sync.Once
+	enqueueMu        sync.RWMutex
+	closeErr         error
+	batchWriter      func(context.Context, []Record) error
+	retryDelays      []time.Duration
+	cleanupBatchSize int
+	cleanupDelay     time.Duration
+	cleanupWait      func(context.Context, time.Duration) error
+	summaryMu        sync.Mutex
+	summaryCache     map[string]summaryCacheEntry
+	summaryTTL       time.Duration
+	summaryNow       func() time.Time
 }
 
-func Open(path string, retentionDays int) (*Store, error) {
+type QueueHealth struct {
+	QueueSize       int    `json:"queue_size"`
+	QueueCap        int    `json:"queue_cap"`
+	DroppedTotal    uint64 `json:"dropped_total"`
+	OldestPendingMS int64  `json:"oldest_pending_ms"`
+}
+
+func Open(path string, retentionDays, queueSize int) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("audit database path is empty")
 	}
 	if retentionDays < 1 {
 		return nil, errors.New("audit retention days must be positive")
+	}
+	if queueSize < 1 {
+		return nil, errors.New("audit queue size must be positive")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create audit database directory: %w", err)
@@ -64,9 +91,13 @@ func Open(path string, retentionDays int) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	store := &Store{
-		db: db, retentionDays: retentionDays, queue: make(chan Record, defaultQueueSize),
+		db: db, retentionDays: retentionDays, queue: make(chan Record, queueSize),
 		flushRequests: make(chan chan error), stop: make(chan struct{}), done: make(chan struct{}),
+		retryDelays:      append([]time.Duration(nil), defaultBatchRetryDelays...),
+		cleanupBatchSize: retentionBatchSize, cleanupDelay: retentionBatchDelay, cleanupWait: waitForDelay,
+		summaryCache: make(map[string]summaryCacheEntry), summaryTTL: defaultSummaryTTL, summaryNow: time.Now,
 	}
+	store.batchWriter = store.insertBatch
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -124,11 +155,15 @@ func (s *Store) Enqueue(record Record) bool {
 		return false
 	}
 	record = normalizeRecord(record)
+	s.pendingMu.Lock()
 	select {
 	case s.queue <- record:
+		s.pendingTimes = append(s.pendingTimes, time.Now())
+		s.pendingMu.Unlock()
 		return true
 	default:
-		dropped := s.dropped.Add(1)
+		s.pendingMu.Unlock()
+		dropped := s.recordDropped(1)
 		if dropped == 1 || dropped%100 == 0 {
 			slog.Warn("audit queue full; record dropped", "dropped", dropped)
 		}
@@ -143,19 +178,67 @@ func (s *Store) Insert(ctx context.Context, records ...Record) error {
 	for index := range records {
 		records[index] = normalizeRecord(records[index])
 	}
-	return s.insertBatch(ctx, records)
+	return s.writeBatchWithRetry(ctx, records)
+}
+
+func (s *Store) Dropped() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.dropped.Load()
+}
+
+func (s *Store) Health(now time.Time) QueueHealth {
+	if s == nil {
+		return QueueHealth{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	health := QueueHealth{QueueSize: len(s.queue), QueueCap: cap(s.queue), DroppedTotal: s.Dropped()}
+	s.pendingMu.Lock()
+	if s.pendingHead < len(s.pendingTimes) {
+		health.OldestPendingMS = max(now.Sub(s.pendingTimes[s.pendingHead]).Milliseconds(), 0)
+	}
+	s.pendingMu.Unlock()
+	return health
 }
 
 func (s *Store) Cleanup(ctx context.Context, now time.Time) (int64, error) {
 	if s == nil {
 		return 0, ErrClosed
 	}
+	ctx, cancel := context.WithTimeout(ctx, retentionTimeout)
+	defer cancel()
 	cutoff := now.AddDate(0, 0, -s.retentionDays).UnixMilli()
-	result, err := s.db.ExecContext(ctx, "DELETE FROM request_audits WHERE created_at < ?", cutoff)
-	if err != nil {
-		return 0, err
+	batchSize := s.cleanupBatchSize
+	if batchSize < 1 {
+		batchSize = retentionBatchSize
 	}
-	return result.RowsAffected()
+	wait := s.cleanupWait
+	if wait == nil {
+		wait = waitForDelay
+	}
+	var total int64
+	for {
+		result, err := s.db.ExecContext(ctx, `DELETE FROM request_audits WHERE rowid IN (
+			SELECT rowid FROM request_audits WHERE created_at < ? ORDER BY created_at LIMIT ?
+		)`, cutoff, batchSize)
+		if err != nil {
+			return total, err
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += deleted
+		if deleted < int64(batchSize) {
+			return total, nil
+		}
+		if err := wait(ctx, s.cleanupDelay); err != nil {
+			return total, err
+		}
+	}
 }
 
 func (s *Store) Flush(ctx context.Context) error {
@@ -206,10 +289,11 @@ func (s *Store) run() {
 		if len(batch) == 0 {
 			return nil
 		}
-		err := s.insertBatch(context.Background(), batch)
+		err := s.writeBatchWithRetry(context.Background(), batch)
 		if err != nil {
 			slog.Error("write audit batch", "error", err, "records", len(batch))
 		}
+		s.completePending(len(batch))
 		batch = batch[:0]
 		return err
 	}
@@ -248,6 +332,72 @@ func (s *Store) run() {
 			return
 		}
 	}
+}
+
+func (s *Store) writeBatchWithRetry(ctx context.Context, records []Record) error {
+	if len(records) == 0 {
+		return nil
+	}
+	writer := s.batchWriter
+	if writer == nil {
+		writer = s.insertBatch
+	}
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = writer(ctx, records)
+		if err == nil {
+			return nil
+		}
+		if attempt >= len(s.retryDelays) {
+			break
+		}
+		if waitErr := waitForDelay(ctx, s.retryDelays[attempt]); waitErr != nil {
+			err = errors.Join(err, waitErr)
+			break
+		}
+	}
+	s.recordDropped(uint64(len(records)))
+	return err
+}
+
+func waitForDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Store) completePending(count int) {
+	if count <= 0 {
+		return
+	}
+	s.pendingMu.Lock()
+	remaining := len(s.pendingTimes) - s.pendingHead
+	if count >= remaining {
+		s.pendingTimes = s.pendingTimes[:0]
+		s.pendingHead = 0
+	} else {
+		s.pendingHead += count
+		if s.pendingHead >= 1024 && s.pendingHead*2 >= len(s.pendingTimes) {
+			s.pendingTimes = append(s.pendingTimes[:0], s.pendingTimes[s.pendingHead:]...)
+			s.pendingHead = 0
+		}
+	}
+	s.pendingMu.Unlock()
+}
+
+func (s *Store) recordDropped(count uint64) uint64 {
+	if count == 0 {
+		return s.dropped.Load()
+	}
+	return s.dropped.Add(count)
 }
 
 func (s *Store) insertBatch(ctx context.Context, records []Record) error {

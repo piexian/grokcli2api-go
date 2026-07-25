@@ -76,15 +76,19 @@ func TestLoadAuditDefaultsAndOverrides(t *testing.T) {
 	if cfg.AuditRetentionDays != 30 {
 		t.Fatalf("AuditRetentionDays = %d", cfg.AuditRetentionDays)
 	}
+	if cfg.AuditQueueSize != 4096 {
+		t.Fatalf("AuditQueueSize = %d", cfg.AuditQueueSize)
+	}
 
 	t.Setenv("GROK_AUDIT_DB", " off ")
 	t.Setenv("GROK_AUDIT_RETENTION_DAYS", "45")
+	t.Setenv("GROK_AUDIT_QUEUE_SIZE", "8192")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AuditDB != "off" || cfg.AuditRetentionDays != 45 {
-		t.Fatalf("audit config = %q/%d", cfg.AuditDB, cfg.AuditRetentionDays)
+	if cfg.AuditDB != "off" || cfg.AuditRetentionDays != 45 || cfg.AuditQueueSize != 8192 {
+		t.Fatalf("audit config = %q/%d/%d", cfg.AuditDB, cfg.AuditRetentionDays, cfg.AuditQueueSize)
 	}
 }
 
@@ -93,6 +97,14 @@ func TestLoadRejectsInvalidAuditRetention(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "GROK_AUDIT_RETENTION_DAYS") {
 		t.Fatalf("Load() error = %v, want retention validation error", err)
+	}
+}
+
+func TestLoadRejectsInvalidAuditQueueSize(t *testing.T) {
+	t.Setenv("GROK_AUDIT_QUEUE_SIZE", "0")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "GROK_AUDIT_QUEUE_SIZE") {
+		t.Fatalf("Load() error = %v, want queue size validation error", err)
 	}
 }
 

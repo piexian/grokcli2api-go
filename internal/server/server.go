@@ -64,9 +64,13 @@ func New(cfg config.Config) (*Server, error) {
 	if retentionDays < 1 {
 		retentionDays = 30
 	}
+	queueSize := cfg.AuditQueueSize
+	if queueSize < 1 {
+		queueSize = audit.DefaultQueueSize
+	}
 	var auditStore *audit.Store
 	if !strings.EqualFold(auditPath, "off") {
-		auditStore, err = audit.Open(auditPath, retentionDays)
+		auditStore, err = audit.Open(auditPath, retentionDays, queueSize)
 		if err != nil {
 			client.Close()
 			pool.Close()
@@ -136,6 +140,7 @@ func (s *Server) routes() {
 		s.mux.Handle("POST /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("DELETE /v1/admin/credentials/{id}", s.adminKeyGate(http.HandlerFunc(s.adminCredential)))
 		s.mux.Handle("GET /v1/admin/audits", s.adminKeyGate(http.HandlerFunc(s.adminAudits)))
+		s.mux.Handle("GET /v1/admin/audits/health", s.adminKeyGate(http.HandlerFunc(s.adminAuditHealth)))
 		s.mux.Handle("GET /v1/admin/audits/summary", s.adminKeyGate(http.HandlerFunc(s.adminAuditSummary)))
 		s.mux.Handle("GET /v1/admin/dashboard", s.adminKeyGate(http.HandlerFunc(s.adminDashboard)))
 	}
@@ -247,7 +252,8 @@ func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_parameter")
 			return
 		}
-		page := listCredentials(s.pool.Credentials(), filter)
+		generation, credentials := s.pool.CredentialSnapshot()
+		page := listCredentials(credentials, generation, filter)
 		writeJSON(w, http.StatusOK, newAdminCredentialListResponse(page, filter.Limit > 0))
 		return
 	}

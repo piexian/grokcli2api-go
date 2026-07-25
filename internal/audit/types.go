@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,8 @@ type Capture struct {
 	record  Record
 }
 
+const maxCapturedModelCharacters = 256
+
 func NewCapture(protocol, requestID string, started time.Time) *Capture {
 	if started.IsZero() {
 		started = time.Now()
@@ -63,8 +66,22 @@ func (c *Capture) SetRequest(model string, streaming bool) {
 		return
 	}
 	c.mu.Lock()
-	c.record.Model, c.record.Streaming = model, streaming
+	c.record.Model, c.record.Streaming = truncateCapturedModel(model), streaming
 	c.mu.Unlock()
+}
+
+func truncateCapturedModel(model string) string {
+	if len(model) <= maxCapturedModelCharacters {
+		return model
+	}
+	characters := 0
+	for index := range model {
+		if characters == maxCapturedModelCharacters {
+			return strings.Clone(model[:index])
+		}
+		characters++
+	}
+	return model
 }
 
 func (c *Capture) SetTenant(tenant string) {

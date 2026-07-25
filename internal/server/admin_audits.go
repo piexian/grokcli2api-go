@@ -57,6 +57,14 @@ func (s *Server) adminAudits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
+func (s *Server) adminAuditHealth(w http.ResponseWriter, _ *http.Request) {
+	if s.audits == nil {
+		writeJSON(w, http.StatusOK, audit.QueueHealth{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.audits.Health(time.Now()))
+}
+
 func (s *Server) adminAuditSummary(w http.ResponseWriter, r *http.Request) {
 	period := auditPeriod(r)
 	summary, err := s.auditSummary(r, period)
@@ -75,7 +83,7 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resources := dashboardResources{}
-	credentials := s.pool.Credentials()
+	_, credentials := s.pool.CredentialSnapshot()
 	resources.TotalAccounts = len(credentials)
 	for _, credential := range credentials {
 		if credential.Usable {

@@ -48,6 +48,7 @@ type Config struct {
 	PublicBaseURL          string
 	AuditDB                string
 	AuditRetentionDays     int
+	AuditQueueSize         int
 }
 
 func Load() (Config, error) {
@@ -75,6 +76,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	auditRetentionDays, err := envPositiveInt("GROK_AUDIT_RETENTION_DAYS", 30)
+	if err != nil {
+		return Config{}, err
+	}
+	auditQueueSize, err := envPositiveInt("GROK_AUDIT_QUEUE_SIZE", 4096)
 	if err != nil {
 		return Config{}, err
 	}
@@ -165,6 +170,7 @@ func Load() (Config, error) {
 		PublicBaseURL:          strings.TrimSpace(os.Getenv("GROK_PUBLIC_BASE_URL")),
 		AuditDB:                auditDB,
 		AuditRetentionDays:     auditRetentionDays,
+		AuditQueueSize:         auditQueueSize,
 	}
 	cfg.APIKeys = unique(append(splitCSV(os.Getenv("GROK_API_KEYS")), splitCSV(os.Getenv("GROK_API_KEY"))...))
 	return cfg, nil
