@@ -27,13 +27,15 @@ import (
 )
 
 type Server struct {
-	cfg        config.Config
-	pool       *auth.Pool
-	client     *grok.Client
-	continuity *continuityStore
-	audits     *audit.Store
-	mux        *http.ServeMux
-	spa        http.Handler
+	cfg            config.Config
+	pool           *auth.Pool
+	client         *grok.Client
+	continuity     *continuityStore
+	audits         *audit.Store
+	mux            *http.ServeMux
+	spa            http.Handler
+	adminSnapshots adminPoolSnapshotCache
+	adminModels    adminModelSummaryCache
 }
 
 func New(cfg config.Config) (*Server, error) {
@@ -139,6 +141,7 @@ func (s *Server) routes() {
 		s.mux.Handle("GET /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("POST /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("DELETE /v1/admin/credentials/{id}", s.adminKeyGate(http.HandlerFunc(s.adminCredential)))
+		s.mux.Handle("GET /v1/admin/models/summary", s.adminKeyGate(http.HandlerFunc(s.adminModelsSummary)))
 		s.mux.Handle("GET /v1/admin/audits", s.adminKeyGate(http.HandlerFunc(s.adminAudits)))
 		s.mux.Handle("GET /v1/admin/audits/health", s.adminKeyGate(http.HandlerFunc(s.adminAuditHealth)))
 		s.mux.Handle("GET /v1/admin/audits/summary", s.adminKeyGate(http.HandlerFunc(s.adminAuditSummary)))
@@ -253,7 +256,7 @@ func (s *Server) adminCredentials(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		generation, credentials := s.pool.CredentialSnapshot()
-		page := listCredentials(credentials, generation, filter)
+		page := listCredentials(s.adminSnapshots.get(generation, credentials), filter)
 		writeJSON(w, http.StatusOK, newAdminCredentialListResponse(page, filter.Limit > 0))
 		return
 	}
