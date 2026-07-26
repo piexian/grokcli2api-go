@@ -305,10 +305,17 @@ type Pool struct {
 	capacityCh                   chan struct{}
 	capacityMu                   sync.Mutex
 	rebuildCh                    chan struct{}
+	stateWake                    chan struct{}
+	statePersistDelay            time.Duration
 	closed                       chan struct{}
 	closeOnce                    sync.Once
 	wg                           sync.WaitGroup
 	stateMu                      sync.Mutex
+	stateGeneration              atomic.Uint64
+	statePersistedGeneration     atomic.Uint64
+	stateDigest                  [sha256.Size]byte
+	stateDigestValid             bool
+	stateWriteCount              atomic.Uint64
 	mutationMu                   sync.Mutex
 }
 
@@ -404,9 +411,13 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	p := &Pool{
 		cfg: cfg, http: client, accounts: map[string]*account{}, files: map[string]fileEntry{},
 		states: map[string]accountState{}, catalogs: map[string]catalogState{},
-		affinity:   newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
-		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), capacityCh: make(chan struct{}),
-		rebuildCh: make(chan struct{}, 1), closed: make(chan struct{}),
+		affinity:          newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
+		refreshSem:        make(chan struct{}, cfg.RefreshConcurrency),
+		capacityCh:        make(chan struct{}),
+		rebuildCh:         make(chan struct{}, 1),
+		stateWake:         make(chan struct{}, 1),
+		statePersistDelay: time.Second,
+		closed:            make(chan struct{}),
 	}
 	p.active.Store([]*account{})
 	p.activeByModel.Store(map[string][]*account{})
@@ -444,6 +455,11 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	if err := p.persistState(); err != nil {
 		return nil, fmt.Errorf("persist credential state: %w", err)
 	}
+	// The synchronous startup checkpoint already includes scan changes.
+	select {
+	case <-p.stateWake:
+	default:
+	}
 	if len(p.accounts) == 0 && !cfg.AllowEmpty {
 		return nil, ErrNoAuth
 	}
@@ -455,9 +471,10 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 			return nil, err
 		}
 	}
-	p.wg.Add(2)
+	p.wg.Add(3)
 	go p.background()
 	go p.rebuildLoop()
+	go p.stateCheckpointLoop()
 	return p, nil
 }
 
@@ -465,7 +482,7 @@ func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		close(p.closed)
 		p.wg.Wait()
-		_ = p.persistState()
+		_ = p.FlushState()
 	})
 }
 
@@ -1728,11 +1745,13 @@ func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Ti
 	}
 	p.mu.Unlock()
 	p.requestRebuild()
-	return p.persistState()
+	p.requestStatePersist()
+	return nil
 }
 
 // UpdateModelDescriptors atomically publishes a structured account catalog in
-// state v2. It never writes model metadata, endpoints, or keys into auth.json.
+// state v2 and queues one coalesced state checkpoint. It never writes model
+// metadata, endpoints, or keys into auth.json.
 func (p *Pool) UpdateModelDescriptors(accountID string, descriptors []modelcatalog.ModelDescriptor, etag string, updatedAt time.Time) error {
 	if updatedAt.IsZero() {
 		updatedAt = time.Now()
@@ -1782,9 +1801,7 @@ func (p *Pool) UpdateModelDescriptors(accountID string, descriptors []modelcatal
 	p.catalogs[accountID] = state
 	p.mu.Unlock()
 	p.requestRebuild()
-	if err := p.persistState(); err != nil {
-		return err
-	}
+	p.requestStatePersist()
 	return nil
 }
 
@@ -1804,7 +1821,8 @@ func (p *Pool) TouchModelCatalog(accountID string, updatedAt time.Time) error {
 	p.catalogs[accountID] = catalog
 	p.mu.Unlock()
 	p.invalidateCredentialSnapshot()
-	return p.persistState()
+	p.requestStatePersist()
+	return nil
 }
 
 func (p *Pool) ModelCatalogETag(accountID string) string {
@@ -1857,7 +1875,8 @@ func (p *Pool) UpdateModelLimits(accountID, model string, contextWindow uint64, 
 	catalog.Models[model] = descriptor
 	p.catalogs[accountID] = catalog
 	p.mu.Unlock()
-	return p.persistState()
+	p.requestStatePersist()
+	return nil
 }
 
 // AccountDescriptor is a lock-safe, non-leasing lookup used to validate
@@ -2024,7 +2043,7 @@ func (p *Pool) markCooldown(accountID, reason string, duration time.Duration, re
 	p.mu.Unlock()
 	p.requestRebuild()
 	p.rebuildWhenCooldownExpires(until)
-	_ = p.persistState()
+	p.requestStatePersist()
 	slog.Warn("credential account cooling", "account", accountID, "reason", reason, "until", until.UTC().Format(time.RFC3339))
 	return true
 }
@@ -2061,7 +2080,7 @@ func (p *Pool) ClearCooldownReason(accountID, reason string) bool {
 	p.mu.Unlock()
 	p.requestRebuild()
 	p.notifyCapacity()
-	_ = p.persistState()
+	p.requestStatePersist()
 	return true
 }
 
@@ -2109,9 +2128,7 @@ func (p *Pool) MarkModelCooldown(accountID, model, reason string, duration time.
 	p.mu.Unlock()
 	p.requestRebuild()
 	p.rebuildWhenCooldownExpires(until)
-	if err := p.persistState(); err != nil {
-		slog.Error("credential scheduler state persistence failed", "error", err)
-	}
+	p.requestStatePersist()
 	slog.Warn("credential model cooling", "account", accountID, "model", model, "reason", reason, "until", until.UTC().Format(time.RFC3339))
 }
 
@@ -2134,6 +2151,7 @@ func (p *Pool) rebuildWhenCooldownExpires(until time.Time) {
 		case <-timer.C:
 			p.rebuildActive()
 			p.notifyCapacity()
+			p.requestStatePersist()
 		case <-p.closed:
 		}
 	}()
@@ -2318,7 +2336,8 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 	a.mu.Unlock()
 	p.mu.Lock()
 	state := p.states[a.id]
-	stateChanged := state.Disabled || state.CredentialFingerprint != ""
+	criticalStateChanged := state.Disabled || state.CredentialFingerprint != ""
+	stateChanged := criticalStateChanged
 	state.Disabled = false
 	state.CredentialFingerprint = ""
 	if !keepCooldown {
@@ -2353,8 +2372,12 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 	}
 	p.mu.Unlock()
 	if stateChanged {
-		if err := p.persistState(); err != nil {
-			slog.Error("credential scheduler state persistence failed", "error", err)
+		if criticalStateChanged {
+			if err := p.persistState(); err != nil {
+				slog.Error("credential scheduler state persistence failed", "error", err)
+			}
+		} else {
+			p.requestStatePersist()
 		}
 	}
 	p.requestRebuild()
@@ -2376,6 +2399,46 @@ func (p *Pool) background() {
 			}
 			p.refreshAllDue()
 		case <-p.closed:
+			return
+		}
+	}
+}
+
+func (p *Pool) requestStatePersist() {
+	p.stateGeneration.Add(1)
+	select {
+	case p.stateWake <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Pool) stateCheckpointLoop() {
+	defer p.wg.Done()
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	for {
+		select {
+		case <-p.stateWake:
+			if timer == nil {
+				delay := p.statePersistDelay
+				if delay <= 0 {
+					delay = time.Second
+				}
+				timer = time.NewTimer(delay)
+				timerC = timer.C
+			}
+		case <-timerC:
+			err := p.FlushState()
+			timer = nil
+			timerC = nil
+			if err != nil {
+				slog.Error("credential state checkpoint failed", "error", err)
+				p.requestStatePersist()
+			}
+		case <-p.closed:
+			if timer != nil {
+				timer.Stop()
+			}
 			return
 		}
 	}
@@ -2434,7 +2497,8 @@ func (p *Pool) scan() error {
 	if err != nil || !stateChanged {
 		return err
 	}
-	return p.persistState()
+	p.requestStatePersist()
+	return nil
 }
 
 func (p *Pool) scanUnlocked() (bool, error) {
@@ -2447,6 +2511,7 @@ func (p *Pool) scanUnlocked() (bool, error) {
 	seen := map[string]struct{}{}
 	parsed := map[string]*credential{}
 	newFiles := map[string]fileEntry{}
+	scanComplete := true
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || strings.HasPrefix(name, ".") || !strings.EqualFold(filepath.Ext(name), ".json") {
@@ -2455,6 +2520,7 @@ func (p *Pool) scanUnlocked() (bool, error) {
 		path := filepath.Join(p.cfg.Dir, name)
 		info, err := entry.Info()
 		if err != nil {
+			scanComplete = false
 			continue
 		}
 		p.mu.RLock()
@@ -2469,6 +2535,7 @@ func (p *Pool) scanUnlocked() (bool, error) {
 		} else {
 			credentials, err = loadCredentials(path, p.cfg.Surface)
 			if err != nil {
+				scanComplete = false
 				slog.Warn("credential file skipped", "reason", "invalid_format")
 				continue
 			}
@@ -2489,8 +2556,13 @@ func (p *Pool) scanUnlocked() (bool, error) {
 		newFiles[path] = fileEntry{size: info.Size(), modTime: info.ModTime(), cred: first, creds: credentials}
 	}
 	if len(parsed) == 0 {
+		if !scanComplete {
+			slog.Warn("credential scan incomplete", "reason", "unreadable_file")
+			return false, nil
+		}
 		p.mu.Lock()
-		stateChanged := len(p.accounts) > 0 || len(p.files) > 0 || len(p.catalogs) > 0
+		poolChanged := len(p.accounts) > 0 || len(p.files) > 0
+		stateChanged := len(p.states) > 0 || len(p.catalogs) > 0
 		hadAccounts := len(p.accounts) > 0
 		for _, a := range p.accounts {
 			a.mu.Lock()
@@ -2499,9 +2571,10 @@ func (p *Pool) scanUnlocked() (bool, error) {
 		}
 		p.accounts = map[string]*account{}
 		p.files = map[string]fileEntry{}
+		p.states = map[string]accountState{}
 		p.catalogs = map[string]catalogState{}
 		p.mu.Unlock()
-		if stateChanged {
+		if poolChanged || stateChanged {
 			p.invalidateCredentialSnapshot()
 		}
 		p.rebuildActive()
@@ -2516,7 +2589,7 @@ func (p *Pool) scanUnlocked() (bool, error) {
 	}
 	p.mu.Lock()
 	poolChanged := len(p.files) != len(newFiles) || len(p.accounts) != len(parsed)
-	stateChanged := poolChanged
+	stateChanged := false
 	if !poolChanged {
 		for path, next := range newFiles {
 			current, ok := p.files[path]
@@ -2578,6 +2651,9 @@ func (p *Pool) scanUnlocked() (bool, error) {
 					existing.cooldownCause = ""
 					existing.billing = nil
 					state := p.states[id]
+					if state.Disabled || state.CredentialFingerprint != "" || !state.CooldownUntil.IsZero() || state.Reason != "" {
+						stateChanged = true
+					}
 					state.Disabled = false
 					state.CredentialFingerprint = ""
 					state.CooldownUntil = time.Time{}
@@ -2604,6 +2680,7 @@ func (p *Pool) scanUnlocked() (bool, error) {
 			if state.Disabled {
 				fingerprintChanged := state.CredentialFingerprint != "" && state.CredentialFingerprint != credentialFingerprint(cred)
 				if fingerprintChanged {
+					stateChanged = true
 					state.Disabled = false
 					state.CredentialFingerprint = ""
 					state.CooldownUntil = time.Time{}
@@ -2635,13 +2712,28 @@ func (p *Pool) scanUnlocked() (bool, error) {
 	}
 	for id, a := range p.accounts {
 		if _, ok := parsed[id]; !ok {
+			if !scanComplete {
+				continue
+			}
 			a.mu.Lock()
 			a.disabled, a.disableReason = true, "removed"
 			a.mu.Unlock()
 			delete(p.accounts, id)
-			delete(p.catalogs, id)
 			poolChanged = true
-			stateChanged = true
+		}
+	}
+	if scanComplete {
+		for id := range p.states {
+			if _, ok := parsed[id]; !ok {
+				delete(p.states, id)
+				stateChanged = true
+			}
+		}
+		for id := range p.catalogs {
+			if _, ok := parsed[id]; !ok {
+				delete(p.catalogs, id)
+				stateChanged = true
+			}
 		}
 	}
 	p.files = newFiles
@@ -2947,9 +3039,21 @@ func (p *Pool) loadState() error {
 	return nil
 }
 
+// FlushState synchronously persists all account and catalog state queued so far.
+func (p *Pool) FlushState() error {
+	return p.persistStateThrough(p.stateGeneration.Load())
+}
+
 func (p *Pool) persistState() error {
+	return p.persistStateThrough(p.stateGeneration.Add(1))
+}
+
+func (p *Pool) persistStateThrough(target uint64) error {
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
+	if p.statePersistedGeneration.Load() >= target {
+		return nil
+	}
 	p.mu.RLock()
 	state := persistedState{
 		Version: 2, GlobalAgentID: p.globalAgentID, NamespaceKey: p.namespaceKey,
@@ -2985,12 +3089,18 @@ func (p *Pool) persistState() error {
 			state.Catalogs[id] = catalog
 		}
 	}
+	snapshotGeneration := p.stateGeneration.Load()
 	p.mu.RUnlock()
-	b, err := json.MarshalIndent(state, "", "  ")
+	b, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
+	digest := sha256.Sum256(b)
+	if p.stateDigestValid && digest == p.stateDigest {
+		p.statePersistedGeneration.Store(snapshotGeneration)
+		return nil
+	}
 	path := filepath.Join(p.cfg.Dir, stateFileName)
 	tmp, err := os.CreateTemp(p.cfg.Dir, ".grok-state-*.tmp")
 	if err != nil {
@@ -3013,7 +3123,14 @@ func (p *Pool) persistState() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	p.stateDigest = digest
+	p.stateDigestValid = true
+	p.statePersistedGeneration.Store(snapshotGeneration)
+	p.stateWriteCount.Add(1)
+	return nil
 }
 
 func cloneFirstSeen(source map[string]int64) map[string]int64 {

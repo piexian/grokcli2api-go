@@ -692,6 +692,126 @@ func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) 
 	}
 }
 
+func TestStateCheckpointsCoalesceBurstAndSkipUnchangedContent(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	pool.statePersistDelay = 20 * time.Millisecond
+	baseline := pool.stateWriteCount.Load()
+	id := accountID("subject-a")
+
+	for i := 0; i < 100; i++ {
+		pool.mu.Lock()
+		state := pool.states[id]
+		state.Disabled = true
+		state.Reason = fmt.Sprintf("burst-%d", i)
+		pool.states[id] = state
+		pool.mu.Unlock()
+		pool.requestStatePersist()
+	}
+	deadline := time.Now().Add(time.Second)
+	for pool.stateWriteCount.Load() == baseline && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := pool.stateWriteCount.Load(); got != baseline+1 {
+		t.Fatalf("state writes after burst = %d, want %d", got, baseline+1)
+	}
+	if err := pool.FlushState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.stateWriteCount.Load(); got != baseline+1 {
+		t.Fatalf("unchanged flush wrote state again: writes=%d", got)
+	}
+
+	var persisted persistedState
+	readJSONFile(t, filepath.Join(dir, stateFileName), &persisted)
+	if got := persisted.Accounts[id].Reason; got != "burst-99" {
+		t.Fatalf("coalesced state reason = %q, want burst-99", got)
+	}
+}
+
+func TestCredentialFileRefreshWithoutStateChangeSkipsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	pool.statePersistDelay = 20 * time.Millisecond
+	baseline := pool.stateWriteCount.Load()
+
+	time.Sleep(10 * time.Millisecond)
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-b", time.Now().Add(time.Hour), "")
+	if err := pool.scan(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := pool.stateWriteCount.Load(); got != baseline {
+		t.Fatalf("credential-only scan wrote scheduler state: writes=%d, want %d", got, baseline)
+	}
+}
+
+func TestCompleteScanPrunesStaleAccountStateAndCatalog(t *testing.T) {
+	dir := t.TempDir()
+	const subject = "live-subject"
+	writeTestCredential(t, dir, "live.json", subject, "token-live", time.Now().Add(time.Hour), "")
+	liveID := accountID(subject)
+	const staleID = "stale-account"
+	writeJSONFile(t, filepath.Join(dir, stateFileName), persistedState{
+		Version: 2, GlobalAgentID: strings.Repeat("a", 32), NamespaceKey: strings.Repeat("b", 64),
+		Accounts: map[string]accountState{
+			liveID:  {BuildSuperEntitled: true},
+			staleID: {Disabled: true, Reason: "removed"},
+		},
+		Catalogs: map[string]catalogState{
+			staleID: {Provisional: []string{"grok-stale"}},
+		},
+	})
+
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	var persisted persistedState
+	readJSONFile(t, filepath.Join(dir, stateFileName), &persisted)
+	if _, ok := persisted.Accounts[liveID]; !ok {
+		t.Fatal("live account state was pruned")
+	}
+	if _, ok := persisted.Accounts[staleID]; ok {
+		t.Fatal("stale account state was not pruned")
+	}
+	if _, ok := persisted.Catalogs[staleID]; ok {
+		t.Fatal("stale account catalog was not pruned")
+	}
+}
+
+func TestIncompleteScanPreservesStaleState(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "live.json", "live-subject", "token-live", time.Now().Add(time.Hour), "")
+	if err := os.WriteFile(filepath.Join(dir, "invalid.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const staleID = "stale-account"
+	writeJSONFile(t, filepath.Join(dir, stateFileName), persistedState{
+		Version: 2, GlobalAgentID: strings.Repeat("a", 32), NamespaceKey: strings.Repeat("b", 64),
+		Accounts: map[string]accountState{
+			staleID: {Disabled: true, Reason: "removed"},
+		},
+		Catalogs: map[string]catalogState{
+			staleID: {Provisional: []string{"grok-stale"}},
+		},
+	})
+
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	var persisted persistedState
+	readJSONFile(t, filepath.Join(dir, stateFileName), &persisted)
+	if _, ok := persisted.Accounts[staleID]; !ok {
+		t.Fatal("incomplete scan pruned stale account state")
+	}
+	if _, ok := persisted.Catalogs[staleID]; !ok {
+		t.Fatal("incomplete scan pruned stale account catalog")
+	}
+}
+
 func TestBillingRecoveryDoesNotClearOtherCooldownReasons(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCredentialModelsWithTier(t, dir, "paid.json", "paid-subject", 4, []string{"grok-4.5"})

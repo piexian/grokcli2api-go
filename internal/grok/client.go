@@ -307,6 +307,9 @@ func (c *Client) refreshAccountModelsPath(ctx context.Context, accountID, path s
 			err = c.pool.UpdateModelDescriptors(accountID, result.Descriptors, result.ETag, now)
 		}
 	}
+	if err == nil {
+		err = c.pool.FlushState()
+	}
 	c.pool.RebuildSchedulingSnapshot()
 	return err
 }
@@ -367,10 +370,15 @@ func (c *Client) RefreshModels(ctx context.Context, force bool) error {
 			succeeded++
 		}
 	}
+	persistErr := c.pool.FlushState()
 	c.pool.RebuildSchedulingSnapshot()
 	slog.Info("account model catalogs refreshed", "requested", len(ids), "succeeded", succeeded, "failed", len(ids)-succeeded, "models", len(c.pool.Models()))
 	if succeeded != len(ids) {
-		return fmt.Errorf("model discovery failed for %d of %d credential accounts", len(ids)-succeeded, len(ids))
+		discoveryErr := fmt.Errorf("model discovery failed for %d of %d credential accounts", len(ids)-succeeded, len(ids))
+		return errors.Join(discoveryErr, persistErr)
+	}
+	if persistErr != nil {
+		return fmt.Errorf("persist model catalogs: %w", persistErr)
 	}
 	return nil
 }
