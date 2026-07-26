@@ -781,6 +781,7 @@ func TestBackgroundScanPersistsProvisionalCatalogAdditionAndRemoval(t *testing.T
 		t.Fatal(err)
 	}
 	defer pool.Close()
+	pool.statePersistDelay = 20 * time.Millisecond
 
 	writeTestCredentialModels(t, dir, "b.json", "scan-b", "token-b", time.Now().Add(24*time.Hour), "", []string{"grok-b"})
 	waitForPersistedCatalog := func(account, model string, present bool) {

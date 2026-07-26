@@ -416,7 +416,7 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 		capacityCh:        make(chan struct{}),
 		rebuildCh:         make(chan struct{}, 1),
 		stateWake:         make(chan struct{}, 1),
-		statePersistDelay: time.Second,
+		statePersistDelay: 5 * time.Second,
 		closed:            make(chan struct{}),
 	}
 	p.active.Store([]*account{})
@@ -2422,7 +2422,7 @@ func (p *Pool) stateCheckpointLoop() {
 			if timer == nil {
 				delay := p.statePersistDelay
 				if delay <= 0 {
-					delay = time.Second
+					delay = 5 * time.Second
 				}
 				timer = time.NewTimer(delay)
 				timerC = timer.C
