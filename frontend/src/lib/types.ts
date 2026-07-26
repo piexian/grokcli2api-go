@@ -11,6 +11,8 @@ export type BillingInfo = {
   updatedAt: string;
 };
 
+export type BuildRouteMode = "auto" | "build" | "xai";
+
 export type Credential = {
   id: string;
   scope?: string;
@@ -18,13 +20,21 @@ export type Credential = {
   status: string;
   usable: boolean;
   disabled: boolean;
+  disabledReason?: string;
   expiresAt?: string;
   cooldownUntil?: string;
+  cooldownReason?: string;
   models: string[];
   discoveryStatus?: string;
   hasRefreshToken: boolean;
   subscriptionTier?: string;
   subscriptionTierDisplay?: string;
+  buildRouteMode: BuildRouteMode;
+  buildSuperEntitled: boolean;
+  buildSuperEntitledOverride: boolean;
+  buildBotFlagged: boolean;
+  buildApiFallback: boolean;
+  buildEffectiveRoute: "build" | "xai";
   billing?: BillingInfo;
 };
 

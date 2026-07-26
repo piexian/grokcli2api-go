@@ -36,6 +36,12 @@ const permanentChatDenialKeyword = "Access to the chat endpoint is denied"
 
 const permanentChatDenialReason = "chat_endpoint_denied"
 
+const paymentRequiredReason = "payment_required"
+
+const buildPermissionDeniedReason = "build_permission_denied"
+
+const blockedUserReason = "blocked_user"
+
 const freeModelQuotaMessage = "used all the included free usage for model"
 
 const freeModelQuotaReason = "model_free_quota_exhausted"
@@ -72,19 +78,25 @@ func (e *APIError) Error() string {
 	return strings.Join(parts, " | ")
 }
 
+type buildEntitlementProbe struct {
+	done chan struct{}
+	err  error
+}
+
 type Client struct {
-	cfg            config.Config
-	pool           *auth.Pool
-	http           *http.Client
-	modelsMu       sync.Mutex
-	billingMu      sync.Mutex
-	modelStart     sync.Once
-	modelClose     chan struct{}
-	modelRefreshCh chan string
-	modelPending   sync.Map
-	modelWG        sync.WaitGroup
-	closeOnce      sync.Once
-	lastInference  sync.Map // account ID -> time.Time
+	cfg               config.Config
+	pool              *auth.Pool
+	http              *http.Client
+	modelsMu          sync.Mutex
+	billingMu         sync.Mutex
+	modelStart        sync.Once
+	modelClose        chan struct{}
+	modelRefreshCh    chan string
+	modelPending      sync.Map
+	modelWG           sync.WaitGroup
+	closeOnce         sync.Once
+	lastInference     sync.Map // account ID -> time.Time
+	entitlementProbes sync.Map // account ID -> *buildEntitlementProbe
 }
 
 type SSEEvent struct {
@@ -430,6 +442,10 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 		return err
 	}
 	defer lease.Release()
+	return c.fetchAccountBillingWithLease(ctx, accountID, refreshed, lease, true)
+}
+
+func (c *Client) fetchAccountBillingWithLease(ctx context.Context, accountID string, refreshed bool, lease *auth.Lease, allowRefresh bool) error {
 	resp, _, err := c.do(ctx, lease, http.MethodGet, "billing?format=credits", nil, NewID(), "", false, false)
 	if err != nil {
 		return err
@@ -441,7 +457,7 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 	}
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
-		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
+		if allowRefresh && isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
 			return c.fetchAccountBilling(ctx, accountID, true)
 		}
 		return apiErr
@@ -449,6 +465,21 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 	info, err := parseBillingInfo(payload, time.Now())
 	if err != nil {
 		return err
+	}
+	credential, _ := c.pool.Credential(accountID)
+	if !info.Paid && buildTierNeedsSubscriptionProbe(credential.SubscriptionTier) {
+		planCode, planName, tierErr := c.fetchAccountSubscription(ctx, lease)
+		if tierErr != nil {
+			slog.Warn("build entitlement metadata probe failed", "account", accountID, "error", tierErr)
+		} else {
+			if info.PlanCode == "" {
+				info.PlanCode = planCode
+			}
+			if info.PlanName == "" {
+				info.PlanName = planName
+			}
+			info.Paid = auth.IsPaidBuildPlan(info.PlanCode) || auth.IsPaidBuildPlan(info.PlanName)
+		}
 	}
 	if err := c.pool.UpdateBilling(accountID, info); err != nil {
 		return err
@@ -468,6 +499,103 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 	}
 	c.pool.MarkCooldownIfNoOtherReason(accountID, billingExhaustedReason, duration)
 	return nil
+}
+
+type subscriptionTierPayload struct {
+	SubscriptionTier string                   `json:"subscriptionTier"`
+	PlanCode         string                   `json:"planCode"`
+	PlanName         string                   `json:"planName"`
+	Subscription     *billingPlan             `json:"subscription"`
+	User             *subscriptionTierPayload `json:"user"`
+}
+
+func buildTierNeedsSubscriptionProbe(tier string) bool {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "free", "x_basic", "supergrok", "x_premium", "x_premium_plus", "supergrok_heavy", "supergrok_lite":
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *Client) fetchAccountSubscription(ctx context.Context, lease *auth.Lease) (string, string, error) {
+	resp, _, err := c.do(ctx, lease, http.MethodGet, "user?include=subscription", nil, NewID(), "", false, false)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	body, err := readResponseBody(resp, 1<<20)
+	if err != nil {
+		return "", "", err
+	}
+	if resp.StatusCode >= 400 {
+		return "", "", parseAPIError(resp, body)
+	}
+	var payload subscriptionTierPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", "", err
+	}
+	candidate := &payload
+	if payload.User != nil {
+		candidate = payload.User
+	}
+	code := strings.TrimSpace(candidate.PlanCode)
+	name := strings.TrimSpace(candidate.SubscriptionTier)
+	if name == "" {
+		name = strings.TrimSpace(candidate.PlanName)
+	}
+	if candidate.Subscription != nil {
+		if code == "" {
+			code = strings.TrimSpace(candidate.Subscription.Code)
+		}
+		if name == "" {
+			name = strings.TrimSpace(candidate.Subscription.Name)
+		}
+	}
+	if code == "" && name == "" {
+		return "", "", errors.New("subscription response did not contain a tier")
+	}
+	return code, name, nil
+}
+
+func (c *Client) probeBuildEntitlement(ctx context.Context, accountID string, lease *auth.Lease) error {
+	candidate := &buildEntitlementProbe{done: make(chan struct{})}
+	actual, loaded := c.entitlementProbes.LoadOrStore(accountID, candidate)
+	if loaded {
+		probe := actual.(*buildEntitlementProbe)
+		select {
+		case <-probe.done:
+			return probe.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	candidate.err = c.fetchAccountBillingWithLease(ctx, accountID, true, lease, false)
+	close(candidate.done)
+	c.entitlementProbes.Delete(accountID)
+	return candidate.err
+}
+
+func (c *Client) routingAfterEntitlementProbe(ctx context.Context, lease *auth.Lease, routing auth.BuildRoutingInfo) auth.BuildRoutingInfo {
+	if routing.RouteMode != auth.BuildRouteAuto || routing.SuperEntitled || routing.EffectiveInferenceRoute != auth.InferencePlaneBuild {
+		return routing
+	}
+	info, ok := c.pool.Credential(lease.AccountID())
+	if !ok || !buildTierNeedsSubscriptionProbe(info.SubscriptionTier) {
+		return routing
+	}
+	interval := c.cfg.BillingRefreshInterval
+	if interval <= 0 {
+		interval = defaultBillingRefreshInterval
+	}
+	if info.Billing != nil && !info.Billing.UpdatedAt.IsZero() && time.Since(info.Billing.UpdatedAt) < interval {
+		return routing
+	}
+	_ = c.probeBuildEntitlement(ctx, lease.AccountID(), lease)
+	if refreshed, ok := c.pool.Credential(lease.AccountID()); ok {
+		return refreshed.BuildRoutingInfo
+	}
+	return routing
 }
 
 type modelFetchResult struct {
@@ -505,13 +633,10 @@ func (c *Client) fetchAccountModelsPath(ctx context.Context, accountID string, r
 	}
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
-		if isPermanentAccountDenial(apiErr) {
-			c.deletePermanentlyDeniedCredential(accountID)
-			return modelFetchResult{}, apiErr
-		}
 		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
 			return c.fetchAccountModelsPath(ctx, accountID, true, path)
 		}
+		_ = c.handleRetryable(accountID, "", apiErr, defaultInferencePlane(lease.Session()))
 		return modelFetchResult{}, apiErr
 	}
 	descriptors, err := parseModelDescriptors(payload)
@@ -556,10 +681,22 @@ func parseModelDescriptors(payload []byte) ([]modelcatalog.ModelDescriptor, erro
 }
 
 type billingCreditsResponse struct {
-	Config *billingCreditsConfig `json:"config"`
+	SubscriptionTier string                `json:"subscriptionTier"`
+	PlanCode         string                `json:"planCode"`
+	PlanName         string                `json:"planName"`
+	Subscription     *billingPlan          `json:"subscription"`
+	Config           *billingCreditsConfig `json:"config"`
+}
+
+type billingPlan struct {
+	Code string `json:"code"`
+	Name string `json:"name"`
 }
 
 type billingCreditsConfig struct {
+	SubscriptionTier     string              `json:"subscriptionTier"`
+	PlanCode             string              `json:"planCode"`
+	PlanName             string              `json:"planName"`
 	CreditUsagePercent   *float64            `json:"creditUsagePercent"`
 	CurrentPeriod        *billingUsagePeriod `json:"currentPeriod"`
 	MonthlyLimit         *billingCent        `json:"monthlyLimit"`
@@ -586,10 +723,34 @@ func parseBillingInfo(payload []byte, now time.Time) (auth.BillingInfo, error) {
 		return auth.BillingInfo{}, err
 	}
 	info := auth.BillingInfo{UpdatedAt: now.UTC()}
+	info.PlanCode = strings.TrimSpace(response.PlanCode)
+	info.PlanName = strings.TrimSpace(response.SubscriptionTier)
+	if info.PlanName == "" {
+		info.PlanName = strings.TrimSpace(response.PlanName)
+	}
+	if response.Subscription != nil {
+		if info.PlanCode == "" {
+			info.PlanCode = strings.TrimSpace(response.Subscription.Code)
+		}
+		if info.PlanName == "" {
+			info.PlanName = strings.TrimSpace(response.Subscription.Name)
+		}
+	}
+	info.Paid = auth.IsPaidBuildPlan(info.PlanCode) || auth.IsPaidBuildPlan(info.PlanName)
 	if response.Config == nil {
 		return info, nil
 	}
 	cfg := response.Config
+	if info.PlanCode == "" {
+		info.PlanCode = strings.TrimSpace(cfg.PlanCode)
+	}
+	if info.PlanName == "" {
+		info.PlanName = strings.TrimSpace(cfg.SubscriptionTier)
+	}
+	if info.PlanName == "" {
+		info.PlanName = strings.TrimSpace(cfg.PlanName)
+	}
+	info.Paid = info.Paid || auth.IsPaidBuildPlan(info.PlanCode) || auth.IsPaidBuildPlan(info.PlanName)
 	if cfg.CreditUsagePercent != nil {
 		usage := *cfg.CreditUsagePercent
 		if usage < 0 {
@@ -646,6 +807,23 @@ func parseBillingInfo(payload []byte, now time.Time) (auth.BillingInfo, error) {
 		unified := *cfg.IsUnifiedBillingUser
 		info.UnifiedBilling = &unified
 	}
+	monthlyLimit := int64(0)
+	if cfg.MonthlyLimit != nil {
+		monthlyLimit = nonNegativeCents(cfg.MonthlyLimit.Val)
+	}
+	onDemandCap := int64(0)
+	onDemandUsed := int64(0)
+	if cfg.OnDemandCap != nil {
+		onDemandCap = nonNegativeCents(cfg.OnDemandCap.Val)
+	}
+	if cfg.OnDemandUsed != nil {
+		onDemandUsed = nonNegativeCents(cfg.OnDemandUsed.Val)
+	}
+	prepaidBalance := int64(0)
+	if cfg.PrepaidBalance != nil {
+		prepaidBalance = nonNegativeCents(cfg.PrepaidBalance.Val)
+	}
+	info.Paid = info.Paid || monthlyLimit > 0 || onDemandCap > 0 || onDemandUsed > 0 || prepaidBalance > 0
 	hasOnDemand := info.OnDemandRemainingCents != nil && *info.OnDemandRemainingCents > 0
 	hasPrepaid := info.PrepaidBalanceCents != nil && *info.PrepaidBalanceCents > 0
 	info.Exhausted = info.UsagePercent != nil && *info.UsagePercent >= 100 && !hasOnDemand && !hasPrepaid
@@ -721,18 +899,27 @@ func (c *Client) URL(path string) string {
 	return c.cfg.ChatProxyBaseURL + "/" + c.cfg.ChatProxyVersion + "/" + strings.TrimLeft(path, "/")
 }
 
+func defaultInferencePlane(session auth.Session) auth.InferencePlane {
+	if session.IsAPIKey() {
+		return auth.InferencePlaneXAI
+	}
+	return auth.InferencePlaneBuild
+}
+
 // URLForSession selects only operator-controlled origins. API-key credentials
 // use the configured xAI API origin; all other modes use cli-chat-proxy.
 func (c *Client) URLForSession(session auth.Session, path string) string {
+	return c.URLForPlane(session, path, defaultInferencePlane(session))
+}
+
+func (c *Client) URLForPlane(session auth.Session, path string, plane auth.InferencePlane) string {
 	baseURL := c.cfg.ChatProxyBaseURL
 	version := strings.Trim(c.cfg.ChatProxyVersion, "/")
-	if session.IsAPIKey() {
+	if session.IsAPIKey() || plane == auth.InferencePlaneXAI {
 		baseURL = c.cfg.XAIAPIBaseURL
 		if strings.TrimSpace(baseURL) == "" {
 			baseURL = "https://api.x.ai"
 		}
-		// GROK_CHAT_PROXY_VERSION belongs to the private CLI proxy. The
-		// operator-configured xAI origin always uses the public /v1 API.
 		version = "v1"
 	}
 	return strings.TrimRight(baseURL, "/") + "/" + version + "/" + strings.TrimLeft(path, "/")
@@ -785,10 +972,6 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		}
 		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
-			var permanentDenial *APIError
-			if errors.As(lastErr, &permanentDenial) && isPermanentAccountDenial(permanentDenial) {
-				return nil, lastErr
-			}
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
 				return nil, err
@@ -825,13 +1008,6 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			apiErr := parseAPIError(resp, data)
 			lease.Release()
 			lastErr = apiErr
-			if isPermanentAccountDenial(apiErr) {
-				c.deletePermanentlyDeniedCredential(accountID)
-				if len(used) < c.cfg.RetryMaxAttempts {
-					continue
-				}
-				return nil, apiErr
-			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				refreshStarted := time.Now()
@@ -851,7 +1027,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 					continue
 				}
 			}
-			if !c.handleRetryable(accountID, model, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
+			if !c.handleRetryable(accountID, model, apiErr, defaultInferencePlane(lease.Session())) || len(used) >= c.cfg.RetryMaxAttempts {
 				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
 					apiErr.Status = http.StatusTooManyRequests
 					apiErr.UpstreamCode = "account_pool_retry_exhausted"
@@ -914,10 +1090,6 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		}
 		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
-			var permanentDenial *APIError
-			if errors.As(lastErr, &permanentDenial) && isPermanentAccountDenial(permanentDenial) {
-				return nil, lastErr
-			}
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
 				return nil, err
@@ -931,7 +1103,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		generation := lease.Generation()
 		identity = identityWithLeaseDefaults(identity, lease)
 		used[accountID] = struct{}{}
-		resp, wrote, err := c.doWithIdentity(ctx, lease, http.MethodPost, path, payload, identity, trace, true, nil)
+		resp, wrote, plane, err := c.doInferenceWithIdentity(ctx, lease, http.MethodPost, path, payload, identity, trace, true)
 		if err != nil {
 			lease.Release()
 			lastErr = err
@@ -943,23 +1115,14 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			continue
 		}
-		c.observeModelHeaders(accountID, model, resp.Header)
-		if resp.StatusCode >= 400 {
-			data, readErr := readResponseBody(resp, 4<<20)
-			resp.Body.Close()
+		resp, apiErr, fallbackUncertain, resolveErr := c.resolveInferenceResponse(ctx, lease, http.MethodPost, path, payload, identity, trace, true, plane, resp)
+		if resolveErr != nil {
 			lease.Release()
-			if readErr != nil {
-				return nil, readErr
-			}
-			apiErr := parseAPIError(resp, data)
+			return nil, resolveErr
+		}
+		if apiErr != nil {
+			lease.Release()
 			lastErr = apiErr
-			if isPermanentAccountDenial(apiErr) {
-				c.deletePermanentlyDeniedCredential(accountID)
-				if len(used) < c.cfg.RetryMaxAttempts {
-					continue
-				}
-				return nil, apiErr
-			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				refreshStarted := time.Now()
@@ -980,7 +1143,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 					continue
 				}
 			}
-			if !c.handleRetryable(accountID, model, apiErr) || len(used) >= c.cfg.RetryMaxAttempts {
+			if fallbackUncertain || !c.handleRetryable(accountID, model, apiErr, plane) || len(used) >= c.cfg.RetryMaxAttempts {
 				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
 					apiErr.Status = http.StatusTooManyRequests
 					apiErr.UpstreamCode = "account_pool_retry_exhausted"
@@ -996,6 +1159,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			continue
 		}
+		c.observeModelHeaders(accountID, model, resp.Header)
 		c.pool.Bind(affinity, model, accountID)
 		if err := decodeResponseBody(resp); err != nil {
 			resp.Body.Close()
@@ -1044,6 +1208,24 @@ func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string,
 }
 
 func (c *Client) doWithIdentity(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, identity RequestIdentity, trace, stream bool, extraHeaders http.Header) (*http.Response, bool, error) {
+	plane := auth.InferencePlaneBuild
+	if lease.Session().IsAPIKey() {
+		plane = auth.InferencePlaneXAI
+	}
+	return c.doWithIdentityAt(ctx, lease, method, path, payload, identity, trace, stream, extraHeaders, plane)
+}
+
+func (c *Client) doInferenceWithIdentity(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, identity RequestIdentity, trace, stream bool) (*http.Response, bool, auth.InferencePlane, error) {
+	session := lease.Session()
+	plane := lease.BuildRouting().EffectiveInferenceRoute
+	if !session.IsAPIKey() && plane == auth.InferencePlaneXAI && !fallbackInferencePath(path) {
+		plane = auth.InferencePlaneBuild
+	}
+	resp, wrote, err := c.doWithIdentityAt(ctx, lease, method, path, payload, identity, trace, stream, nil, plane)
+	return resp, wrote, plane, err
+}
+
+func (c *Client) doWithIdentityAt(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, identity RequestIdentity, trace, stream bool, extraHeaders http.Header, plane auth.InferencePlane) (*http.Response, bool, error) {
 	var wrote atomic.Bool
 	timing := RequestTimingFromContext(ctx)
 	timing.MarkAttempt()
@@ -1062,7 +1244,7 @@ func (c *Client) doWithIdentity(ctx context.Context, lease *auth.Lease, method, 
 	if payload != nil {
 		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequestWithContext(requestCtx, method, c.URLForSession(lease.Session(), path), reader)
+	req, err := http.NewRequestWithContext(requestCtx, method, c.URLForPlane(lease.Session(), path, plane), reader)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1091,8 +1273,89 @@ func (c *Client) doWithIdentity(ctx context.Context, lease *auth.Lease, method, 
 	resp.Body = &timedReadCloser{ReadCloser: resp.Body, timing: timing}
 	return resp, wrote.Load(), nil
 }
+func fallbackInferencePath(path string) bool {
+	path = strings.Trim(strings.SplitN(path, "?", 2)[0], "/")
+	switch path {
+	case "responses", "responses/compact":
+		return true
+	default:
+		return false
+	}
+}
 
-func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
+func (c *Client) resolveInferenceResponse(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, identity RequestIdentity, trace, stream bool, primaryPlane auth.InferencePlane, resp *http.Response) (*http.Response, *APIError, bool, error) {
+	if resp.StatusCode < 400 {
+		return resp, nil, false, nil
+	}
+	body, err := readResponseBody(resp, 4<<20)
+	resp.Body.Close()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	primaryErr := parseAPIError(resp, body)
+	routing := lease.BuildRouting()
+	if primaryPlane != auth.InferencePlaneBuild || primaryErr.Status != http.StatusForbidden ||
+		!fallbackInferencePath(path) || isAuthError(primaryErr) ||
+		isPermanentAccountDenial(primaryErr) || isDefinitiveAccountBlock(primaryErr) {
+		return nil, primaryErr, false, nil
+	}
+	routing = c.routingAfterEntitlementProbe(ctx, lease, routing)
+	if !routing.CanProbeXAI() {
+		return nil, primaryErr, false, nil
+	}
+
+	fallbackResp, wrote, requestErr := c.doWithIdentityAt(ctx, lease, method, path, payload, identity, trace, stream, nil, auth.InferencePlaneXAI)
+	if requestErr != nil {
+		slog.Warn("xai inference fallback transport failed", "account", lease.AccountID(), "path", path, "wrote", wrote, "error", requestErr)
+		return nil, primaryErr, wrote, nil
+	}
+	if fallbackResp.StatusCode >= 400 {
+		fallbackBody, readErr := readResponseBody(fallbackResp, 4<<20)
+		fallbackResp.Body.Close()
+		if readErr != nil {
+			slog.Warn("read xai inference fallback failure body", "account", lease.AccountID(), "path", path, "error", readErr)
+			return nil, primaryErr, true, nil
+		}
+		fallbackErr := parseAPIError(fallbackResp, fallbackBody)
+		_ = c.handleRetryable(lease.AccountID(), identity.Model, fallbackErr, auth.InferencePlaneXAI)
+		slog.Warn("xai inference fallback rejected", "account", lease.AccountID(), "path", path, "status", fallbackErr.Status, "code", fallbackErr.UpstreamCode)
+		return nil, primaryErr, false, nil
+	}
+	if !c.pool.MarkBuildAPIFallback(lease.AccountID()) {
+		slog.Error("persist xai inference fallback marker failed", "account", lease.AccountID())
+	}
+	slog.Info("xai inference fallback activated", "account", lease.AccountID(), "path", path)
+	return fallbackResp, nil, false, nil
+}
+
+func (c *Client) handleRetryable(accountID, model string, err *APIError, plane auth.InferencePlane) bool {
+	if err == nil {
+		return false
+	}
+	if err.Status == http.StatusPaymentRequired {
+		c.pool.MarkCooldown(accountID, paymentRequiredReason, c.billingCooldown(accountID))
+		return true
+	}
+	if isPermanentAccountDenial(err) {
+		if model == "" {
+			c.pool.MarkCooldown(accountID, permanentChatDenialReason, c.cfg.QuotaCooldown)
+		} else {
+			c.pool.MarkModelCooldown(accountID, model, permanentChatDenialReason, c.cfg.QuotaCooldown)
+		}
+		return true
+	}
+	if isDefinitiveAccountBlock(err) {
+		c.pool.Disable(accountID, blockedUserReason)
+		return true
+	}
+	if plane == auth.InferencePlaneBuild && isBuildPermissionDenied(err) {
+		cooldown := c.cfg.RateLimitCooldown
+		if cooldown <= 0 {
+			cooldown = time.Minute
+		}
+		c.pool.MarkCooldown(accountID, buildPermissionDeniedReason, cooldown)
+		return true
+	}
 	if err.ShouldRetry != nil && !*err.ShouldRetry {
 		return false
 	}
@@ -1124,6 +1387,19 @@ func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
 	}
 }
 
+func (c *Client) billingCooldown(accountID string) time.Duration {
+	duration := c.cfg.QuotaCooldown
+	if duration <= 0 {
+		duration = 24 * time.Hour
+	}
+	if billing, ok := c.pool.Billing(accountID); ok && billing.PeriodEnd != nil {
+		if untilReset := time.Until(*billing.PeriodEnd); untilReset > 0 {
+			duration = untilReset
+		}
+	}
+	return duration
+}
+
 func isAuthError(err *APIError) bool {
 	if err.Status == http.StatusUnauthorized {
 		return true
@@ -1142,21 +1418,20 @@ func isPermanentAccountDenial(err *APIError) bool {
 	return strings.Contains(err.UpstreamMessage, permanentChatDenialKeyword) ||
 		strings.Contains(err.Body, permanentChatDenialKeyword)
 }
-
-// deletePermanentlyDeniedCredential removes the exact logical credential
-// rejected by the upstream. DeleteCredential is scope-aware, so a denial for
-// one scope in a multi-scope auth.json does not remove its siblings. A failed
-// filesystem deletion falls back to disabling the account so it cannot be
-// scheduled again while the operator investigates the write/lock failure.
-func (c *Client) deletePermanentlyDeniedCredential(accountID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := c.pool.DeleteCredential(ctx, accountID); err != nil && !errors.Is(err, auth.ErrCredentialNotFound) {
-		c.pool.Disable(accountID, permanentChatDenialReason)
-		slog.Error("delete credential after exact chat endpoint denial failed", "account", accountID, "error", err)
-		return
+func isDefinitiveAccountBlock(err *APIError) bool {
+	if err == nil || err.Status != http.StatusForbidden {
+		return false
 	}
-	slog.Warn("credential deleted after exact chat endpoint denial", "account", accountID)
+	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
+	return strings.Contains(text, "blocked-user") || strings.Contains(text, "blocked user")
+}
+
+func isBuildPermissionDenied(err *APIError) bool {
+	if err == nil || err.Status != http.StatusForbidden || isAuthError(err) ||
+		isPermanentAccountDenial(err) || isDefinitiveAccountBlock(err) {
+		return false
+	}
+	return true
 }
 
 func isFreeModelQuotaExhausted(err *APIError) bool {

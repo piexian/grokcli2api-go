@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -502,6 +503,81 @@ func BenchmarkAdminCredentialsHandler_16k(b *testing.B) {
 	}
 	if p95Total >= 200*time.Millisecond {
 		b.Fatalf("p95 latency for 32 pages = %s, want < 200ms", p95Total)
+	}
+}
+
+func TestAdminCredentialRoutingUpdatesAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	payload, err := json.Marshal(map[string]any{
+		"key": "token", "auth_mode": "external", "user_id": "user", "expires_at": expires,
+		"models": []string{"grok-4.5"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "account.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 16,
+	}, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{pool: pool}
+	id := pool.AccountIDs()[0]
+	request := httptest.NewRequest(http.MethodPatch, "/v1/admin/credentials/"+id, bytes.NewBufferString(`{
+		"build_route_mode":"xai",
+		"build_super_entitled":true
+	}`))
+	request.SetPathValue("id", id)
+	response := httptest.NewRecorder()
+	server.adminCredentialRouting(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	info, ok := pool.Credential(id)
+	if !ok || info.RouteMode != auth.BuildRouteXAI || !info.SuperEntitledOverride ||
+		info.EffectiveInferenceRoute != auth.InferencePlaneXAI {
+		t.Fatalf("routing info = %#v, %v", info.BuildRoutingInfo, ok)
+	}
+	pool.Close()
+
+	reloaded, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "tui", ReloadInterval: time.Hour, RefreshConcurrency: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 16,
+	}, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	reloadedInfo, ok := reloaded.Credential(id)
+	if !ok || reloadedInfo.RouteMode != auth.BuildRouteXAI || !reloadedInfo.SuperEntitledOverride {
+		t.Fatalf("reloaded routing info = %#v, %v", reloadedInfo.BuildRoutingInfo, ok)
+	}
+}
+
+func TestAdminCredentialRoutingRejectsInvalidMode(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPatch, "/v1/admin/credentials/0123456789abcdef01234567", bytes.NewBufferString(`{"build_route_mode":"random"}`))
+	request.SetPathValue("id", "0123456789abcdef01234567")
+	response := httptest.NewRecorder()
+	server := &Server{}
+	server.adminCredentialRouting(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminCredentialRoutingRejectsSettingFallbackRecord(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPatch, "/v1/admin/credentials/0123456789abcdef01234567", bytes.NewBufferString(`{"build_api_fallback":true}`))
+	request.SetPathValue("id", "0123456789abcdef01234567")
+	response := httptest.NewRecorder()
+	server := &Server{}
+	server.adminCredentialRouting(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

@@ -90,6 +90,57 @@ func TestCredentialInfoUsesOfficialSubscriptionTierDisplay(t *testing.T) {
 		t.Fatalf("credential JSON = %s", encoded)
 	}
 }
+func TestCredentialRoutingUsesBotFlagForEntitledAccount(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"tier":            4,
+		"bot_flag_source": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+	raw, err := json.Marshal(map[string]any{
+		"access_token": token,
+		"sub":          "subject-a",
+		"models":       []string{"grok-4.5"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := parseCredential(raw, "", "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &account{id: accountID(cred.Subject), credential: cred, buildRouteMode: BuildRouteAuto}
+	routing := buildRoutingInfo(cred, a.buildRouteMode, a.buildSuperEntitled, a.buildAPIFallback)
+	if !routing.BotFlagged || !routing.SuperEntitled || routing.EffectiveInferenceRoute != InferencePlaneXAI || routing.CanProbeXAI() {
+		t.Fatalf("routing = %#v", routing)
+	}
+	info := credentialInfo(a.id, a, time.Now())
+	if !info.BotFlagged || info.EffectiveInferenceRoute != InferencePlaneXAI {
+		t.Fatalf("credential info = %#v", info)
+	}
+}
+func TestBuildSuperTierExcludesLowerPaidTiers(t *testing.T) {
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{key: "free"},
+		{key: "x_basic"},
+		{key: "x_premium", want: true},
+		{key: "x_premium_plus", want: true},
+		{key: "supergrok", want: true},
+		{key: "supergrok_heavy", want: true},
+		{key: "supergrok_lite", want: true},
+		{key: "99"},
+	}
+	for _, test := range tests {
+		if got := buildSuperTier(subscriptionTier{Key: test.key}); got != test.want {
+			t.Errorf("buildSuperTier(%q) = %t, want %t", test.key, got, test.want)
+		}
+	}
+}
 
 func TestRefreshRotatesAndPersistsCredential(t *testing.T) {
 	var calls atomic.Int32
@@ -298,6 +349,63 @@ func TestRefreshPreservesModelCooldown(t *testing.T) {
 		t.Fatalf("unrelated model was unavailable after refresh: %v", err)
 	}
 	lease.Release()
+}
+func TestRefreshClearsDisabledStateAndPreservesBuildRouting(t *testing.T) {
+	refreshEntered := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshEntered <- struct{}{}
+		<-releaseRefresh
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"token-new","refresh_token":"refresh-new","expires_in":3600}`))
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-old", time.Now().Add(time.Hour), server.URL)
+	pool := newTestPool(t, dir)
+	id := accountID("subject-a")
+	mode, entitled, fallback := BuildRouteXAI, true, true
+	if _, err := pool.UpdateBuildRouting(id, BuildRoutingUpdate{
+		RouteMode: &mode, SuperEntitledOverride: &entitled, APIFallback: &fallback,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- pool.Refresh(context.Background(), id) }()
+	select {
+	case <-refreshEntered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach token endpoint")
+	}
+	pool.Disable(id, "blocked_user")
+	close(releaseRefresh)
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	info, ok := pool.Credential(id)
+	if !ok || info.Disabled || info.RouteMode != mode || !info.SuperEntitledOverride || !info.APIFallback {
+		t.Fatalf("credential after refresh = %#v", info)
+	}
+	persistedJSON, err := os.ReadFile(filepath.Join(dir, stateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted persistedState
+	if err := json.Unmarshal(persistedJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	state := persisted.Accounts[id]
+	if state.Disabled || state.BuildRouteMode != mode || !state.BuildSuperEntitled || !state.BuildAPIFallback {
+		t.Fatalf("persisted state = %#v", state)
+	}
+	pool.Close()
+
+	reloaded := newTestPool(t, dir)
+	defer reloaded.Close()
+	info, ok = reloaded.Credential(id)
+	if !ok || info.Disabled || info.RouteMode != mode || !info.SuperEntitledOverride || !info.APIFallback {
+		t.Fatalf("credential after reload = %#v", info)
+	}
 }
 
 func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {

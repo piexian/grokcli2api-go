@@ -1,5 +1,5 @@
 import { keepPreviousData, useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, ArrowUpDown, RefreshCw, Search, Trash2, Upload, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, RefreshCw, Search, Settings2, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -25,6 +25,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -32,14 +33,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Table, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmptyHint, ErrorHint, SkeletonRows } from "@/components/data";
 import { PageHeader } from "@/components/layout";
-import { deleteCredential, fetchCredentialPage, splitCredentialPayloads, uploadCredentialsBatch, type CredentialQuery, type UploadItemResult } from "@/lib/api";
+import { deleteCredential, fetchCredentialPage, splitCredentialPayloads, updateCredentialRouting, uploadCredentialsBatch, type CredentialQuery, type UploadItemResult } from "@/lib/api";
 import { formatDateTime, formatNumber } from "@/lib/format";
-import type { Credential } from "@/lib/types";
+import type { BuildRouteMode, Credential } from "@/lib/types";
 
 const QUERY_KEY = ["credentials"] as const;
 const PAGE_SIZE = 100;
@@ -56,8 +58,9 @@ const SORTABLE_COLUMNS: Array<{ field: SortField; labelKey: string }> = [
   { field: "models_count", labelKey: "accounts.colModels" },
 ];
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({ credential }: { credential: Credential }) {
   const { t } = useTranslation();
+  const { status } = credential;
   const tone =
     status === "ready"
       ? "bg-emerald-500"
@@ -65,11 +68,19 @@ function StatusBadge({ status }: { status: string }) {
         ? "bg-amber-500"
         : "bg-red-500";
   const label = t(`accounts.status.${status}`, { defaultValue: status });
-  return (
+  const reason = status === "disabled" ? credential.disabledReason : credential.cooldownReason;
+  const content = (
     <span className="inline-flex items-center gap-1.5 text-[13px] whitespace-nowrap">
       <span className={`size-1.5 rounded-full ${tone}`} aria-hidden="true" />
       {label}
     </span>
+  );
+  if (!reason) return content;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{content}</TooltipTrigger>
+      <TooltipContent>{reason}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -100,6 +111,28 @@ function QuotaCell({ credential }: { credential: Credential }) {
     <Tooltip>
       <TooltipTrigger asChild>
         <span className="text-[13px] tabular-nums whitespace-nowrap">{text}</span>
+      </TooltipTrigger>
+      <TooltipContent>{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function RouteCell({ credential }: { credential: Credential }) {
+  const { t } = useTranslation();
+  const tooltip = [
+    t("accounts.routeModeValue", { value: t(`accounts.routeMode.${credential.buildRouteMode}`) }),
+    credential.buildSuperEntitled ? t("accounts.routeSuper") : "",
+    credential.buildBotFlagged ? t("accounts.routeRiskFlag") : "",
+    credential.buildApiFallback ? t("accounts.routeFallbackActive") : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={credential.buildEffectiveRoute === "xai" ? "default" : "outline"} className="font-mono text-[11px] uppercase">
+          {credential.buildEffectiveRoute}
+        </Badge>
       </TooltipTrigger>
       <TooltipContent>{tooltip}</TooltipContent>
     </Tooltip>
@@ -142,6 +175,10 @@ export function AccountsPage() {
   const [order, setOrder] = useState<SortOrder>("asc");
   const [uploadOpen, setUploadOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Credential | null>(null);
+  const [routeTarget, setRouteTarget] = useState<Credential | null>(null);
+  const [routeMode, setRouteMode] = useState<BuildRouteMode>("auto");
+  const [routeSuperEntitled, setRouteSuperEntitled] = useState(false);
+  const [routeFallback, setRouteFallback] = useState(false);
   const [paste, setPaste] = useState("");
   const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
   const [uploadResults, setUploadResults] = useState<UploadItemResult[] | null>(null);
@@ -236,6 +273,37 @@ export function AccountsPage() {
     },
     onSettled: () => void queryClient.invalidateQueries({ queryKey: QUERY_KEY }),
   });
+  const routingMutation = useMutation({
+    mutationFn: ({ id, mode, superEntitled, fallback }: { id: string; mode: BuildRouteMode; superEntitled: boolean; fallback?: boolean }) =>
+      updateCredentialRouting(id, {
+        buildRouteMode: mode,
+        buildSuperEntitled: superEntitled,
+        buildApiFallback: fallback,
+      }),
+    onSuccess: (updated) => {
+      queryClient.setQueriesData<{ pages: Array<{ items: Credential[] }>; pageParams: string[] }>(
+        { queryKey: QUERY_KEY },
+        (old) => old ? {
+          ...old,
+          pages: old.pages.map((page) => ({
+            ...page,
+            items: page.items.map((credential) => credential.id === updated.id ? updated : credential),
+          })),
+        } : old,
+      );
+      setRouteTarget(null);
+      toast.success(t("accounts.routeSaved"));
+      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
+  });
+
+  function openRouting(item: Credential) {
+    setRouteTarget(item);
+    setRouteMode(item.buildRouteMode);
+    setRouteSuperEntitled(item.buildSuperEntitledOverride);
+    setRouteFallback(item.buildApiFallback);
+  }
 
   function toggleSort(field: SortField) {
     if (sort === field) setOrder(order === "asc" ? "desc" : "asc");
@@ -250,7 +318,7 @@ export function AccountsPage() {
     return order === "asc" ? <ArrowUp className="size-3" /> : <ArrowDown className="size-3" />;
   }
 
-  const colSpan = 8;
+  const colSpan = 9;
   const searching = debouncedSearch.trim().length > 0 || status !== "all" || usable !== "all";
 
   return (
@@ -338,6 +406,7 @@ export function AccountsPage() {
                     </button>
                   </TableHead>
                 ))}
+                <TableHead>{t("accounts.colRoute")}</TableHead>
                 <TableHead>{t("accounts.colQuota")}</TableHead>
                 <TableHead>{t("accounts.colExpiry")}</TableHead>
                 <TableHead>{t("accounts.colCooldown")}</TableHead>
@@ -362,13 +431,16 @@ export function AccountsPage() {
                       <span className="font-mono text-[13px]">{item.id}</span>
                     </TableCell>
                     <TableCell>
-                      <StatusBadge status={item.status} />
+                      <StatusBadge credential={item} />
                     </TableCell>
                     <TableCell>
                       <span className="text-[13px] whitespace-nowrap">{item.subscriptionTierDisplay ?? "—"}</span>
                     </TableCell>
                     <TableCell>
                       <span className="text-[13px] tabular-nums">{formatNumber(item.models.length)}</span>
+                    </TableCell>
+                    <TableCell>
+                      <RouteCell credential={item} />
                     </TableCell>
                     <TableCell>
                       <QuotaCell credential={item} />
@@ -382,14 +454,36 @@ export function AccountsPage() {
                       </span>
                     </TableCell>
                     <TableCell>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-8 text-muted-foreground hover:text-destructive"
-                        onClick={() => setDeleteTarget(item)}
-                      >
-                        <Trash2 className="size-4" />
-                      </Button>
+                      <div className="flex items-center justify-end gap-1">
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-8 text-muted-foreground hover:text-foreground"
+                              onClick={() => openRouting(item)}
+                              aria-label={t("accounts.routeSettings")}
+                            >
+                              <Settings2 className="size-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{t("accounts.routeSettings")}</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-8 text-muted-foreground hover:text-destructive"
+                              onClick={() => setDeleteTarget(item)}
+                              aria-label={t("accounts.deleteTitle")}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{t("accounts.deleteTitle")}</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -473,6 +567,86 @@ export function AccountsPage() {
               {uploadMutation.isPending
                 ? t("accounts.uploading")
                 : t("accounts.upload")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={routeTarget !== null}
+        onOpenChange={(open) => {
+          if (routingMutation.isPending) return;
+          if (!open) setRouteTarget(null);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("accounts.routeTitle")}</DialogTitle>
+            <DialogDescription className="font-mono text-xs">{routeTarget?.id}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-5 py-1">
+            <div className="grid gap-2">
+              <Label htmlFor="route-mode">{t("accounts.routeModeLabel")}</Label>
+              <Select
+                value={routeMode}
+                onValueChange={(value) => setRouteMode(value as BuildRouteMode)}
+                disabled={routeTarget?.authMode === "api_key"}
+              >
+                <SelectTrigger id="route-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{t("accounts.routeMode.auto")}</SelectItem>
+                  <SelectItem value="build">{t("accounts.routeMode.build")}</SelectItem>
+                  <SelectItem value="xai">{t("accounts.routeMode.xai")}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="route-super">{t("accounts.routeSuperOverride")}</Label>
+              <Switch
+                id="route-super"
+                checked={routeSuperEntitled}
+                onCheckedChange={setRouteSuperEntitled}
+                disabled={routeTarget?.authMode === "api_key"}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <Label>{t("accounts.routeFallbackMarker")}</Label>
+              <div className="flex items-center gap-2">
+                <span className="text-[13px] text-muted-foreground">
+                  {routeFallback ? t("accounts.routeFallbackActive") : t("common.no")}
+                </span>
+                {routeFallback ? (
+                  <Button type="button" variant="outline" size="sm" onClick={() => setRouteFallback(false)}>
+                    {t("accounts.routeFallbackClear")}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-2 border-t pt-4 text-[13px]">
+              <span className="text-muted-foreground">{t("accounts.routeRiskFlag")}</span>
+              <span className="text-right">{routeTarget?.buildBotFlagged ? t("common.yes") : t("common.no")}</span>
+              <span className="text-muted-foreground">{t("accounts.routeEffective")}</span>
+              <span className="text-right font-mono uppercase">{routeTarget?.buildEffectiveRoute ?? "—"}</span>
+              <span className="text-muted-foreground">{t("accounts.routeSuperEffective")}</span>
+              <span className="text-right">{routeTarget?.buildSuperEntitled ? t("common.yes") : t("common.no")}</span>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRouteTarget(null)} disabled={routingMutation.isPending}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              onClick={() => routeTarget && routingMutation.mutate({
+                id: routeTarget.id,
+                mode: routeMode,
+                superEntitled: routeSuperEntitled,
+                fallback: routeFallback === routeTarget.buildApiFallback ? undefined : routeFallback,
+              })}
+              disabled={routingMutation.isPending || routeTarget?.authMode === "api_key"}
+            >
+              {routingMutation.isPending ? t("accounts.routeSaving") : t("accounts.routeSave")}
             </Button>
           </DialogFooter>
         </DialogContent>

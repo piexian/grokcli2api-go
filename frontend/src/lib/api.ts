@@ -69,13 +69,21 @@ function toCredential(raw: any): Credential {
     status: raw.status,
     usable: Boolean(raw.usable),
     disabled: Boolean(raw.disabled),
+    disabledReason: raw.disabled_reason,
     expiresAt: raw.expires_at,
     cooldownUntil: raw.cooldown_until,
+    cooldownReason: raw.cooldown_reason,
     models: raw.models ?? [],
     discoveryStatus: raw.discovery_status,
     hasRefreshToken: Boolean(raw.has_refresh_token),
     subscriptionTier: raw.subscription_tier,
     subscriptionTierDisplay: raw.subscription_tier_display,
+    buildRouteMode: raw.build_route_mode ?? "auto",
+    buildSuperEntitled: Boolean(raw.build_super_entitled),
+    buildSuperEntitledOverride: Boolean(raw.build_super_entitled_override),
+    buildBotFlagged: Boolean(raw.build_bot_flagged),
+    buildApiFallback: Boolean(raw.build_api_fallback),
+    buildEffectiveRoute: raw.build_effective_route ?? (raw.auth_mode === "api_key" ? "xai" : "build"),
     billing: raw.billing
       ? {
           usagePercent: raw.billing.usage_percent,
@@ -233,6 +241,25 @@ export async function uploadCredentialsBatch(
 
 export async function deleteCredential(id: string): Promise<void> {
   await apiRequest(`/v1/admin/credentials/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+export type CredentialRoutingUpdate = {
+  buildRouteMode?: Credential["buildRouteMode"];
+  buildSuperEntitled?: boolean;
+  buildApiFallback?: boolean;
+};
+
+export async function updateCredentialRouting(id: string, update: CredentialRoutingUpdate): Promise<Credential> {
+  const body: Record<string, unknown> = {};
+  if (update.buildRouteMode !== undefined) body.build_route_mode = update.buildRouteMode;
+  if (update.buildSuperEntitled !== undefined) body.build_super_entitled = update.buildSuperEntitled;
+  if (update.buildApiFallback !== undefined) body.build_api_fallback = update.buildApiFallback;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result = await apiRequest<any>(`/v1/admin/credentials/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return toCredential(result.credential);
 }
 
 /* ---------- 审计 ---------- */

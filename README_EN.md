@@ -76,6 +76,22 @@ All three public endpoints—Chat Completions, Responses, and Anthropic Messages
 
 Fields, content blocks, tool state, and protocol-specific state that cannot be mapped safely are silently removed. The response contains no compatibility warning or deletion list. A `400 invalid_request_error` is returned only when a retained field has an invalid type, a required public field is missing, or no valid minimum input remains after cleaning; bodies over 16 MiB return `413`. If `previous_response_id`, encrypted reasoning, or a thinking signature must be removed because the target backend cannot represent it, that hard affinity is released for this request and a new upstream session is used.
 
+### Build risk control and XAI inference fallback
+
+OIDC/Web accounts use the Build inference plane by default. In `auto` mode, a confirmed Super account whose JWT contains numeric `bot_flag_source=1` uses XAI directly. Other confirmed Super accounts probe XAI with the same account and request only when that Build Responses create/compact attempt returns an exact HTTP 403 that is not an authentication failure, `blocked-user`, or chat endpoint denial. A successful probe persists `build_api_fallback` in the redacted scheduler state as an observation marker; later `auto` requests still start on Build. Model catalogs, billing, and OAuth refresh always remain on the Build plane.
+
+Super eligibility is inferred only from explicit `SuperGrok`, `X Premium`, `X Premium+`, `SuperGrok Heavy`, `SuperGrok Lite`, or an explicit paid signal from billing. When the JWT tier is unknown, the first eligible 403 performs a controlled billing and subscription probe; if entitlement remains unknown, XAI is not probed and an administrator can confirm it explicitly. Per-account routing supports `auto`, `build`, and `xai`:
+
+```http
+PATCH /v1/admin/credentials/{id}
+Authorization: Bearer <GROK_ADMIN_KEY>
+Content-Type: application/json
+
+{"build_route_mode":"auto","build_super_entitled":true,"build_api_fallback":false}
+```
+
+A generic HTTP 402 cools the account until the known billing period ends, or for the configured quota cooldown when no period is known, then retries another account. A generic Build 403 applies a short cooldown and switches accounts. `blocked-user` disables the account but retains its credential file. Chat endpoint denial isolates only the affected model and never deletes the credential automatically.
+
 ### Reasoning effort
 
 An explicitly supplied reasoning effort is never dropped for compatibility. It is trimmed and lowercased: supported `minimal`, `low`, `medium`, `high`, and `xhigh` values are preserved; `none`, every unknown string, any value absent from the model's supported list, and every value sent to a model without declared reasoning capability become `low`. This fallback is still sent even if the descriptor itself does not list `low`.
@@ -388,7 +404,7 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
 
-When the upstream returns HTTP `403` and the error content contains the case-sensitive keyword `Access to the chat endpoint is denied`, the service automatically deletes that logical credential and tries another account. Suffix text, punctuation, and JSON nesting may differ; non-`403` responses and differently cased text do not trigger deletion. A multi-scope file still loses only the rejected scope. If the file lock or write fails, the account is disabled first so it cannot be scheduled again.
+When the upstream returns HTTP `403` and the error content contains the case-sensitive keyword `Access to the chat endpoint is denied`, the service isolates the affected model on that account and tries another account; it no longer deletes the logical credential automatically. Suffix text, punctuation, and JSON nesting may differ; non-`403` responses and differently cased text do not trigger this handling. An explicit `blocked-user` disables the account but retains its credential file. If state persistence fails, the account is still removed from in-memory scheduling and the error is logged.
 
 Administrator responses include `Cache-Control: no-store`. Uploads are limited to 1 MiB; the service validates the JSON, derives the destination from the account identity, and atomically writes it with mode `0600` instead of trusting the client filename. Prefer administration over loopback or an SSH tunnel. Cross-network access must use HTTPS with source and rate restrictions at the reverse proxy.
 

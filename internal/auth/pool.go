@@ -62,8 +62,10 @@ type CredentialInfo struct {
 	Status                  string                       `json:"status"`
 	Usable                  bool                         `json:"usable"`
 	Disabled                bool                         `json:"disabled"`
+	DisabledReason          string                       `json:"disabled_reason,omitempty"`
 	ExpiresAt               *time.Time                   `json:"expires_at,omitempty"`
 	CooldownUntil           *time.Time                   `json:"cooldown_until,omitempty"`
+	CooldownReason          string                       `json:"cooldown_reason,omitempty"`
 	ModelCooldowns          map[string]ModelCooldownInfo `json:"model_cooldowns,omitempty"`
 	Models                  []string                     `json:"models"`
 	DiscoveryStatus         string                       `json:"discovery_status"`
@@ -74,6 +76,7 @@ type CredentialInfo struct {
 	SubscriptionTierDisplay string                       `json:"subscription_tier_display,omitempty"`
 	Paid                    bool                         `json:"-"`
 	Billing                 *BillingInfo                 `json:"billing,omitempty"`
+	BuildRoutingInfo
 }
 
 // ModelCooldownInfo is redacted model-scoped cooldown metadata for administrators.
@@ -91,6 +94,9 @@ type credentialInfoSnapshot struct {
 // BillingInfo is a redacted, in-memory snapshot of the authoritative credits
 // endpoint. Monetary values are remaining cents and never include payment data.
 type BillingInfo struct {
+	PlanCode               string     `json:"plan_code,omitempty"`
+	PlanName               string     `json:"plan_name,omitempty"`
+	Paid                   bool       `json:"paid"`
 	UsagePercent           *float64   `json:"usage_percent,omitempty"`
 	PeriodType             string     `json:"period_type,omitempty"`
 	PeriodEnd              *time.Time `json:"period_end,omitempty"`
@@ -124,23 +130,26 @@ type account struct {
 	agentID   string
 	sessionID string
 
-	mu             sync.RWMutex
-	credential     *credential
-	descriptors    map[string]modelcatalog.ModelDescriptor
-	catalogETag    string
-	catalogUpdated time.Time
-	cooldownUntil  time.Time
-	cooldownCause  string
-	modelCooldowns map[string]cooldownState
-	disabled       bool
-	disableReason  string
-	billing        *BillingInfo
-	deleting       bool
-	refreshOnce    sync.Once
-	refreshLock    chan struct{}
-	generation     atomic.Uint64
-	inflight       atomic.Int64
-	paidTier       atomic.Bool
+	mu                 sync.RWMutex
+	credential         *credential
+	descriptors        map[string]modelcatalog.ModelDescriptor
+	catalogETag        string
+	catalogUpdated     time.Time
+	cooldownUntil      time.Time
+	cooldownCause      string
+	modelCooldowns     map[string]cooldownState
+	disabled           bool
+	disableReason      string
+	billing            *BillingInfo
+	buildRouteMode     BuildRouteMode
+	buildSuperEntitled bool
+	buildAPIFallback   bool
+	deleting           bool
+	refreshOnce        sync.Once
+	refreshLock        chan struct{}
+	generation         atomic.Uint64
+	inflight           atomic.Int64
+	paidTier           atomic.Bool
 }
 
 func (a *account) currentGeneration() uint64 {
@@ -265,6 +274,9 @@ type accountState struct {
 	Disabled              bool                     `json:"disabled,omitempty"`
 	CredentialFingerprint string                   `json:"credential_fingerprint,omitempty"`
 	ModelCooldowns        map[string]cooldownState `json:"model_cooldowns,omitempty"`
+	BuildRouteMode        BuildRouteMode           `json:"build_route_mode,omitempty"`
+	BuildSuperEntitled    bool                     `json:"build_super_entitled,omitempty"`
+	BuildAPIFallback      bool                     `json:"build_api_fallback,omitempty"`
 }
 
 type cooldownState struct {
@@ -308,6 +320,7 @@ type Lease struct {
 	model      string
 	descriptor modelcatalog.ModelDescriptor
 	described  bool
+	routing    BuildRoutingInfo
 	once       sync.Once
 }
 
@@ -317,10 +330,11 @@ func (p *Pool) newLease(a *account, model string) *Lease {
 	generation := a.currentGeneration()
 	descriptor, described := a.descriptors[model]
 	descriptor.ReasoningEfforts = append([]string(nil), descriptor.ReasoningEfforts...)
+	routing := buildRoutingInfoWithBilling(cred, a.billing, a.buildRouteMode, a.buildSuperEntitled, a.buildAPIFallback)
 	a.mu.RUnlock()
 	return &Lease{
 		pool: p, account: a, credential: cred, generation: generation, model: model,
-		descriptor: descriptor, described: described,
+		descriptor: descriptor, described: described, routing: routing,
 	}
 }
 
@@ -330,10 +344,11 @@ func (l *Lease) Session() Session {
 	}
 	return l.credential.session()
 }
-func (l *Lease) AccountID() string  { return l.account.id }
-func (l *Lease) AgentID() string    { return l.account.agentID }
-func (l *Lease) SessionID() string  { return l.account.sessionID }
-func (l *Lease) Generation() uint64 { return l.generation }
+func (l *Lease) AccountID() string              { return l.account.id }
+func (l *Lease) AgentID() string                { return l.account.agentID }
+func (l *Lease) SessionID() string              { return l.account.sessionID }
+func (l *Lease) Generation() uint64             { return l.generation }
+func (l *Lease) BuildRouting() BuildRoutingInfo { return l.routing }
 
 // Descriptor returns the immutable descriptor selected with this lease. A
 // false result means scheduling used only a legacy provisional []string list.
@@ -953,7 +968,7 @@ func credentialInfo(id string, a *account, now time.Time) CredentialInfo {
 func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, time.Time) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	info := CredentialInfo{ID: id, Disabled: a.disabled, Models: []string{}}
+	info := CredentialInfo{ID: id, Disabled: a.disabled, DisabledReason: a.disableReason, Models: []string{}}
 	if a.credential == nil {
 		info.Status = "unavailable"
 		return info, time.Time{}
@@ -984,6 +999,7 @@ func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, tim
 	info.Models = a.modelIDsLocked()
 	info.Scope = a.credential.Scope
 	info.AuthMode = a.credential.AuthMode
+	info.BuildRoutingInfo = buildRoutingInfoWithBilling(a.credential, a.billing, a.buildRouteMode, a.buildSuperEntitled, a.buildAPIFallback)
 	info.CatalogETag = a.catalogETag
 	if !a.catalogUpdated.IsZero() {
 		updated := a.catalogUpdated.UTC()
@@ -1000,7 +1016,7 @@ func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, tim
 	info.HasRefreshToken = a.credential.RefreshToken != ""
 	info.SubscriptionTier = a.credential.Tier.Key
 	info.SubscriptionTierDisplay = a.credential.Tier.Display
-	info.Paid = a.credential.Tier.Paid
+	info.Paid = a.credential.Tier.Paid || a.billing != nil && a.billing.Paid
 	info.Billing = cloneBillingInfo(a.billing)
 	if !a.credential.ExpiresAt.IsZero() {
 		expires := a.credential.ExpiresAt.UTC()
@@ -1009,6 +1025,7 @@ func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, tim
 	if accountCooling {
 		cooldown := a.cooldownUntil.UTC()
 		info.CooldownUntil = &cooldown
+		info.CooldownReason = a.cooldownCause
 	}
 	allModelsCooling := len(info.Models) > 0
 	var earliestModelReady time.Time
@@ -1574,10 +1591,88 @@ func (p *Pool) UpdateBilling(accountID string, info BillingInfo) error {
 		info.UpdatedAt = time.Now().UTC()
 	}
 	a.mu.Lock()
+	wasPaid := a.billing != nil && a.billing.Paid
 	a.billing = cloneBillingInfo(&info)
 	a.mu.Unlock()
 	p.invalidateCredentialSnapshot()
+	if wasPaid != info.Paid {
+		p.requestRebuild()
+	}
 	return nil
+}
+
+// Billing returns an independent snapshot of one account's billing metadata.
+func (p *Pool) Billing(accountID string) (BillingInfo, bool) {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return BillingInfo{}, false
+	}
+	a.mu.RLock()
+	billing := cloneBillingInfo(a.billing)
+	a.mu.RUnlock()
+	if billing == nil {
+		return BillingInfo{}, false
+	}
+	return *billing, true
+}
+func (p *Pool) UpdateBuildRouting(accountID string, update BuildRoutingUpdate) (BuildRoutingInfo, error) {
+	if update.RouteMode != nil {
+		mode, err := ParseBuildRouteMode(string(*update.RouteMode))
+		if err != nil {
+			return BuildRoutingInfo{}, err
+		}
+		update.RouteMode = &mode
+	}
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return BuildRoutingInfo{}, ErrCredentialNotFound
+	}
+	a.mu.Lock()
+	changed := false
+	if update.RouteMode != nil && a.buildRouteMode != *update.RouteMode {
+		a.buildRouteMode = *update.RouteMode
+		changed = true
+	}
+	if update.SuperEntitledOverride != nil && a.buildSuperEntitled != *update.SuperEntitledOverride {
+		a.buildSuperEntitled = *update.SuperEntitledOverride
+		changed = true
+	}
+	if update.APIFallback != nil && a.buildAPIFallback != *update.APIFallback {
+		a.buildAPIFallback = *update.APIFallback
+		changed = true
+	}
+	routing := buildRoutingInfoWithBilling(a.credential, a.billing, a.buildRouteMode, a.buildSuperEntitled, a.buildAPIFallback)
+	mode, entitled, fallback := a.buildRouteMode, a.buildSuperEntitled, a.buildAPIFallback
+	a.mu.Unlock()
+	if !changed {
+		return routing, nil
+	}
+	p.mu.Lock()
+	state := p.states[accountID]
+	state.BuildRouteMode = mode
+	state.BuildSuperEntitled = entitled
+	state.BuildAPIFallback = fallback
+	if state.hasPersistentAccountState(time.Now()) {
+		p.states[accountID] = state
+	} else {
+		delete(p.states, accountID)
+	}
+	p.mu.Unlock()
+	p.invalidateCredentialSnapshot()
+	if err := p.persistState(); err != nil {
+		return BuildRoutingInfo{}, err
+	}
+	return routing, nil
+}
+
+func (p *Pool) MarkBuildAPIFallback(accountID string) bool {
+	fallback := true
+	_, err := p.UpdateBuildRouting(accountID, BuildRoutingUpdate{APIFallback: &fallback})
+	return err == nil
 }
 
 func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Time) error {
@@ -1957,10 +2052,10 @@ func (p *Pool) ClearCooldownReason(accountID, reason string) bool {
 	if state.Reason == reason {
 		state.CooldownUntil = time.Time{}
 		state.Reason = ""
-		if !state.Disabled && len(state.ModelCooldowns) == 0 {
-			delete(p.states, accountID)
-		} else {
+		if state.hasPersistentAccountState(time.Now()) {
 			p.states[accountID] = state
+		} else {
+			delete(p.states, accountID)
 		}
 	}
 	p.mu.Unlock()
@@ -2215,26 +2310,29 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 	a.disableReason = ""
 	now := time.Now()
 	keepCooldown := now.Before(a.cooldownUntil) && a.cooldownCause != "" && a.cooldownCause != "refresh_backoff"
-	hasModelCooldown := false
-	for _, cooldown := range a.modelCooldowns {
-		if now.Before(cooldown.Until) {
-			hasModelCooldown = true
-			break
-		}
-	}
+	cooldownReason := a.cooldownCause
 	if !keepCooldown {
 		a.cooldownUntil = time.Time{}
 		a.cooldownCause = ""
 	}
 	a.mu.Unlock()
 	p.mu.Lock()
-	if !keepCooldown && !hasModelCooldown {
-		delete(p.states, a.id)
-	} else if !keepCooldown {
-		state := p.states[a.id]
+	state := p.states[a.id]
+	stateChanged := state.Disabled || state.CredentialFingerprint != ""
+	state.Disabled = false
+	state.CredentialFingerprint = ""
+	if !keepCooldown {
+		stateChanged = stateChanged || !state.CooldownUntil.IsZero() || state.Reason != ""
 		state.CooldownUntil = time.Time{}
 		state.Reason = ""
+	} else {
+		stateChanged = stateChanged || state.Reason != cooldownReason
+		state.Reason = cooldownReason
+	}
+	if state.hasPersistentAccountState(now) {
 		p.states[a.id] = state
+	} else {
+		delete(p.states, a.id)
 	}
 	if cached, ok := p.files[next.Path]; ok {
 		if info, statErr := os.Stat(next.Path); statErr == nil {
@@ -2254,6 +2352,11 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 		}
 	}
 	p.mu.Unlock()
+	if stateChanged {
+		if err := p.persistState(); err != nil {
+			slog.Error("credential scheduler state persistence failed", "error", err)
+		}
+	}
 	p.requestRebuild()
 	p.notifyCapacity()
 	slog.Info("credential refreshed", "account", a.id)
@@ -2479,10 +2582,10 @@ func (p *Pool) scanUnlocked() (bool, error) {
 					state.CredentialFingerprint = ""
 					state.CooldownUntil = time.Time{}
 					state.Reason = ""
-					if len(state.ModelCooldowns) == 0 {
-						delete(p.states, id)
-					} else {
+					if state.hasPersistentAccountState(time.Now()) {
 						p.states[id] = state
+					} else {
+						delete(p.states, id)
 					}
 				}
 			}
@@ -2495,6 +2598,9 @@ func (p *Pool) scanUnlocked() (bool, error) {
 		}
 		a.generation.Store(1)
 		if state, ok := p.states[id]; ok {
+			a.buildRouteMode = normalizeBuildRouteMode(state.BuildRouteMode)
+			a.buildSuperEntitled = state.BuildSuperEntitled
+			a.buildAPIFallback = state.BuildAPIFallback
 			if state.Disabled {
 				fingerprintChanged := state.CredentialFingerprint != "" && state.CredentialFingerprint != credentialFingerprint(cred)
 				if fingerprintChanged {
@@ -2502,10 +2608,10 @@ func (p *Pool) scanUnlocked() (bool, error) {
 					state.CredentialFingerprint = ""
 					state.CooldownUntil = time.Time{}
 					state.Reason = ""
-					if len(state.ModelCooldowns) == 0 {
-						delete(p.states, id)
-					} else {
+					if state.hasPersistentAccountState(time.Now()) {
 						p.states[id] = state
+					} else {
+						delete(p.states, id)
 					}
 				} else {
 					a.disabled, a.disableReason = true, state.Reason
@@ -2665,7 +2771,8 @@ func (p *Pool) rebuildActive() {
 		available := !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil
 		var models []string
 		if available {
-			a.paidTier.Store(a.credential.Tier.Paid)
+			paid := a.credential.Tier.Paid || a.billing != nil && a.billing.Paid
+			a.paidTier.Store(paid)
 			for _, model := range a.modelIDsLocked() {
 				cooldown, cooling := a.modelCooldowns[model]
 				if !cooling || !now.Before(cooldown.Until) {
@@ -2797,7 +2904,7 @@ func (p *Pool) loadState() error {
 			}
 		}
 		item.ModelCooldowns = activeModels
-		if item.Disabled || now.Before(item.CooldownUntil) || len(item.ModelCooldowns) > 0 {
+		if item.hasPersistentAccountState(now) {
 			p.states[id] = item
 		}
 	}
@@ -2863,7 +2970,10 @@ func (p *Pool) persistState() error {
 			}
 		}
 		item.ModelCooldowns = activeModels
-		if item.Disabled || now.Before(item.CooldownUntil) || len(item.ModelCooldowns) > 0 {
+		if normalizeBuildRouteMode(item.BuildRouteMode) == BuildRouteAuto {
+			item.BuildRouteMode = ""
+		}
+		if item.hasPersistentAccountState(now) {
 			state.Accounts[id] = item
 		}
 	}

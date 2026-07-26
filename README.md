@@ -76,6 +76,22 @@ Chat Completions、Responses 与 Anthropic Messages 三个对外接口都可以�
 
 无法安全映射的字段、内容块、工具状态或协议专属状态会被静默删除，响应中不会包含兼容 warning 或删除清单。仅当保留字段本身类型非法、缺少公共协议必需字段，或清洗后已没有合法最小输入时返回 `400 invalid_request_error`；请求体超过 16 MiB 返回 `413`。如果 `previous_response_id`、加密 reasoning 或 thinking signature 因目标 backend 无法表达而被删除，本次请求会解除对应 hard affinity 并以新会话执行。
 
+### Build 风控与 XAI 推理回退
+
+OIDC/Web 账号默认使用 Build 推理平面。`auto` 模式下，已确认 Super 且 JWT 含数值型 `bot_flag_source=1` 的账号直接使用 XAI；其他已确认 Super 账号仅在当次 Build Responses create/compact 严格返回 403、且错误不是认证失败、`blocked-user` 或 chat endpoint denied 时，使用同一账号和同一请求探测 XAI。探测成功后把 `build_api_fallback` 写入脱敏调度 state 作为观测标记；后续 `auto` 请求仍从 Build 开始。模型目录、billing 与 OAuth 刷新始终保留在 Build 平面。
+
+Super 资格只从明确层级 `SuperGrok`、`X Premium`、`X Premium+`、`SuperGrok Heavy`、`SuperGrok Lite` 或 billing 明确付费信号推断；JWT 层级未知时，首次符合条件的 403 会按需查询 billing 与订阅层级，仍无法确认时不会探测 XAI，可由管理员显式确认。账号路由支持 `auto`、`build`、`xai`：
+
+```http
+PATCH /v1/admin/credentials/{id}
+Authorization: Bearer <GROK_ADMIN_KEY>
+Content-Type: application/json
+
+{"build_route_mode":"auto","build_super_entitled":true,"build_api_fallback":false}
+```
+
+通用 HTTP 402 会将账号冷却至已知 billing 周期结束（未知时使用额度冷却时长）并换号；普通 Build 403 会短暂冷却并换号；`blocked-user` 会禁用账号但保留凭证文件；chat endpoint denied 只隔离对应模型，不再自动删除凭证。
+
 ### Reasoning effort
 
 用户显式提供的 reasoning effort 不会因兼容性而被删除。服务会去除首尾空白并统一为小写：模型明确支持的 `minimal`、`low`、`medium`、`high`、`xhigh` 保持不变；`none`、任意未知字符串、模型未列出的档位，以及模型未声明 reasoning 能力时，一律向上游发送 `low`，即使描述符本身没有列出 `low` 也如此。
@@ -388,7 +404,7 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
   -H "X-Admin-Key: $GROK_ADMIN_KEY"
 ```
 
-上游返回 HTTP `403`，并且错误内容包含区分大小写的关键词 `Access to the chat endpoint is denied` 时，服务会自动删除命中的逻辑凭证并尝试其他账号。关键词之后的说明文字、标点以及 JSON 层级可以不同；非 `403` 或大小写不同不会触发删除。多 scope 文件仍只删除被拒绝的 scope；若文件锁或写盘失败，账号会先被禁用，避免再次调度。
+上游返回 HTTP `403`，并且错误内容包含区分大小写的关键词 `Access to the chat endpoint is denied` 时，服务只隔离当前账号上的对应模型并尝试其他账号，不再自动删除逻辑凭证。关键词之后的说明文字、标点以及 JSON 层级可以不同；非 `403` 或大小写不同不会触发该处理。明确的 `blocked-user` 会禁用账号但保留凭证文件；若状态写盘失败，账号仍会在内存中停止调度并记录错误。
 
 管理接口响应带有 `Cache-Control: no-store`。上传文件限制为 1 MiB，服务会校验 JSON、使用账号身份生成保存路径并以 `0600` 权限原子写入，不会采用客户端提供的文件名。建议优先在服务器本机或 SSH 隧道中管理；如需跨网络访问，必须使用 HTTPS，并在反向代理层限制来源和频率。
 

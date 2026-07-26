@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -385,7 +384,7 @@ func TestRefreshAccountModelsUsesETagAndHandlesNotModified(t *testing.T) {
 	}
 }
 
-func TestRefreshModelsDeletesExactlyDeniedAccount(t *testing.T) {
+func TestRefreshModelsPreservesDeniedAccountAndCoolsIt(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Header.Get("Authorization") {
 		case "Bearer token-a":
@@ -438,8 +437,18 @@ func TestRefreshModelsDeletesExactlyDeniedAccount(t *testing.T) {
 	if available != 1 {
 		t.Fatalf("available accounts=%d, want 1", available)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "account-a.json")); !os.IsNotExist(err) {
-		t.Fatalf("exactly denied credential file still exists or stat failed: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "account-a.json")); err != nil {
+		t.Fatalf("denied credential file was removed: %v", err)
+	}
+	var deniedInfo auth.CredentialInfo
+	for _, info := range pool.Credentials() {
+		if info.CooldownReason == permanentChatDenialReason {
+			deniedInfo = info
+			break
+		}
+	}
+	if deniedInfo.ID == "" || deniedInfo.Status != "cooling_down" {
+		t.Fatalf("denied credential info = %#v", deniedInfo)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "account-b.json")); err != nil {
 		t.Fatalf("unrelated credential file was removed: %v", err)
@@ -461,12 +470,16 @@ func writeModelTestCredential(t *testing.T, dir, name, subject, token string) {
 	}
 }
 
+func billingTestToken(subject string, tier int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload, _ := json.Marshal(map[string]any{"sub": subject, "tier": tier})
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
+
 func writeBillingTestCredential(t *testing.T, dir, name, subject string, tier int64) {
 	t.Helper()
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"tier":` + fmt.Sprint(tier) + `}`))
 	raw := map[string]any{
-		"access_token":  header + "." + payload + ".signature",
+		"access_token":  billingTestToken(subject, tier),
 		"refresh_token": "refresh", "client_id": "client", "sub": subject,
 		"expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
 		"models":  []string{"grok-4.5"}, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
@@ -839,7 +852,7 @@ func TestUnauthorizedRetryRerendersForDifferentAccountDescriptor(t *testing.T) {
 	}
 }
 
-func TestChatDenialKeywordDeletesOnlyMatchingScope(t *testing.T) {
+func TestChatDenialKeywordCoolsOnlyMatchingScope(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -939,8 +952,12 @@ func TestChatDenialKeywordDeletesOnlyMatchingScope(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("upstream calls = %d, want 1", calls.Load())
 	}
-	if _, ok := pool.Credential(deniedID); ok {
-		t.Fatal("denied logical credential remains in the pool")
+	deniedInfo, ok := pool.Credential(deniedID)
+	if !ok {
+		t.Fatal("denied logical credential was removed from the pool")
+	}
+	if cooldown, cooling := deniedInfo.ModelCooldowns["grok-denied"]; !cooling || cooldown.Reason != permanentChatDenialReason {
+		t.Fatalf("denied model cooldown = %#v", deniedInfo.ModelCooldowns)
 	}
 	if _, ok := pool.Credential(keepID); !ok {
 		t.Fatal("sibling logical credential was removed")
@@ -955,11 +972,11 @@ func TestChatDenialKeywordDeletesOnlyMatchingScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	tokens, _ := root["tokens"].(map[string]any)
-	if _, exists := tokens["scope-denied"]; exists {
-		t.Fatalf("denied scope remains on disk: %s", written)
+	if _, exists := tokens["scope-denied"]; !exists {
+		t.Fatalf("denied scope was removed from disk: %s", written)
 	}
-	if _, exists := tokens["scope-keep"]; !exists || len(tokens) != 1 {
-		t.Fatalf("sibling scope was not preserved: %s", written)
+	if _, exists := tokens["scope-keep"]; !exists || len(tokens) != 2 {
+		t.Fatalf("sibling scopes were not preserved: %s", written)
 	}
 }
 
@@ -1137,6 +1154,415 @@ func TestEventStreamIdleTimeout(t *testing.T) {
 	}
 }
 
+func testInferencePlan(t *testing.T) *inference.RequestPlan {
+	t.Helper()
+	plan, err := inference.NewRequestPlan(inference.ProtocolChatCompletions, map[string]any{
+		"model":    "grok-4.5",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, inference.PlanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func newInferenceTestPool(t *testing.T, dir string, client *http.Client) *auth.Pool {
+	t.Helper()
+	pool, err := auth.NewPool(context.Background(), auth.PoolConfig{
+		Dir: dir, Surface: "headless", ReloadInterval: time.Hour, RefreshConcurrency: 2, AccountMaxInflight: 1,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 64,
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pool
+}
+func useResponsesBackend(t *testing.T, pool *auth.Pool) {
+	t.Helper()
+	for _, id := range pool.AccountIDs() {
+		if err := pool.UpdateModelDescriptors(id, []modelcatalog.ModelDescriptor{{
+			ID: "grok-4.5", WireModel: "grok-4.5", Backend: modelcatalog.BackendResponses,
+		}}, "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func newInferenceTestClient(t *testing.T, dir string, pool *auth.Pool, client *http.Client, buildURL, xaiURL string, attempts int) *Client {
+	t.Helper()
+	cfg := config.Config{
+		ChatProxyBaseURL: buildURL, ChatProxyVersion: "v1", XAIAPIBaseURL: xaiURL, AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 2, RetryMaxAttempts: attempts,
+		RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 64, ClientVersion: "test", ClientMode: "headless",
+		ClientIdentifier: "grok-shell", ClientSurface: "headless", ClientName: "grok", TokenAuth: "xai-grok-cli",
+	}
+	clientUnderTest, err := NewClient(cfg, pool, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return clientUnderTest
+}
+
+func TestBuild403FallsBackToXAIAndPersistsMarker(t *testing.T) {
+	var buildCalls, xaiCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buildCalls.Add(1)
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
+			"status_code": float64(http.StatusForbidden), "code": "permission-denied", "error": "permission denied",
+		})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls.Add(1)
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("xai path = %q", r.URL.Path)
+		}
+		writeJSONResponse(t, w, http.StatusOK, map[string]any{"id": "chatcmpl-fallback", "choices": []any{}})
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	useResponsesBackend(t, pool)
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	result, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Payload["id"] != "chatcmpl-fallback" || buildCalls.Load() != 1 || xaiCalls.Load() != 1 {
+		t.Fatalf("result=%#v build=%d xai=%d", result.Payload, buildCalls.Load(), xaiCalls.Load())
+	}
+	info, ok := pool.Credential(result.AccountID)
+	if !ok || !info.APIFallback || info.EffectiveInferenceRoute != auth.InferencePlaneBuild {
+		t.Fatalf("routing info = %#v, %v", info.BuildRoutingInfo, ok)
+	}
+	if _, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if buildCalls.Load() != 2 || xaiCalls.Load() != 2 {
+		t.Fatalf("observed fallback marker build=%d xai=%d", buildCalls.Load(), xaiCalls.Load())
+	}
+	client.Close()
+	pool.Close()
+
+	reloaded := newInferenceTestPool(t, dir, build.Client())
+	defer reloaded.Close()
+	reloadedInfo, ok := reloaded.Credential(result.AccountID)
+	if !ok || !reloadedInfo.APIFallback || reloadedInfo.EffectiveInferenceRoute != auth.InferencePlaneBuild {
+		t.Fatalf("reloaded routing info = %#v, %v", reloadedInfo.BuildRoutingInfo, ok)
+	}
+}
+
+func TestUnknownBuild403ProbesSubscriptionBeforeXAI(t *testing.T) {
+	var buildCalls, billingCalls, userCalls, xaiCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/billing":
+			billingCalls.Add(1)
+			writeJSONResponse(t, w, http.StatusOK, map[string]any{"config": map[string]any{"currentPeriod": map[string]any{"end": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}}})
+		case "/v1/user":
+			userCalls.Add(1)
+			writeJSONResponse(t, w, http.StatusOK, map[string]any{"subscriptionTier": "SuperGrok"})
+		case "/v1/responses":
+			buildCalls.Add(1)
+			writeJSONResponse(t, w, http.StatusForbidden, map[string]any{"code": "permission-denied", "error": "permission denied"})
+		default:
+			t.Fatalf("unexpected Build path %q", r.URL.Path)
+		}
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls.Add(1)
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("xai path = %q", r.URL.Path)
+		}
+		writeJSONResponse(t, w, http.StatusOK, map[string]any{"id": "chatcmpl-unknown-fallback", "choices": []any{}})
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "unknown.json", "unknown-subject", 99)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	defer client.Close()
+	result, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Payload["id"] != "chatcmpl-unknown-fallback" || buildCalls.Load() != 1 || billingCalls.Load() != 1 || userCalls.Load() != 1 || xaiCalls.Load() != 1 {
+		t.Fatalf("result=%#v build=%d billing=%d user=%d xai=%d", result.Payload, buildCalls.Load(), billingCalls.Load(), userCalls.Load(), xaiCalls.Load())
+	}
+	info, ok := pool.Credential(result.AccountID)
+	if !ok || !info.SuperEntitled || info.Billing == nil || info.Billing.PlanName != "SuperGrok" {
+		t.Fatalf("unknown entitlement info = %#v, %v", info, ok)
+	}
+	if info.EffectiveInferenceRoute != auth.InferencePlaneBuild {
+		t.Fatalf("fallback marker changed future route: %#v", info.BuildRoutingInfo)
+	}
+}
+
+func TestRejectedXAIFallbackAppliesAccountLifecycle(t *testing.T) {
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
+			"status_code": float64(http.StatusForbidden), "code": "permission-denied", "error": "permission denied",
+		})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+			"status_code": float64(http.StatusPaymentRequired), "code": "quota-exhausted", "error": "payment required",
+		})
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "fallback-402-subject", 4)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	defer client.Close()
+	_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Fatalf("error = %v, want original Build 403", err)
+	}
+	info, ok := pool.Credential(pool.AccountIDs()[0])
+	if !ok || info.CooldownReason != paymentRequiredReason || info.CooldownUntil == nil {
+		t.Fatalf("credential lifecycle = %#v, %v", info, ok)
+	}
+}
+
+func TestStreamingBuild403FallsBackToXAI(t *testing.T) {
+	var buildCalls, xaiCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buildCalls.Add(1)
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
+			"status_code": float64(http.StatusForbidden), "code": "permission-denied", "error": "permission denied",
+		})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "stream-subject", 4)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	defer client.Close()
+	stream, err := client.OpenInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	event, ok, err := stream.Next()
+	if err != nil || !ok || !strings.Contains(string(event.Data), "response.completed") {
+		t.Fatalf("event=%#v ok=%v err=%v", event, ok, err)
+	}
+	if buildCalls.Load() != 1 || xaiCalls.Load() != 1 {
+		t.Fatalf("stream fallback build=%d xai=%d", buildCalls.Load(), xaiCalls.Load())
+	}
+}
+func TestChatEndpointDenialDoesNotProbeXAI(t *testing.T) {
+	var xaiCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
+			"status_code": float64(http.StatusForbidden), "error": permanentChatDenialKeyword,
+		})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		xaiCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	defer client.Close()
+	if _, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{}); err == nil {
+		t.Fatal("chat endpoint denial unexpectedly succeeded")
+	}
+	if xaiCalls.Load() != 0 {
+		t.Fatalf("chat endpoint denial probed XAI %d times", xaiCalls.Load())
+	}
+	info := pool.Credentials()[0]
+	if info.Status != "cooling_down" || info.ModelCooldowns["grok-4.5"].Reason != permanentChatDenialReason {
+		t.Fatalf("chat endpoint denial info = %#v", info)
+	}
+}
+func TestForcedXAIUsesBuildForUnsupportedBackend(t *testing.T) {
+	var buildCalls, xaiCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		buildCalls.Add(1)
+		writeJSONResponse(t, w, http.StatusOK, map[string]any{"id": "chatcmpl-build", "choices": []any{}})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		xaiCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	defer pool.Close()
+	id := pool.AccountIDs()[0]
+	mode := auth.BuildRouteXAI
+	if _, err := pool.UpdateBuildRouting(id, auth.BuildRoutingUpdate{RouteMode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	defer client.Close()
+	if _, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if buildCalls.Load() != 1 || xaiCalls.Load() != 0 {
+		t.Fatalf("unsupported backend build=%d xai=%d", buildCalls.Load(), xaiCalls.Load())
+	}
+}
+
+func TestPaymentRequiredCoolsAccountUntilBillingResetAndRetries(t *testing.T) {
+	paidToken := billingTestToken("paid-subject", 4)
+	var calls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") == "Bearer "+paidToken {
+			w.Header().Set("X-Should-Retry", "false")
+			writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{"error": "payment required"})
+			return
+		}
+		writeJSONResponse(t, w, http.StatusOK, map[string]any{"id": "chatcmpl-second", "choices": []any{}})
+	}))
+	defer build.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	writeBillingTestCredential(t, dir, "basic.json", "basic-subject", 2)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	defer pool.Close()
+	var paidID string
+	for _, info := range pool.Credentials() {
+		if info.SubscriptionTier == "x_premium_plus" {
+			paidID = info.ID
+			break
+		}
+	}
+	periodEnd := time.Now().Add(2 * time.Hour).UTC()
+	if paidID == "" {
+		t.Fatal("paid account not found")
+	}
+	if err := pool.UpdateBilling(paidID, auth.BillingInfo{PeriodEnd: &periodEnd, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, build.URL, 2)
+	defer client.Close()
+	result, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AccountID == paidID || calls.Load() != 2 {
+		t.Fatalf("result account=%q paid=%q calls=%d", result.AccountID, paidID, calls.Load())
+	}
+	info, ok := pool.Credential(paidID)
+	if !ok || info.Status != "cooling_down" || info.CooldownReason != paymentRequiredReason || info.CooldownUntil == nil {
+		t.Fatalf("payment-required info = %#v, %v", info, ok)
+	}
+	if delta := info.CooldownUntil.Sub(periodEnd); delta < -time.Second || delta > time.Second {
+		t.Fatalf("cooldown until=%s period end=%s", info.CooldownUntil, periodEnd)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "paid.json")); err != nil {
+		t.Fatalf("payment-required credential removed: %v", err)
+	}
+}
+
+func TestBuildPermissionDeniedCoolsAndRetriesWithoutFallbackWhenForcedBuild(t *testing.T) {
+	paidToken := billingTestToken("paid-subject", 4)
+	var buildCalls, xaiCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buildCalls.Add(1)
+		if r.Header.Get("Authorization") == "Bearer "+paidToken {
+			w.Header().Set("X-Should-Retry", "false")
+			writeJSONResponse(t, w, http.StatusForbidden, map[string]any{"code": "permission-denied", "error": "permission denied"})
+			return
+		}
+		writeJSONResponse(t, w, http.StatusOK, map[string]any{"id": "chatcmpl-second", "choices": []any{}})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "paid.json", "paid-subject", 4)
+	writeBillingTestCredential(t, dir, "basic.json", "basic-subject", 2)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	defer pool.Close()
+	var paidID string
+	for _, info := range pool.Credentials() {
+		if info.SubscriptionTier == "x_premium_plus" {
+			paidID = info.ID
+		}
+	}
+	mode := auth.BuildRouteBuild
+	if _, err := pool.UpdateBuildRouting(paidID, auth.BuildRoutingUpdate{RouteMode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 2)
+	defer client.Close()
+	result, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AccountID == paidID || buildCalls.Load() != 2 || xaiCalls.Load() != 0 {
+		t.Fatalf("result account=%q build=%d xai=%d", result.AccountID, buildCalls.Load(), xaiCalls.Load())
+	}
+	info, _ := pool.Credential(paidID)
+	if info.Status != "cooling_down" || info.CooldownReason != buildPermissionDeniedReason {
+		t.Fatalf("permission-denied info = %#v", info)
+	}
+}
+
+func TestBlockedUserDisablesButPreservesCredential(t *testing.T) {
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{"code": "blocked-user", "error": "blocked user"})
+	}))
+	defer build.Close()
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "blocked.json", "blocked-subject", 2)
+	pool := newInferenceTestPool(t, dir, build.Client())
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, build.URL, 1)
+	defer client.Close()
+	if _, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{}); err == nil {
+		t.Fatal("blocked account unexpectedly succeeded")
+	}
+	info := pool.Credentials()[0]
+	if !info.Disabled || info.Status != "disabled" {
+		t.Fatalf("blocked credential info = %#v", info)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "blocked.json")); err != nil {
+		t.Fatalf("blocked credential removed: %v", err)
+	}
+}
+
 func TestParseRetryHintsAndRetryableStatuses(t *testing.T) {
 	resp := &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{
 		"Retry-After":    []string{"7"},
@@ -1147,15 +1573,15 @@ func TestParseRetryHintsAndRetryableStatuses(t *testing.T) {
 		t.Fatalf("retry hints = after %s should-retry %v", apiErr.RetryAfter, apiErr.ShouldRetry)
 	}
 	client := &Client{}
-	if client.handleRetryable("", "", apiErr) {
+	if client.handleRetryable("", "", apiErr, auth.InferencePlaneBuild) {
 		t.Fatal("x-should-retry:false must suppress a 500 retry")
 	}
 	for _, status := range []int{500, 502, 503, 504, 520} {
-		if !client.handleRetryable("", "", &APIError{Status: status}) {
+		if !client.handleRetryable("", "", &APIError{Status: status}, auth.InferencePlaneBuild) {
 			t.Errorf("status %d should be retryable", status)
 		}
 	}
-	if client.handleRetryable("", "", &APIError{Status: http.StatusBadRequest, ShouldRetry: boolPointer(true)}) {
+	if client.handleRetryable("", "", &APIError{Status: http.StatusBadRequest, ShouldRetry: boolPointer(true)}, auth.InferencePlaneBuild) {
 		t.Fatal("x-should-retry:true must not force retry of a non-retryable status")
 	}
 }

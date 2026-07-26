@@ -243,7 +243,7 @@ func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	}
 }
 
-func TestChatDenialKeywordDeletesAccountAndRetries(t *testing.T) {
+func TestChatDenialKeywordCoolsAccountAndRetries(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string
 	deniedToken := ""
@@ -285,7 +285,7 @@ func TestChatDenialKeywordDeletesAccountAndRetries(t *testing.T) {
 	}
 }
 
-func TestChatDenialKeywordDeletesAccountAndRetriesStream(t *testing.T) {
+func TestChatDenialKeywordCoolsAccountAndRetriesStream(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string
 	deniedToken := ""
@@ -321,7 +321,7 @@ func TestChatDenialKeywordDeletesAccountAndRetriesStream(t *testing.T) {
 	}
 }
 
-func TestChatDenialKeywordDeletesOnlyAccount(t *testing.T) {
+func TestChatDenialKeywordCoolsOnlyAccount(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -339,11 +339,11 @@ func TestChatDenialKeywordDeletesOnlyAccount(t *testing.T) {
 	if status := request(); status != http.StatusForbidden {
 		t.Fatalf("first status=%d, want 403", status)
 	}
-	if status := request(); status != http.StatusServiceUnavailable {
-		t.Fatalf("second status=%d, want 503", status)
+	if status := request(); status != http.StatusTooManyRequests {
+		t.Fatalf("second status=%d, want 429", status)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("deleted account called upstream %d times, want 1", got)
+		t.Fatalf("cooled account called upstream %d times, want 1", got)
 	}
 }
 

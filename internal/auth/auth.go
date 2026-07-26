@@ -100,6 +100,7 @@ type credential struct {
 	Models          []string
 	ModelsUpdatedAt time.Time
 	Tier            subscriptionTier
+	BotFlagged      bool
 }
 
 func loadCredential(path, surface string) (*credential, error) {
@@ -241,7 +242,8 @@ func parseCredentialNode(raw map[string]any, candidate credentialCandidate, path
 		Surface:    defaultSurface(surface),
 		ExpiresAt:  expiresAt, ExpiresIn: expiresIn,
 		Models: stringSlice(node["models"]), ModelsUpdatedAt: firstTime(node, "models_updated_at"),
-		Tier: subscriptionTierFromClaims(accessClaims),
+		Tier:       subscriptionTierFromClaims(accessClaims),
+		BotFlagged: number(accessClaims["bot_flag_source"]) == 1 || number(idClaims["bot_flag_source"]) == 1,
 	}, nil
 }
 

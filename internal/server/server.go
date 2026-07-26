@@ -141,6 +141,7 @@ func (s *Server) routes() {
 		s.mux.Handle("GET /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("POST /v1/admin/credentials", s.adminKeyGate(http.HandlerFunc(s.adminCredentials)))
 		s.mux.Handle("DELETE /v1/admin/credentials/{id}", s.adminKeyGate(http.HandlerFunc(s.adminCredential)))
+		s.mux.Handle("PATCH /v1/admin/credentials/{id}", s.adminKeyGate(http.HandlerFunc(s.adminCredentialRouting)))
 		s.mux.Handle("GET /v1/admin/models/summary", s.adminKeyGate(http.HandlerFunc(s.adminModelsSummary)))
 		s.mux.Handle("GET /v1/admin/audits", s.adminKeyGate(http.HandlerFunc(s.adminAudits)))
 		s.mux.Handle("GET /v1/admin/audits/health", s.adminKeyGate(http.HandlerFunc(s.adminAuditHealth)))

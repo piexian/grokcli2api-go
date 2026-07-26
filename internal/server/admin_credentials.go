@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -15,6 +16,8 @@ import (
 )
 
 const maxAdminCredentialsPageSize = 1000
+
+const maxAdminCredentialUpdateSize = 4 << 10
 
 type credentialSort string
 
@@ -548,6 +551,66 @@ func decodeCredentialSortKey(sortField credentialSort, raw string) (credentialSo
 		return credentialSortValue{}, errors.New("invalid credential sort key")
 	}
 	return credentialSortValue{Number: number}, nil
+}
+
+type adminCredentialRoutingRequest struct {
+	BuildRouteMode     *string `json:"build_route_mode"`
+	BuildSuperEntitled *bool   `json:"build_super_entitled"`
+	BuildAPIFallback   *bool   `json:"build_api_fallback"`
+}
+
+func (s *Server) adminCredentialRouting(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if !validCredentialID(id) {
+		writeError(w, http.StatusNotFound, "credential not found", "invalid_request_error", "credential_not_found")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAdminCredentialUpdateSize)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request adminCredentialRoutingRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid credential routing body", "invalid_request_error", "invalid_credential_routing")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "credential routing body must contain one JSON object", "invalid_request_error", "invalid_credential_routing")
+		return
+	}
+	if request.BuildRouteMode == nil && request.BuildSuperEntitled == nil && request.BuildAPIFallback == nil {
+		writeError(w, http.StatusBadRequest, "credential routing body has no updates", "invalid_request_error", "empty_credential_routing")
+		return
+	}
+	if request.BuildAPIFallback != nil && *request.BuildAPIFallback {
+		writeError(w, http.StatusBadRequest, "build_api_fallback is observational and may only be cleared", "invalid_request_error", "invalid_build_api_fallback")
+		return
+	}
+	update := auth.BuildRoutingUpdate{
+		SuperEntitledOverride: request.BuildSuperEntitled,
+		APIFallback:           request.BuildAPIFallback,
+	}
+	if request.BuildRouteMode != nil {
+		mode, err := auth.ParseBuildRouteMode(*request.BuildRouteMode)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "build_route_mode must be auto, build, or xai", "invalid_request_error", "invalid_build_route_mode")
+			return
+		}
+		update.RouteMode = &mode
+	}
+	if _, err := s.pool.UpdateBuildRouting(id, update); err != nil {
+		if errors.Is(err, auth.ErrCredentialNotFound) {
+			writeError(w, http.StatusNotFound, "credential not found", "invalid_request_error", "credential_not_found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "credential routing could not be updated", "server_error", "credential_routing_update_failed")
+		return
+	}
+	credential, ok := s.pool.Credential(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "credential not found", "invalid_request_error", "credential_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "credential", "credential": credential})
 }
 
 func newAdminCredentialListResponse(page credentialListPage, paginated bool) adminCredentialListResponse {
