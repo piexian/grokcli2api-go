@@ -518,6 +518,23 @@ func buildTierNeedsSubscriptionProbe(tier string) bool {
 	}
 }
 
+func billingEntitlementKnown(info *auth.BillingInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.Paid {
+		return true
+	}
+	for _, value := range []string{info.PlanCode, info.PlanName} {
+		normalized := strings.NewReplacer(" ", "", "_", "", "-", "").Replace(strings.ToLower(strings.TrimSpace(value)))
+		switch normalized {
+		case "free", "basic", "xbasic":
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) fetchAccountSubscription(ctx context.Context, lease *auth.Lease) (string, string, error) {
 	resp, _, err := c.do(ctx, lease, http.MethodGet, "user?include=subscription", nil, NewID(), "", false, false)
 	if err != nil {
@@ -588,7 +605,7 @@ func (c *Client) routingAfterEntitlementProbe(ctx context.Context, lease *auth.L
 	if interval <= 0 {
 		interval = defaultBillingRefreshInterval
 	}
-	if info.Billing != nil && !info.Billing.UpdatedAt.IsZero() && time.Since(info.Billing.UpdatedAt) < interval {
+	if info.Billing != nil && !info.Billing.UpdatedAt.IsZero() && time.Since(info.Billing.UpdatedAt) < interval && billingEntitlementKnown(info.Billing) {
 		return routing
 	}
 	_ = c.probeBuildEntitlement(ctx, lease.AccountID(), lease)
