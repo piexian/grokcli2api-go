@@ -370,8 +370,30 @@ func TestRefreshAccountModelsUsesETagAndHandlesNotModified(t *testing.T) {
 	}
 	defer client.Close()
 	accountID := pool.AccountIDs()[0]
-	if err := client.RefreshAccountModels(context.Background(), accountID); err != nil {
+	statePath := filepath.Join(dir, ".grokcli2api-state.json")
+	before, err := os.ReadFile(statePath)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if err := client.refreshAccountModelsPath(context.Background(), accountID, "models", false); err != nil {
+		t.Fatal(err)
+	}
+	deferred, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, deferred) {
+		t.Fatal("background account model refresh bypassed the state checkpoint batch")
+	}
+	if err := pool.FlushState(); err != nil {
+		t.Fatal(err)
+	}
+	flushed, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, flushed) {
+		t.Fatal("explicit model state flush did not persist the refreshed catalog")
 	}
 	if err := client.RefreshAccountModels(context.Background(), accountID); err != nil {
 		t.Fatal(err)

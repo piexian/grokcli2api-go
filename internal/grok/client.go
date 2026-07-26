@@ -289,15 +289,15 @@ func (c *Client) StartModelRefresh() {
 // catalog. Credential writes are serialized by the pool; avoiding the batch
 // refresh mutex here keeps the caller's context deadline authoritative.
 func (c *Client) RefreshAccountModels(ctx context.Context, accountID string) error {
-	return c.refreshAccountModelsPath(ctx, accountID, "models")
+	return c.refreshAccountModelsPath(ctx, accountID, "models", true)
 }
 
 // RefreshAccountModelsV2 mirrors the CLI session-resume metadata refresh.
 func (c *Client) RefreshAccountModelsV2(ctx context.Context, accountID string) error {
-	return c.refreshAccountModelsPath(ctx, accountID, "models-v2")
+	return c.refreshAccountModelsPath(ctx, accountID, "models-v2", true)
 }
 
-func (c *Client) refreshAccountModelsPath(ctx context.Context, accountID, path string) error {
+func (c *Client) refreshAccountModelsPath(ctx context.Context, accountID, path string, flush bool) error {
 	result, err := c.fetchAccountModelsPath(ctx, accountID, false, path)
 	if err == nil {
 		now := time.Now()
@@ -307,7 +307,7 @@ func (c *Client) refreshAccountModelsPath(ctx context.Context, accountID, path s
 			err = c.pool.UpdateModelDescriptors(accountID, result.Descriptors, result.ETag, now)
 		}
 	}
-	if err == nil {
+	if err == nil && flush {
 		err = c.pool.FlushState()
 	}
 	c.pool.RebuildSchedulingSnapshot()
@@ -892,7 +892,7 @@ func (c *Client) modelRefreshLoop() {
 			cancel()
 		case accountID := <-c.modelRefreshCh:
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			if err := c.RefreshAccountModels(ctx, accountID); err != nil {
+			if err := c.refreshAccountModelsPath(ctx, accountID, "models", false); err != nil {
 				slog.Warn("account model refresh after ETag change failed", "error", err)
 			}
 			cancel()
