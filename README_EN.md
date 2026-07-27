@@ -90,7 +90,7 @@ Content-Type: application/json
 {"build_route_mode":"auto","build_super_entitled":true,"build_api_fallback":false}
 ```
 
-A generic HTTP 402 cools the account until the known billing period ends, or for the configured quota cooldown when no period is known, then retries another account. A generic Build 403 applies a short cooldown and switches accounts. `blocked-user` disables the account but retains its credential file. Chat endpoint denial isolates only the affected model and never deletes the credential automatically.
+A generic HTTP 402 no longer consumes the general account-switch budget. One request validates at most `GROK_QUOTA_RETRY_MAX_ACCOUNTS` distinct accounts (default 3). Each account uses the response `Retry-After` first. The request path queries a billing period only for an account with explicit paid-subscription evidence; unsubscribed accounts and accounts with a missing or unknown tier do not trigger that query and use `GROK_QUOTA_COOLDOWN` when `Retry-After` is absent. Exhausting the quota budget, or finding no other usable account, returns a local 429 with the earliest cooldown. A generic Build 403 applies a short cooldown and switches accounts. `blocked-user` disables the account but retains its credential file. Chat endpoint denial isolates only the affected model and never deletes the credential automatically.
 
 ### Reasoning effort
 
@@ -418,14 +418,15 @@ Administrator responses include `Cache-Control: no-store`. Uploads are limited t
 | `GROK_ACCOUNT_MAX_INFLIGHT` | `16` | Maximum upstream requests in flight per account; excess requests wait for capacity |
 | `GROK_MODELS_REFRESH_INTERVAL` | `6h` | Per-account model-catalog refresh interval |
 | `GROK_BILLING_REFRESH_INTERVAL` | `5m` | Credits refresh interval for higher tiers with official usage support |
-| `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum number of distinct accounts tried per request |
+| `GROK_RETRY_MAX_ATTEMPTS` | `3` | Maximum distinct accounts tried for general network, 5xx, and authentication failures |
+| `GROK_QUOTA_RETRY_MAX_ACCOUNTS` | `3` | Maximum distinct accounts validated after HTTP 402 in one request; independently bounded to prevent a quota outage from sweeping the pool |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | Base delay for retryable network and upstream 5xx failures |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | Cooldown when an upstream 429 omits `Retry-After` |
 | `GROK_QUOTA_COOLDOWN` | `24h` | Default cooldown after quota exhaustion |
 | `GROK_AFFINITY_TTL` | `1h` | Lifetime of hard and soft affinity; hard bindings may persist, while soft bindings remain in memory |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | Maximum number of affinity-cache entries |
 
-Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account. Higher tiers on which the official client exposes usage also poll `billing?format=credits`; Free and X Basic are not proactively polled. Proactive cooldown occurs only when included usage reaches 100% and neither on-demand nor prepaid credit remains; the cooldown lasts until the server-provided period end. A recovered balance clears only the `billing_exhausted` cooldown created by this probe, never a 429, authentication, model-level, or other upstream cooldown. The redacted snapshot is kept in memory and exposed through the administrator credential status `billing` field; it is not written to OAuth files.
+Free-model quota cooldowns are isolated by account and model. An exhausted spending limit cools down the entire account, and an HTTP 402 response `Retry-After` always takes precedence. The request path queries `billing?format=credits` before releasing the current account lease only when a JWT tier or cached billing information explicitly identifies a paid subscription, so `GROK_ACCOUNT_MAX_INFLIGHT=1` cannot deadlock on a second lease for that account. Free, X Basic, and missing or unknown tiers never query a billing period because of a 402; they use `GROK_QUOTA_COOLDOWN` when `Retry-After` is absent. Higher tiers on which the official client exposes usage continue to poll credits proactively. Proactive cooldown occurs only when included usage reaches 100% and neither on-demand nor prepaid credit remains; the cooldown lasts until the server-provided period end. A recovered balance clears only the `billing_exhausted` cooldown created by this probe, never a 429, authentication, model-level, or other upstream cooldown. The redacted snapshot is kept in memory and exposed through the administrator credential status `billing` field; it is not written to OAuth files.
 
 Scheduling distinguishes known paid tiers from free or unknown tiers; it does not assume that larger numeric tier claims represent higher plans.
 

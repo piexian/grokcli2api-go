@@ -90,7 +90,7 @@ Content-Type: application/json
 {"build_route_mode":"auto","build_super_entitled":true,"build_api_fallback":false}
 ```
 
-通用 HTTP 402 会将账号冷却至已知 billing 周期结束（未知时使用额度冷却时长）并换号；普通 Build 403 会短暂冷却并换号；`blocked-user` 会禁用账号但保留凭证文件；chat endpoint denied 只隔离对应模型，不再自动删除凭证。
+通用 HTTP 402 不再复用普通跨账号重试预算：单个请求最多验证 `GROK_QUOTA_RETRY_MAX_ACCOUNTS` 个不同账号（默认 3）。每个账号优先按响应 `Retry-After` 冷却；只有已有明确付费订阅证据的账号才查询 billing 周期，无订阅或 tier 缺失/未知的账号不会查询 billing，缺少 `Retry-After` 时直接使用 `GROK_QUOTA_COOLDOWN`。预算耗尽或没有其他可用账号时立即返回本地 429 与最早冷却时间。普通 Build 403 会短暂冷却并换号；`blocked-user` 会禁用账号但保留凭证文件；chat endpoint denied 只隔离对应模型，不再自动删除凭证。
 
 ### Reasoning effort
 
@@ -418,14 +418,15 @@ curl -X DELETE http://localhost:8088/v1/admin/credentials/<credential-id> \
 | `GROK_ACCOUNT_MAX_INFLIGHT` | `16` | 每账号最大上游在途请求数，超出后等待可用容量 |
 | `GROK_MODELS_REFRESH_INTERVAL` | `6h` | 每个账号模型目录的刷新周期 |
 | `GROK_BILLING_REFRESH_INTERVAL` | `5m` | 官方支持 usage 的高层级账号 credits 刷新周期 |
-| `GROK_RETRY_MAX_ATTEMPTS` | `3` | 单个请求最多尝试的不同账号数 |
+| `GROK_RETRY_MAX_ATTEMPTS` | `3` | 网络、5xx、鉴权等通用错误下，单个请求最多尝试的不同账号数 |
+| `GROK_QUOTA_RETRY_MAX_ACCOUNTS` | `3` | HTTP 402 下单个请求最多验证的不同账号数；独立限制可防止额度故障横扫账号池 |
 | `GROK_RETRY_BASE_DELAY` | `200ms` | 可重试网络错误与上游 5xx 错误的基础退避时间 |
 | `GROK_RATE_LIMIT_COOLDOWN` | `1m` | 上游 429 未提供 `Retry-After` 时的冷却时间 |
 | `GROK_QUOTA_COOLDOWN` | `24h` | 额度耗尽后的默认冷却时间 |
 | `GROK_AFFINITY_TTL` | `1h` | hard/soft affinity 的有效期；hard binding 可持久化，soft binding 仅在内存中 |
 | `GROK_AFFINITY_MAX_ENTRIES` | `100000` | 会话亲和缓存的容量上限 |
 
-免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。官方开放 usage 的高层级账号还会读取 `billing?format=credits`（Free 与 X Basic 不主动轮询）：只有 included usage 达到 100%，且没有剩余 on-demand 或 prepaid 额度时，才主动冷却到服务端返回的周期结束时间。余额恢复只会清理由此探测设置的 `billing_exhausted` 冷却，不会覆盖 429、鉴权、模型级或其他上游冷却。用量快照仅保存在内存并通过管理员凭证状态的 `billing` 字段展示，不写回 OAuth 文件。
+免费模型额度按账号与模型隔离；账号支出额度耗尽时，整个账号会进入冷却。HTTP 402 的响应头 `Retry-After` 始终优先。只有 JWT tier 或已有 billing 信息明确表明付费订阅时，请求路径才会在释放当前账号 lease 前查询 `billing?format=credits`，因此即使 `GROK_ACCOUNT_MAX_INFLIGHT=1` 也不会为同一账号申请第二个 lease。Free、X Basic 以及 tier 缺失/未知的账号不会因为 402 查询 billing period；没有 `Retry-After` 时采用 `GROK_QUOTA_COOLDOWN`。官方开放 usage 的高层级账号仍按周期主动刷新 credits（Free 与 X Basic 不主动轮询）：只有 included usage 达到 100%，且没有剩余 on-demand 或 prepaid 额度时，才主动冷却到服务端返回的周期结束时间。余额恢复只会清理由此探测设置的 `billing_exhausted` 冷却，不会覆盖 429、鉴权、模型级或其他上游冷却。用量快照仅保存在内存并通过管理员凭证状态的 `billing` 字段展示，不写回 OAuth 文件。
 
 调度优先级只区分已知付费层级与 free/未知层级，不假定数字越大套餐越高。
 

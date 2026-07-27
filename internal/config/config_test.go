@@ -37,6 +37,34 @@ func TestLoadBillingRefreshInterval(t *testing.T) {
 	}
 }
 
+func TestLoadQuotaRetryMaxAccounts(t *testing.T) {
+	t.Setenv("GROK_QUOTA_RETRY_MAX_ACCOUNTS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuotaRetryMaxAccounts != 3 {
+		t.Fatalf("QuotaRetryMaxAccounts default = %d", cfg.QuotaRetryMaxAccounts)
+	}
+
+	t.Setenv("GROK_QUOTA_RETRY_MAX_ACCOUNTS", "5")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuotaRetryMaxAccounts != 5 {
+		t.Fatalf("QuotaRetryMaxAccounts override = %d", cfg.QuotaRetryMaxAccounts)
+	}
+}
+
+func TestLoadRejectsInvalidQuotaRetryMaxAccounts(t *testing.T) {
+	t.Setenv("GROK_QUOTA_RETRY_MAX_ACCOUNTS", "0")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "GROK_QUOTA_RETRY_MAX_ACCOUNTS") {
+		t.Fatalf("Load() error = %v, want quota retry validation error", err)
+	}
+}
+
 func TestLoadModernClientTransportConfig(t *testing.T) {
 	t.Setenv("GROK_CLIENT_VERSION", "0.2.102")
 	t.Setenv("GROK_CLIENT_MODE", "HEADLESS")

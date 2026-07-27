@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1327,6 +1328,303 @@ func TestUnknownBuild403ProbesSubscriptionBeforeXAI(t *testing.T) {
 	}
 }
 
+func TestPaymentRequiredQuotaBudgetUsesBillingReset(t *testing.T) {
+	for _, mode := range []string{"inference-json", "inference-stream", "legacy-json", "legacy-stream"} {
+		t.Run(mode, func(t *testing.T) {
+			periodEnd := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+			var inferenceCalls, billingCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/billing") {
+					billingCalls.Add(1)
+					writeJSONResponse(t, w, http.StatusOK, map[string]any{"config": map[string]any{
+						"monthlyLimit": map[string]any{"val": 0}, "used": map[string]any{"val": 0},
+						"billingPeriodEnd": periodEnd.Format(time.RFC3339Nano),
+					}})
+					return
+				}
+				inferenceCalls.Add(1)
+				writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+					"status_code": float64(http.StatusPaymentRequired), "code": quotaErrorCode, "error": "payment required",
+				})
+			}))
+			defer upstream.Close()
+
+			dir := t.TempDir()
+			for i := 0; i < 5; i++ {
+				writeBillingTestCredential(t, dir, fmt.Sprintf("account-%d.json", i), fmt.Sprintf("quota-subject-%d", i), 4)
+			}
+			pool := newInferenceTestPool(t, dir, upstream.Client())
+			useResponsesBackend(t, pool)
+			defer pool.Close()
+			client := newInferenceTestClient(t, dir, pool, upstream.Client(), upstream.URL, upstream.URL, 1)
+			client.cfg.QuotaRetryMaxAccounts = 3
+			defer client.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			var err error
+			switch mode {
+			case "inference-json":
+				_, err = client.DoInference(ctx, testInferencePlan(t), InferenceOptions{})
+			case "inference-stream":
+				_, err = client.OpenInference(ctx, testInferencePlan(t), InferenceOptions{})
+			case "legacy-json":
+				_, err = client.DoJSON(ctx, http.MethodPost, "responses", map[string]any{"model": "grok-4.5"}, auth.Affinity{}, "", "grok-4.5", true)
+			case "legacy-stream":
+				_, err = client.OpenStream(ctx, "responses", map[string]any{"model": "grok-4.5"}, auth.Affinity{}, "", "grok-4.5", true)
+			default:
+				t.Fatalf("unknown mode %q", mode)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.UpstreamCode != quotaRetryExhaustedCode {
+				t.Fatalf("error = %#v, want local quota 429", err)
+			}
+			wantRetryAfter := time.Until(periodEnd)
+			if delta := apiErr.RetryAfter - wantRetryAfter; delta < -2*time.Second || delta > 2*time.Second {
+				t.Fatalf("Retry-After = %s, want %s (delta %s)", apiErr.RetryAfter, wantRetryAfter, delta)
+			}
+			if got := inferenceCalls.Load(); got != 3 {
+				t.Fatalf("inference calls = %d, want 3", got)
+			}
+			if got := billingCalls.Load(); got != 3 {
+				t.Fatalf("billing calls = %d, want 3", got)
+			}
+			cooled := 0
+			ready := 0
+			for _, info := range pool.Credentials() {
+				switch info.Status {
+				case "cooling_down":
+					cooled++
+					if info.CooldownReason != paymentRequiredReason || info.CooldownUntil == nil {
+						t.Fatalf("cooled credential = %#v", info)
+					}
+					delta := info.CooldownUntil.Sub(periodEnd)
+					if delta < -2*time.Second || delta > 2*time.Second {
+						t.Fatalf("cooldown until = %s, want %s", info.CooldownUntil, periodEnd)
+					}
+				case "ready":
+					ready++
+				}
+			}
+			if cooled != 3 || ready != 2 {
+				t.Fatalf("credential states: cooled=%d ready=%d", cooled, ready)
+			}
+		})
+	}
+}
+
+func TestXAIFallbackPaymentRequiredUsesQuotaBudget(t *testing.T) {
+	periodEnd := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	var buildInferenceCalls, xaiCalls, billingCalls atomic.Int32
+	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/billing") {
+			billingCalls.Add(1)
+			writeJSONResponse(t, w, http.StatusOK, map[string]any{"config": map[string]any{
+				"monthlyLimit": map[string]any{"val": 0}, "used": map[string]any{"val": 0},
+				"billingPeriodEnd": periodEnd.Format(time.RFC3339Nano),
+			}})
+			return
+		}
+		buildInferenceCalls.Add(1)
+		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
+			"status_code": float64(http.StatusForbidden), "code": "permission-denied", "error": "permission denied",
+		})
+	}))
+	defer build.Close()
+	xai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		xaiCalls.Add(1)
+		writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+			"status_code": float64(http.StatusPaymentRequired), "code": quotaErrorCode, "error": "payment required",
+		})
+	}))
+	defer xai.Close()
+
+	dir := t.TempDir()
+	for i := 0; i < 5; i++ {
+		writeBillingTestCredential(t, dir, fmt.Sprintf("account-%d.json", i), fmt.Sprintf("fallback-quota-%d", i), 4)
+	}
+	pool := newInferenceTestPool(t, dir, build.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, build.Client(), build.URL, xai.URL, 1)
+	client.cfg.QuotaRetryMaxAccounts = 3
+	defer client.Close()
+
+	_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.UpstreamCode != quotaRetryExhaustedCode {
+		t.Fatalf("error = %#v, want local quota 429", err)
+	}
+	if buildInferenceCalls.Load() != 3 || xaiCalls.Load() != 3 || billingCalls.Load() != 3 {
+		t.Fatalf("calls: build=%d xai=%d billing=%d", buildInferenceCalls.Load(), xaiCalls.Load(), billingCalls.Load())
+	}
+}
+
+func TestPaymentRequiredRetryAfterHeaderPrecedesBillingReset(t *testing.T) {
+	periodEnd := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	var billingCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/billing") {
+			billingCalls.Add(1)
+			writeJSONResponse(t, w, http.StatusOK, map[string]any{"config": map[string]any{
+				"monthlyLimit": map[string]any{"val": 0}, "used": map[string]any{"val": 0},
+				"billingPeriodEnd": periodEnd.Format(time.RFC3339Nano),
+			}})
+			return
+		}
+		w.Header().Set("Retry-After", "120")
+		writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+			"status_code": float64(http.StatusPaymentRequired), "code": quotaErrorCode, "error": "payment required",
+		})
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "account.json", "retry-after-subject", 4)
+	pool := newInferenceTestPool(t, dir, upstream.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, upstream.Client(), upstream.URL, upstream.URL, 20)
+	client.cfg.QuotaRetryMaxAccounts = 1
+	defer client.Close()
+
+	_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.RetryAfter != 2*time.Minute {
+		t.Fatalf("error = %#v, want local 429 with Retry-After 2m", err)
+	}
+	if billingCalls.Load() != 1 {
+		t.Fatalf("billing calls = %d, want 1", billingCalls.Load())
+	}
+	info := pool.Credentials()[0]
+	if info.CooldownUntil == nil {
+		t.Fatalf("credential cooldown = %#v", info)
+	}
+	remaining := time.Until(*info.CooldownUntil)
+	if remaining < 110*time.Second || remaining > 2*time.Minute {
+		t.Fatalf("cooldown remaining = %s, want 2m", remaining)
+	}
+}
+
+func TestPaymentRequiredBillingProbeFailureUsesConfiguredCooldown(t *testing.T) {
+	var inferenceCalls, billingCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/billing") {
+			billingCalls.Add(1)
+			writeJSONResponse(t, w, http.StatusServiceUnavailable, map[string]any{"error": "billing unavailable"})
+			return
+		}
+		inferenceCalls.Add(1)
+		writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+			"status_code": float64(http.StatusPaymentRequired), "code": quotaErrorCode, "error": "payment required",
+		})
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "account.json", "billing-failure-subject", 4)
+	pool := newInferenceTestPool(t, dir, upstream.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, upstream.Client(), upstream.URL, upstream.URL, 20)
+	client.cfg.QuotaRetryMaxAccounts = 1
+	client.cfg.QuotaCooldown = 17 * time.Minute
+	defer client.Close()
+
+	_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.RetryAfter != 17*time.Minute {
+		t.Fatalf("error = %#v, want local 429 with configured cooldown", err)
+	}
+	if inferenceCalls.Load() != 1 || billingCalls.Load() != 1 {
+		t.Fatalf("calls: inference=%d billing=%d", inferenceCalls.Load(), billingCalls.Load())
+	}
+}
+
+func TestPaymentRequiredAccountsWithoutBillingSupportDoNotQueryBilling(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(*testing.T, string)
+	}{
+		{name: "free", write: func(t *testing.T, dir string) {
+			writeBillingTestCredential(t, dir, "free.json", "free-subject", 0)
+		}},
+		{name: "x basic", write: func(t *testing.T, dir string) {
+			writeBillingTestCredential(t, dir, "x-basic.json", "x-basic-subject", 2)
+		}},
+		{name: "unknown tier", write: func(t *testing.T, dir string) {
+			writeModelTestCredential(t, dir, "unknown.json", "unknown-subject", "opaque-token")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var inferenceCalls, billingCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/billing") {
+					billingCalls.Add(1)
+					writeJSONResponse(t, w, http.StatusOK, map[string]any{"config": map[string]any{
+						"billingPeriodEnd": time.Now().Add(48 * time.Hour).Format(time.RFC3339Nano),
+					}})
+					return
+				}
+				inferenceCalls.Add(1)
+				writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+					"status_code": float64(http.StatusPaymentRequired), "code": quotaErrorCode, "error": "payment required",
+				})
+			}))
+			defer upstream.Close()
+
+			dir := t.TempDir()
+			test.write(t, dir)
+			pool := newInferenceTestPool(t, dir, upstream.Client())
+			useResponsesBackend(t, pool)
+			defer pool.Close()
+			client := newInferenceTestClient(t, dir, pool, upstream.Client(), upstream.URL, upstream.URL, 20)
+			client.cfg.QuotaRetryMaxAccounts = 1
+			client.cfg.QuotaCooldown = 17 * time.Minute
+			defer client.Close()
+
+			_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.RetryAfter != 17*time.Minute {
+				t.Fatalf("error = %#v, want local 429 with configured cooldown", err)
+			}
+			if inferenceCalls.Load() != 1 || billingCalls.Load() != 0 {
+				t.Fatalf("calls: inference=%d billing=%d", inferenceCalls.Load(), billingCalls.Load())
+			}
+		})
+	}
+}
+func TestPinnedPaymentRequiredReturnsComputedRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeJSONResponse(t, w, http.StatusPaymentRequired, map[string]any{
+			"status_code": float64(http.StatusPaymentRequired), "code": quotaErrorCode, "error": "payment required",
+		})
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	writeBillingTestCredential(t, dir, "free.json", "pinned-quota-subject", 0)
+	pool := newInferenceTestPool(t, dir, upstream.Client())
+	useResponsesBackend(t, pool)
+	defer pool.Close()
+	client := newInferenceTestClient(t, dir, pool, upstream.Client(), upstream.URL, upstream.URL, 20)
+	client.cfg.QuotaRetryMaxAccounts = 3
+	client.cfg.QuotaCooldown = 17 * time.Minute
+	defer client.Close()
+
+	_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{PinnedAccount: pool.AccountIDs()[0]})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusPaymentRequired || apiErr.RetryAfter != 17*time.Minute {
+		t.Fatalf("error = %#v, want pinned 402 with computed Retry-After", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("inference calls = %d, want 1", calls.Load())
+	}
+}
+
 func TestRejectedXAIFallbackAppliesAccountLifecycle(t *testing.T) {
 	build := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
@@ -1350,8 +1648,11 @@ func TestRejectedXAIFallbackAppliesAccountLifecycle(t *testing.T) {
 	defer client.Close()
 	_, err := client.DoInference(context.Background(), testInferencePlan(t), InferenceOptions{})
 	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
-		t.Fatalf("error = %v, want original Build 403", err)
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.UpstreamCode != quotaRetryExhaustedCode {
+		t.Fatalf("error = %v, want local quota 429", err)
+	}
+	if apiErr.RetryAfter <= 0 {
+		t.Fatalf("Retry-After = %s, want payment cooldown", apiErr.RetryAfter)
 	}
 	info, ok := pool.Credential(pool.AccountIDs()[0])
 	if !ok || info.CooldownReason != paymentRequiredReason || info.CooldownUntil == nil {

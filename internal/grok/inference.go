@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -58,6 +59,7 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 		maxAttempts = 1
 	}
 	transportAttempts := 0
+	quotaRetries := newQuotaRetryState(c.cfg.QuotaRetryMaxAccounts)
 	var lastErr error
 
 	for transportAttempts < maxAttempts {
@@ -135,8 +137,26 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 			return nil, resolveErr
 		}
 		if apiErr != nil {
+			paymentRequired := apiErr.paymentRequired || apiErr.Status == http.StatusPaymentRequired
+			if apiErr.Status == http.StatusPaymentRequired && !apiErr.paymentRequired {
+				apiErr.paymentRequired = true
+				apiErr.paymentRetryAfter = c.markPaymentRequired(ctx, lease, apiErr)
+			}
 			lease.Release()
 			lastErr = apiErr
+			if paymentRequired {
+				transportAttempts--
+				exhausted := quotaRetries.observe(accountID, apiErr.paymentRetryAfter)
+				if pinned {
+					return nil, apiErr
+				}
+				lastErr = quotaRetries.exhaustedError(apiErr)
+				if fallbackUncertain || exhausted {
+					slog.Warn("quota account retry budget exhausted", "accounts", len(quotaRetries.accounts), "limit", quotaRetries.max, "retry_after", quotaRetries.retryAfter)
+					return nil, lastErr
+				}
+				continue
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				if refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation); refreshErr == nil {
@@ -217,6 +237,7 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 		maxAttempts = 1
 	}
 	transportAttempts := 0
+	quotaRetries := newQuotaRetryState(c.cfg.QuotaRetryMaxAccounts)
 	var lastErr error
 
 	for transportAttempts < maxAttempts {
@@ -292,8 +313,26 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 			return nil, resolveErr
 		}
 		if apiErr != nil {
+			paymentRequired := apiErr.paymentRequired || apiErr.Status == http.StatusPaymentRequired
+			if apiErr.Status == http.StatusPaymentRequired && !apiErr.paymentRequired {
+				apiErr.paymentRequired = true
+				apiErr.paymentRetryAfter = c.markPaymentRequired(ctx, lease, apiErr)
+			}
 			lease.Release()
 			lastErr = apiErr
+			if paymentRequired {
+				transportAttempts--
+				exhausted := quotaRetries.observe(accountID, apiErr.paymentRetryAfter)
+				if pinned {
+					return nil, apiErr
+				}
+				lastErr = quotaRetries.exhaustedError(apiErr)
+				if fallbackUncertain || exhausted {
+					slog.Warn("quota account retry budget exhausted", "accounts", len(quotaRetries.accounts), "limit", quotaRetries.max, "retry_after", quotaRetries.retryAfter)
+					return nil, lastErr
+				}
+				continue
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				if refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation); refreshErr == nil {

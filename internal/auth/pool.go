@@ -75,6 +75,7 @@ type CredentialInfo struct {
 	SubscriptionTier        string                       `json:"subscription_tier,omitempty"`
 	SubscriptionTierDisplay string                       `json:"subscription_tier_display,omitempty"`
 	Paid                    bool                         `json:"-"`
+	BillingEligible         bool                         `json:"-"`
 	Billing                 *BillingInfo                 `json:"billing,omitempty"`
 	BuildRoutingInfo
 }
@@ -1034,6 +1035,7 @@ func credentialInfoAt(id string, a *account, now time.Time) (CredentialInfo, tim
 	info.SubscriptionTier = a.credential.Tier.Key
 	info.SubscriptionTierDisplay = a.credential.Tier.Display
 	info.Paid = a.credential.Tier.Paid || a.billing != nil && a.billing.Paid
+	info.BillingEligible = a.credential.Tier.Billing || a.billing != nil && a.billing.Paid
 	info.Billing = cloneBillingInfo(a.billing)
 	if !a.credential.ExpiresAt.IsZero() {
 		expires := a.credential.ExpiresAt.UTC()

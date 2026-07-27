@@ -32,6 +32,8 @@ import (
 
 const quotaErrorCode = "personal-team-blocked:spending-limit"
 
+const quotaRetryExhaustedCode = "account_pool_quota_exhausted"
+
 const permanentChatDenialKeyword = "Access to the chat endpoint is denied"
 
 const permanentChatDenialReason = "chat_endpoint_denied"
@@ -59,6 +61,9 @@ type APIError struct {
 	UpstreamParam   string
 	RetryAfter      time.Duration
 	ShouldRetry     *bool
+
+	paymentRequired   bool
+	paymentRetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -76,6 +81,51 @@ func (e *APIError) Error() string {
 		parts = append(parts, body)
 	}
 	return strings.Join(parts, " | ")
+}
+
+type quotaRetryState struct {
+	max        int
+	accounts   map[string]struct{}
+	retryAfter time.Duration
+}
+
+func newQuotaRetryState(max int) *quotaRetryState {
+	if max < 1 {
+		max = 3
+	}
+	return &quotaRetryState{max: max, accounts: make(map[string]struct{}, max)}
+}
+
+func (s *quotaRetryState) observe(accountID string, retryAfter time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	s.accounts[accountID] = struct{}{}
+	if retryAfter > 0 && (s.retryAfter <= 0 || retryAfter < s.retryAfter) {
+		s.retryAfter = retryAfter
+	}
+	return len(s.accounts) >= s.max
+}
+
+func (s *quotaRetryState) exhaustedError(source *APIError) *APIError {
+	result := &APIError{}
+	if source != nil {
+		*result = *source
+	}
+	result.Status = http.StatusTooManyRequests
+	result.Body = ""
+	result.UpstreamCode = quotaRetryExhaustedCode
+	result.UpstreamMessage = fmt.Sprintf("no account with available upstream quota after %d quota response(s)", len(s.accounts))
+	result.UpstreamParam = ""
+	result.RetryAfter = s.retryAfter
+	shouldRetry := false
+	result.ShouldRetry = &shouldRetry
+	return result
+}
+
+func isQuotaRetryExhausted(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.UpstreamCode == quotaRetryExhaustedCode
 }
 
 type buildEntitlementProbe struct {
@@ -194,6 +244,9 @@ func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Cl
 	}
 	if cfg.RetryMaxAttempts < 1 {
 		cfg.RetryMaxAttempts = 3
+	}
+	if cfg.QuotaRetryMaxAccounts < 1 {
+		cfg.QuotaRetryMaxAccounts = 3
 	}
 	if cfg.RetryBaseDelay <= 0 {
 		cfg.RetryBaseDelay = 200 * time.Millisecond
@@ -453,25 +506,29 @@ func (c *Client) fetchAccountBilling(ctx context.Context, accountID string, refr
 	return c.fetchAccountBillingWithLease(ctx, accountID, refreshed, lease, true)
 }
 
-func (c *Client) fetchAccountBillingWithLease(ctx context.Context, accountID string, refreshed bool, lease *auth.Lease, allowRefresh bool) error {
+func (c *Client) fetchBillingInfoWithLease(ctx context.Context, lease *auth.Lease) (auth.BillingInfo, error) {
 	resp, _, err := c.do(ctx, lease, http.MethodGet, "billing?format=credits", nil, NewID(), "", false, false)
 	if err != nil {
-		return err
+		return auth.BillingInfo{}, err
 	}
 	defer resp.Body.Close()
 	payload, err := readResponseBody(resp, 1<<20)
 	if err != nil {
-		return err
+		return auth.BillingInfo{}, err
 	}
 	if resp.StatusCode >= 400 {
-		apiErr := parseAPIError(resp, payload)
-		if allowRefresh && isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
+		return auth.BillingInfo{}, parseAPIError(resp, payload)
+	}
+	return parseBillingInfo(payload, time.Now())
+}
+
+func (c *Client) fetchAccountBillingWithLease(ctx context.Context, accountID string, refreshed bool, lease *auth.Lease, allowRefresh bool) error {
+	info, err := c.fetchBillingInfoWithLease(ctx, lease)
+	if err != nil {
+		var apiErr *APIError
+		if allowRefresh && errors.As(err, &apiErr) && isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
 			return c.fetchAccountBilling(ctx, accountID, true)
 		}
-		return apiErr
-	}
-	info, err := parseBillingInfo(payload, time.Now())
-	if err != nil {
 		return err
 	}
 	credential, _ := c.pool.Credential(accountID)
@@ -984,8 +1041,14 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 	used := map[string]struct{}{}
 	refreshed := map[string]bool{}
 	preferredID := ""
+	quotaRetries := newQuotaRetryState(c.cfg.QuotaRetryMaxAccounts)
+	maxAttempts := c.cfg.RetryMaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	generalAttempts := 0
 	var lastErr error
-	for len(used) < c.cfg.RetryMaxAttempts {
+	for generalAttempts < maxAttempts {
 		var lease *auth.Lease
 		var err error
 		acquireStarted := time.Now()
@@ -999,6 +1062,9 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		if err != nil {
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
+				if isQuotaRetryExhausted(lastErr) {
+					return nil, lastErr
+				}
 				return nil, err
 			}
 			if lastErr != nil {
@@ -1010,14 +1076,15 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		generation := lease.Generation()
 		identity = identityWithLeaseDefaults(identity, lease)
 		used[accountID] = struct{}{}
+		generalAttempts++
 		resp, wrote, err := c.doWithIdentity(ctx, lease, method, path, payload, identity, trace, false, nil)
 		if err != nil {
 			lease.Release()
 			lastErr = err
-			if ctx.Err() != nil || wrote || len(used) >= c.cfg.RetryMaxAttempts {
+			if ctx.Err() != nil || wrote || generalAttempts >= maxAttempts {
 				return nil, err
 			}
-			if err := c.backoff(ctx, len(used)); err != nil {
+			if err := c.backoff(ctx, generalAttempts); err != nil {
 				return nil, err
 			}
 			continue
@@ -1031,14 +1098,31 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		}
 		if resp.StatusCode >= 400 {
 			apiErr := parseAPIError(resp, data)
+			paymentRequired := apiErr.Status == http.StatusPaymentRequired
+			if paymentRequired {
+				apiErr.paymentRequired = true
+				apiErr.paymentRetryAfter = c.markPaymentRequired(ctx, lease, apiErr)
+			}
+			plane := defaultInferencePlane(lease.Session())
 			lease.Release()
 			lastErr = apiErr
+			if paymentRequired {
+				generalAttempts--
+				exhausted := quotaRetries.observe(accountID, apiErr.paymentRetryAfter)
+				lastErr = quotaRetries.exhaustedError(apiErr)
+				if exhausted {
+					slog.Warn("quota account retry budget exhausted", "accounts", len(quotaRetries.accounts), "limit", quotaRetries.max, "retry_after", quotaRetries.retryAfter)
+					return nil, lastErr
+				}
+				continue
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				refreshStarted := time.Now()
 				refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation)
 				timing.MarkRefresh(time.Since(refreshStarted))
 				if refreshErr == nil {
+					generalAttempts--
 					delete(used, accountID)
 					preferredID = accountID
 					continue
@@ -1048,21 +1132,15 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			}
 			if isAuthError(apiErr) {
 				c.pool.Disable(accountID, "authentication_failed")
-				if len(used) < c.cfg.RetryMaxAttempts {
+				if generalAttempts < maxAttempts {
 					continue
 				}
 			}
-			if !c.handleRetryable(accountID, model, apiErr, defaultInferencePlane(lease.Session())) || len(used) >= c.cfg.RetryMaxAttempts {
-				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
-					apiErr.Status = http.StatusTooManyRequests
-					apiErr.UpstreamCode = "account_pool_retry_exhausted"
-					apiErr.UpstreamMessage = "upstream account retry budget exhausted"
-					apiErr.RetryAfter = c.cfg.QuotaCooldown
-				}
+			if !c.handleRetryable(accountID, model, apiErr, plane) || generalAttempts >= maxAttempts {
 				return nil, apiErr
 			}
 			if apiErr.Status >= 500 {
-				if err := c.backoffForAPI(ctx, len(used), apiErr); err != nil {
+				if err := c.backoffForAPI(ctx, generalAttempts, apiErr); err != nil {
 					return nil, err
 				}
 			}
@@ -1102,8 +1180,14 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 	used := map[string]struct{}{}
 	refreshed := map[string]bool{}
 	preferredID := ""
+	quotaRetries := newQuotaRetryState(c.cfg.QuotaRetryMaxAccounts)
+	maxAttempts := c.cfg.RetryMaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	generalAttempts := 0
 	var lastErr error
-	for len(used) < c.cfg.RetryMaxAttempts {
+	for generalAttempts < maxAttempts {
 		var lease *auth.Lease
 		var err error
 		acquireStarted := time.Now()
@@ -1117,6 +1201,9 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		if err != nil {
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
+				if isQuotaRetryExhausted(lastErr) {
+					return nil, lastErr
+				}
 				return nil, err
 			}
 			if lastErr != nil {
@@ -1128,14 +1215,15 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		generation := lease.Generation()
 		identity = identityWithLeaseDefaults(identity, lease)
 		used[accountID] = struct{}{}
+		generalAttempts++
 		resp, wrote, plane, err := c.doInferenceWithIdentity(ctx, lease, http.MethodPost, path, payload, identity, trace, true)
 		if err != nil {
 			lease.Release()
 			lastErr = err
-			if ctx.Err() != nil || wrote || len(used) >= c.cfg.RetryMaxAttempts {
+			if ctx.Err() != nil || wrote || generalAttempts >= maxAttempts {
 				return nil, err
 			}
-			if err := c.backoff(ctx, len(used)); err != nil {
+			if err := c.backoff(ctx, generalAttempts); err != nil {
 				return nil, err
 			}
 			continue
@@ -1146,14 +1234,30 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			return nil, resolveErr
 		}
 		if apiErr != nil {
+			paymentRequired := apiErr.paymentRequired || apiErr.Status == http.StatusPaymentRequired
+			if apiErr.Status == http.StatusPaymentRequired && !apiErr.paymentRequired {
+				apiErr.paymentRequired = true
+				apiErr.paymentRetryAfter = c.markPaymentRequired(ctx, lease, apiErr)
+			}
 			lease.Release()
 			lastErr = apiErr
+			if paymentRequired {
+				exhausted := quotaRetries.observe(accountID, apiErr.paymentRetryAfter)
+				generalAttempts--
+				lastErr = quotaRetries.exhaustedError(apiErr)
+				if fallbackUncertain || exhausted {
+					slog.Warn("quota account retry budget exhausted", "accounts", len(quotaRetries.accounts), "limit", quotaRetries.max, "retry_after", quotaRetries.retryAfter)
+					return nil, lastErr
+				}
+				continue
+			}
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
 				refreshStarted := time.Now()
 				refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation)
 				timing.MarkRefresh(time.Since(refreshStarted))
 				if refreshErr == nil {
+					generalAttempts--
 					delete(used, accountID)
 					preferredID = accountID
 					continue
@@ -1164,21 +1268,15 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			if isAuthError(apiErr) {
 				c.pool.Disable(accountID, "authentication_failed")
-				if len(used) < c.cfg.RetryMaxAttempts {
+				if generalAttempts < maxAttempts {
 					continue
 				}
 			}
-			if fallbackUncertain || !c.handleRetryable(accountID, model, apiErr, plane) || len(used) >= c.cfg.RetryMaxAttempts {
-				if strings.EqualFold(apiErr.UpstreamCode, quotaErrorCode) {
-					apiErr.Status = http.StatusTooManyRequests
-					apiErr.UpstreamCode = "account_pool_retry_exhausted"
-					apiErr.UpstreamMessage = "upstream account retry budget exhausted"
-					apiErr.RetryAfter = c.cfg.QuotaCooldown
-				}
+			if fallbackUncertain || !c.handleRetryable(accountID, model, apiErr, plane) || generalAttempts >= maxAttempts {
 				return nil, apiErr
 			}
 			if apiErr.Status >= 500 {
-				if err := c.backoffForAPI(ctx, len(used), apiErr); err != nil {
+				if err := c.backoffForAPI(ctx, generalAttempts, apiErr); err != nil {
 					return nil, err
 				}
 			}
@@ -1342,7 +1440,12 @@ func (c *Client) resolveInferenceResponse(ctx context.Context, lease *auth.Lease
 			return nil, primaryErr, true, nil
 		}
 		fallbackErr := parseAPIError(fallbackResp, fallbackBody)
-		_ = c.handleRetryable(lease.AccountID(), identity.Model, fallbackErr, auth.InferencePlaneXAI)
+		if fallbackErr.Status == http.StatusPaymentRequired {
+			primaryErr.paymentRequired = true
+			primaryErr.paymentRetryAfter = c.markPaymentRequired(ctx, lease, fallbackErr)
+		} else {
+			_ = c.handleRetryable(lease.AccountID(), identity.Model, fallbackErr, auth.InferencePlaneXAI)
+		}
 		slog.Warn("xai inference fallback rejected", "account", lease.AccountID(), "path", path, "status", fallbackErr.Status, "code", fallbackErr.UpstreamCode)
 		return nil, primaryErr, false, nil
 	}
@@ -1358,7 +1461,7 @@ func (c *Client) handleRetryable(accountID, model string, err *APIError, plane a
 		return false
 	}
 	if err.Status == http.StatusPaymentRequired {
-		c.pool.MarkCooldown(accountID, paymentRequiredReason, c.billingCooldown(accountID))
+		c.pool.MarkCooldown(accountID, paymentRequiredReason, c.paymentCooldown(accountID, err))
 		return true
 	}
 	if isPermanentAccountDenial(err) {
@@ -1412,13 +1515,58 @@ func (c *Client) handleRetryable(accountID, model string, err *APIError, plane a
 	}
 }
 
+func (c *Client) paymentBillingProbeRequired(accountID string, now time.Time) bool {
+	credential, ok := c.pool.Credential(accountID)
+	if !ok || !credential.BillingEligible {
+		return false
+	}
+	billing := credential.Billing
+	if billing == nil || billing.PeriodEnd == nil || billing.UpdatedAt.IsZero() {
+		return true
+	}
+	interval := c.cfg.BillingRefreshInterval
+	if interval <= 0 {
+		interval = defaultBillingRefreshInterval
+	}
+	age := now.Sub(billing.UpdatedAt)
+	return age < 0 || age >= interval
+}
+
+func (c *Client) markPaymentRequired(ctx context.Context, lease *auth.Lease, apiErr *APIError) time.Duration {
+	accountID := lease.AccountID()
+	if !lease.Session().IsAPIKey() && c.paymentBillingProbeRequired(accountID, time.Now()) {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		info, err := c.fetchBillingInfoWithLease(probeCtx, lease)
+		cancel()
+		if err != nil {
+			slog.Warn("payment-required billing probe failed", "account", accountID, "error", err)
+		} else if err := c.pool.UpdateBilling(accountID, info); err != nil {
+			slog.Warn("store payment-required billing metadata failed", "account", accountID, "error", err)
+		}
+	}
+	duration := c.paymentCooldown(accountID, apiErr)
+	if apiErr != nil && apiErr.RetryAfter <= 0 {
+		apiErr.RetryAfter = duration
+	}
+	c.pool.MarkCooldown(accountID, paymentRequiredReason, duration)
+	return duration
+}
+
+func (c *Client) paymentCooldown(accountID string, apiErr *APIError) time.Duration {
+	if apiErr != nil && apiErr.RetryAfter > 0 {
+		return apiErr.RetryAfter
+	}
+	return c.billingCooldown(accountID)
+}
+
 func (c *Client) billingCooldown(accountID string) time.Duration {
 	duration := c.cfg.QuotaCooldown
 	if duration <= 0 {
 		duration = 24 * time.Hour
 	}
-	if billing, ok := c.pool.Billing(accountID); ok && billing.PeriodEnd != nil {
-		if untilReset := time.Until(*billing.PeriodEnd); untilReset > 0 {
+	credential, subscribed := c.pool.Credential(accountID)
+	if subscribed && credential.Paid && credential.Billing != nil && credential.Billing.PeriodEnd != nil {
+		if untilReset := time.Until(*credential.Billing.PeriodEnd); untilReset > 0 {
 			duration = untilReset
 		}
 	}

@@ -26,6 +26,7 @@ type Config struct {
 	ModelsRefreshInterval  time.Duration
 	BillingRefreshInterval time.Duration
 	RetryMaxAttempts       int
+	QuotaRetryMaxAccounts  int
 	RetryBaseDelay         time.Duration
 	RateLimitCooldown      time.Duration
 	QuotaCooldown          time.Duration
@@ -68,6 +69,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	retryAttempts, err := envPositiveInt("GROK_RETRY_MAX_ATTEMPTS", 3)
+	if err != nil {
+		return Config{}, err
+	}
+	quotaRetryAccounts, err := envPositiveInt("GROK_QUOTA_RETRY_MAX_ACCOUNTS", 3)
 	if err != nil {
 		return Config{}, err
 	}
@@ -149,6 +154,7 @@ func Load() (Config, error) {
 		ModelsRefreshInterval:  modelsRefreshInterval,
 		BillingRefreshInterval: billingRefreshInterval,
 		RetryMaxAttempts:       retryAttempts,
+		QuotaRetryMaxAccounts:  quotaRetryAccounts,
 		RetryBaseDelay:         retryBaseDelay,
 		RateLimitCooldown:      rateLimitCooldown,
 		QuotaCooldown:          quotaCooldown,
